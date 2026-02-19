@@ -182,7 +182,7 @@
                         "vehicle_id": "Vehicle (optional)"
                     },
                     "data_description": {
-                        "card_index": "RFID card slot index (0–9)",
+                        "card_index": "RFID card slot index (0–9, corresponds to go-e app slots 1–10)",
                         "user_id": "The user this RFID card is assigned to",
                         "vehicle_id": "The vehicle associated with this card (optional, e.g. for guests without a car)"
                     }

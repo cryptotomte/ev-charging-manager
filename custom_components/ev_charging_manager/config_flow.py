@@ -680,7 +680,7 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
                     "deactivated_by": None,
                 }
                 return self.async_create_entry(
-                    title=f"Card #{card_index}",
+                    title=f"Card #{card_index} (go-e slot {card_index + 1})",
                     data=data,
                     unique_id=f"rfid_{card_index}",
                 )
@@ -691,7 +691,10 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
         schema_dict: dict[Any, Any] = {
             vol.Required("card_index"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
-                    options=[{"value": str(i), "label": f"Card #{i}"} for i in range(10)],
+                    options=[
+                        {"value": str(i), "label": f"Card #{i} (go-e slot {i + 1})"}
+                        for i in range(10)
+                    ],
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),

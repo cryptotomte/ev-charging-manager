@@ -182,7 +182,7 @@
                         "vehicle_id": "Fordon (valfritt)"
                     },
                     "data_description": {
-                        "card_index": "RFID-kortplatsindex (0–9)",
+                        "card_index": "RFID-kortplatsindex (0–9, motsvarar go-e app plats 1–10)",
                         "user_id": "Användaren som detta RFID-kort är tilldelat",
                         "vehicle_id": "Fordonet kopplat till detta kort (valfritt, t.ex. för gäster utan bil)"
                     }

@@ -1,0 +1,59 @@
+{
+    "config": {
+        "step": {
+            "charger_type": {
+                "title": "Välj laddartyp",
+                "data": {
+                    "charger_profile": "Laddartyp"
+                }
+            },
+            "charger_entities": {
+                "title": "Konfigurera sensorentiteter",
+                "description": "Välj de Home Assistant-sensorentiteter som hör till din laddare. Kända profiler har förifyllda förslag — verifiera eller justera dem för din installation.",
+                "data": {
+                    "car_status_entity": "Bilstatussensor",
+                    "car_status_charging_value": "Värde som indikerar laddning",
+                    "energy_entity": "Sessionsenergi-sensor",
+                    "energy_unit": "Energienhet",
+                    "power_entity": "Effektsensor",
+                    "rfid_entity": "RFID / Transaktionssensor (valfri)",
+                    "total_energy_entity": "Total energisensor (valfri)",
+                    "rfid_uid_entity": "RFID UID-sensor (valfri)",
+                    "charger_name": "Laddarnamn",
+                    "charger_host": "Laddarens värd / IP"
+                },
+                "data_description": {
+                    "car_status_entity": "Sensor som rapporterar bilens anslutningsstatus (t.ex. sensor.goe_{serial}_car_0)",
+                    "car_status_charging_value": "Sensorvärde som betyder 'laddning pågår' (t.ex. 2 för go-e, 'charging' för Easee)",
+                    "energy_entity": "Sensor som rapporterar sessionsenergi",
+                    "energy_unit": "Enhet som energisensorn använder",
+                    "power_entity": "Sensor som rapporterar aktuell laddningseffekt i Watt",
+                    "rfid_entity": "Sensor som rapporterar aktivt RFID / transaktionstoken",
+                    "total_energy_entity": "Sensor som rapporterar total levererad energi",
+                    "rfid_uid_entity": "Sensor som rapporterar senast skannat RFID-UID (kräver rde=true för go-e)",
+                    "charger_name": "Vänligt namn för denna laddare (visas i enhetsregistret)",
+                    "charger_host": "IP-adress eller värdnamn för laddaren (krävs för go-e direkt API i PR-08)"
+                }
+            },
+            "pricing": {
+                "title": "Prissättningskonfiguration",
+                "data": {
+                    "pricing_mode": "Prisläge",
+                    "static_price_kwh": "Pris per kWh"
+                }
+            },
+            "confirm": {
+                "title": "Slutför installation",
+                "description": "Din EV Charging Manager för '{charger_name}' är redo att installeras. Klicka på Skicka för att slutföra installationen och registrera laddarenheten."
+            }
+        },
+        "error": {
+            "entity_not_found": "Entiteten hittades inte i Home Assistant. Kontrollera entitets-ID och försök igen.",
+            "entity_unavailable": "Entiteten finns men är otillgänglig eller i ett okänt tillstånd. Kontrollera att underliggande integration körs.",
+            "invalid_price": "Priset måste vara större än 0."
+        },
+        "abort": {
+            "already_configured": "Denna integration är redan konfigurerad. Varje laddare kräver en separat instans."
+        }
+    }
+}

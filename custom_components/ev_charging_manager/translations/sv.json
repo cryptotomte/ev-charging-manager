@@ -55,5 +55,159 @@
         "abort": {
             "already_configured": "Denna integration är redan konfigurerad. Varje laddare kräver en separat instans."
         }
+    },
+    "config_subentries": {
+        "vehicle": {
+            "entry_type": "Fordon",
+            "initiate_flow": {
+                "user": "Lägg till fordon"
+            },
+            "step": {
+                "user": {
+                    "title": "Lägg till fordon",
+                    "data": {
+                        "name": "Fordonsnamn",
+                        "battery_capacity_kwh": "Batterikapacitet (kWh)",
+                        "usable_battery_kwh": "Användbar batterikapacitet (kWh)",
+                        "charging_phases": "Laddningsfaser",
+                        "max_charging_power_kw": "Max laddningseffekt (kW)",
+                        "charging_efficiency": "Laddningseffektivitet"
+                    },
+                    "data_description": {
+                        "name": "Ett vänligt namn för fordonet (t.ex. 'Peugeot 3008 PHEV')",
+                        "battery_capacity_kwh": "Total batterikapacitet i kWh",
+                        "usable_battery_kwh": "Användbar del av batteriet i kWh (standardvärde: total kapacitet om ej angivet)",
+                        "charging_phases": "Antal laddningsfaser (1 eller 3)",
+                        "max_charging_power_kw": "Maximal laddningseffekt i kW (valfri)",
+                        "charging_efficiency": "Laddningseffektivitetsfaktor (0,80–0,99, standard 0,90)"
+                    }
+                },
+                "reconfigure": {
+                    "title": "Redigera fordon",
+                    "data": {
+                        "name": "Fordonsnamn",
+                        "battery_capacity_kwh": "Batterikapacitet (kWh)",
+                        "usable_battery_kwh": "Användbar batterikapacitet (kWh)",
+                        "charging_phases": "Laddningsfaser",
+                        "max_charging_power_kw": "Max laddningseffekt (kW)",
+                        "charging_efficiency": "Laddningseffektivitet"
+                    },
+                    "data_description": {
+                        "name": "Ett vänligt namn för fordonet",
+                        "battery_capacity_kwh": "Total batterikapacitet i kWh",
+                        "usable_battery_kwh": "Användbar del av batteriet i kWh",
+                        "charging_phases": "Antal laddningsfaser (1 eller 3)",
+                        "max_charging_power_kw": "Maximal laddningseffekt i kW (valfri)",
+                        "charging_efficiency": "Laddningseffektivitetsfaktor (0,80–0,99)"
+                    }
+                }
+            },
+            "error": {}
+        },
+        "user": {
+            "entry_type": "Användare",
+            "initiate_flow": {
+                "user": "Lägg till användare"
+            },
+            "step": {
+                "user": {
+                    "title": "Lägg till användare",
+                    "data": {
+                        "name": "Användarnamn",
+                        "type": "Användartyp"
+                    },
+                    "data_description": {
+                        "name": "Personens namn (t.ex. 'Paul')",
+                        "type": "Vanlig användare eller gäst med egen prissättning"
+                    }
+                },
+                "guest_pricing": {
+                    "title": "Gästprissättning",
+                    "data": {
+                        "guest_pricing_method": "Prismetod",
+                        "price_per_kwh": "Pris per kWh",
+                        "markup_factor": "Påslagsfaktor"
+                    },
+                    "data_description": {
+                        "guest_pricing_method": "Hur laddningspriset ska beräknas för denna gäst",
+                        "price_per_kwh": "Fast pris per kWh (krävs för metoden 'fast pris')",
+                        "markup_factor": "Multiplicera baspriset med denna faktor (krävs för metoden 'påslag', måste vara > 1,0)"
+                    }
+                },
+                "reconfigure": {
+                    "title": "Redigera användare",
+                    "data": {
+                        "name": "Användarnamn",
+                        "active": "Aktiv"
+                    },
+                    "data_description": {
+                        "name": "Personens namn",
+                        "active": "Om denna användare är aktiv. Inaktivering kaskaderar till RFID-kopplingar."
+                    },
+                    "description_placeholders": {
+                        "type": "Användartyp: {type}"
+                    }
+                },
+                "reconfigure_guest_pricing": {
+                    "title": "Redigera gästprissättning",
+                    "data": {
+                        "guest_pricing_method": "Prismetod",
+                        "price_per_kwh": "Pris per kWh",
+                        "markup_factor": "Påslagsfaktor"
+                    },
+                    "data_description": {
+                        "guest_pricing_method": "Hur laddningspriset ska beräknas för denna gäst",
+                        "price_per_kwh": "Fast pris per kWh (krävs för metoden 'fast pris')",
+                        "markup_factor": "Multiplicera baspriset med denna faktor (krävs för metoden 'påslag')"
+                    }
+                }
+            },
+            "error": {
+                "pricing_required": "Gästanvändare kräver prissättningskonfiguration.",
+                "price_required": "Pris per kWh krävs vid fast prismetod.",
+                "markup_required": "Påslagsfaktor krävs vid påslagsmetod."
+            }
+        },
+        "rfid_mapping": {
+            "entry_type": "RFID-koppling",
+            "initiate_flow": {
+                "user": "Lägg till RFID-koppling"
+            },
+            "step": {
+                "user": {
+                    "title": "Lägg till RFID-koppling",
+                    "data": {
+                        "card_index": "Kortplats",
+                        "user_id": "Användare",
+                        "vehicle_id": "Fordon (valfritt)"
+                    },
+                    "data_description": {
+                        "card_index": "RFID-kortplatsindex (0–9)",
+                        "user_id": "Användaren som detta RFID-kort är tilldelat",
+                        "vehicle_id": "Fordonet kopplat till detta kort (valfritt, t.ex. för gäster utan bil)"
+                    }
+                },
+                "reconfigure": {
+                    "title": "Redigera RFID-koppling",
+                    "data": {
+                        "user_id": "Användare",
+                        "vehicle_id": "Fordon (valfritt)",
+                        "active": "Aktiv"
+                    },
+                    "data_description": {
+                        "user_id": "Användaren som detta RFID-kort är tilldelat",
+                        "vehicle_id": "Fordonet kopplat till detta kort (valfritt)",
+                        "active": "Om denna koppling är aktiv"
+                    },
+                    "description_placeholders": {
+                        "card_index": "Kortplats: {card_index}"
+                    }
+                }
+            },
+            "error": {
+                "already_mapped": "Denna kortplats är redan tilldelad en annan användare.",
+                "no_available_slots": "Alla 10 kortplatser (0–9) är redan i bruk."
+            }
+        }
     }
 }

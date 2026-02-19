@@ -1,0 +1,59 @@
+{
+    "config": {
+        "step": {
+            "charger_type": {
+                "title": "Select Charger Type",
+                "data": {
+                    "charger_profile": "Charger Type"
+                }
+            },
+            "charger_entities": {
+                "title": "Configure Sensor Entities",
+                "description": "Select the Home Assistant sensor entities for your charger. Known profiles have pre-filled suggestions — verify or adjust them for your installation.",
+                "data": {
+                    "car_status_entity": "Car Status Sensor",
+                    "car_status_charging_value": "Charging Indicator Value",
+                    "energy_entity": "Session Energy Sensor",
+                    "energy_unit": "Energy Unit",
+                    "power_entity": "Power Sensor",
+                    "rfid_entity": "RFID / Transaction Sensor (optional)",
+                    "total_energy_entity": "Total Energy Sensor (optional)",
+                    "rfid_uid_entity": "RFID UID Sensor (optional)",
+                    "charger_name": "Charger Name",
+                    "charger_host": "Charger Host / IP"
+                },
+                "data_description": {
+                    "car_status_entity": "Sensor reporting the car connection state (e.g. sensor.goe_{serial}_car_0)",
+                    "car_status_charging_value": "Sensor value that means 'currently charging' (e.g. 2 for go-e, 'charging' for Easee)",
+                    "energy_entity": "Sensor reporting session energy consumption",
+                    "energy_unit": "Unit reported by the energy sensor",
+                    "power_entity": "Sensor reporting current charging power in Watts",
+                    "rfid_entity": "Sensor reporting the active RFID / transaction token",
+                    "total_energy_entity": "Sensor reporting total lifetime energy dispensed",
+                    "rfid_uid_entity": "Sensor reporting the last scanned RFID UID (requires rde=true for go-e)",
+                    "charger_name": "Friendly name for this charger (shown in device registry)",
+                    "charger_host": "IP address or hostname of the charger (required for go-e direct API access in PR-08)"
+                }
+            },
+            "pricing": {
+                "title": "Pricing Configuration",
+                "data": {
+                    "pricing_mode": "Pricing Mode",
+                    "static_price_kwh": "Price per kWh"
+                }
+            },
+            "confirm": {
+                "title": "Complete Setup",
+                "description": "Your EV Charging Manager for '{charger_name}' is ready to install. Click Submit to complete the setup and register the charger device."
+            }
+        },
+        "error": {
+            "entity_not_found": "Entity not found in Home Assistant. Check the entity ID and try again.",
+            "entity_unavailable": "Entity exists but is unavailable or in an unknown state. Ensure the underlying integration is running.",
+            "invalid_price": "Price must be greater than 0."
+        },
+        "abort": {
+            "already_configured": "This integration is already configured. Each charger requires a separate instance."
+        }
+    }
+}

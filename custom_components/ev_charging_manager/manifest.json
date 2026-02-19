@@ -1,0 +1,12 @@
+{
+    "domain": "ev_charging_manager",
+    "name": "EV Charging Manager",
+    "version": "0.1.0",
+    "config_flow": true,
+    "iot_class": "calculated",
+    "codeowners": ["@lulebo-dev"],
+    "documentation": "https://github.com/lulebo-dev/ev-charging-manager",
+    "issue_tracker": "https://github.com/lulebo-dev/ev-charging-manager/issues",
+    "requirements": [],
+    "dependencies": []
+}

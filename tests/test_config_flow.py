@@ -13,6 +13,7 @@ from custom_components.ev_charging_manager.const import (
     CONF_CHARGER_HOST,
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
+    CONF_CHARGER_SERIAL,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
     CONF_POWER_ENTITY,
@@ -31,37 +32,43 @@ from custom_components.ev_charging_manager.const import (
 
 async def test_config_flow_goe_happy_path(hass: HomeAssistant) -> None:
     """Full 4-step config flow with go-e Gemini profile."""
-    # Register 5 go-e sensor entities with valid states
-    hass.states.async_set("sensor.goe_abc123_car_0", "2")
-    hass.states.async_set("sensor.goe_abc123_wh", "1000")
-    hass.states.async_set("sensor.goe_abc123_nrg_total_power", "7400")
-    hass.states.async_set("sensor.goe_abc123_trx", "none")
-    hass.states.async_set("sensor.goe_abc123_lri", "DEADBEEF")
+    # Register go-e sensor entities with valid states (matching real hardware)
+    hass.states.async_set("sensor.goe_abc123_car_value", "Idle")
+    hass.states.async_set("sensor.goe_abc123_wh", "0.0")
+    hass.states.async_set("sensor.goe_abc123_nrg_11", "0")
+    hass.states.async_set("select.goe_abc123_trx", "null")
 
     # Step 0 — init flow, should show charger_type form
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
     assert result["type"] == FlowResultType.FORM
-    assert result["step_id"] == "charger_type"
+    assert result["step_id"] == "user"
 
-    # Step 0 — submit profile selection
+    # Step 0 — submit profile selection (go-e has serial → routes to serial step)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {CONF_CHARGER_PROFILE: "goe_gemini"},
     )
     assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "serial"
+
+    # Step 0b — submit serial number
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_CHARGER_SERIAL: "abc123"},
+    )
+    assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "charger_entities"
 
-    # Step 1 — submit go-e entity mapping
+    # Step 1 — submit go-e entity mapping (matching real hardware entities)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {
-            CONF_CAR_STATUS_ENTITY: "sensor.goe_abc123_car_0",
-            CONF_CAR_STATUS_CHARGING_VALUE: 2,
+            CONF_CAR_STATUS_ENTITY: "sensor.goe_abc123_car_value",
+            CONF_CAR_STATUS_CHARGING_VALUE: "Charging",
             CONF_ENERGY_ENTITY: "sensor.goe_abc123_wh",
-            CONF_ENERGY_UNIT: "Wh",
-            CONF_POWER_ENTITY: "sensor.goe_abc123_nrg_total_power",
-            CONF_RFID_ENTITY: "sensor.goe_abc123_trx",
-            CONF_RFID_UID_ENTITY: "sensor.goe_abc123_lri",
+            CONF_ENERGY_UNIT: "kWh",
+            CONF_POWER_ENTITY: "sensor.goe_abc123_nrg_11",
+            CONF_RFID_ENTITY: "select.goe_abc123_trx",
             CONF_CHARGER_NAME: "My go-e Charger",
             CONF_CHARGER_HOST: "192.168.1.100",
         },
@@ -83,13 +90,14 @@ async def test_config_flow_goe_happy_path(hass: HomeAssistant) -> None:
 
     data = result["data"]
     assert data[CONF_CHARGER_PROFILE] == "goe_gemini"
-    assert data[CONF_CAR_STATUS_ENTITY] == "sensor.goe_abc123_car_0"
-    assert data[CONF_CAR_STATUS_CHARGING_VALUE] == 2
+    assert data[CONF_CHARGER_SERIAL] == "abc123"
+    assert data[CONF_CAR_STATUS_ENTITY] == "sensor.goe_abc123_car_value"
+    assert data[CONF_CAR_STATUS_CHARGING_VALUE] == "Charging"
     assert data[CONF_ENERGY_ENTITY] == "sensor.goe_abc123_wh"
-    assert data[CONF_ENERGY_UNIT] == "Wh"
-    assert data[CONF_POWER_ENTITY] == "sensor.goe_abc123_nrg_total_power"
-    assert data[CONF_RFID_ENTITY] == "sensor.goe_abc123_trx"
-    assert data[CONF_RFID_UID_ENTITY] == "sensor.goe_abc123_lri"
+    assert data[CONF_ENERGY_UNIT] == "kWh"
+    assert data[CONF_POWER_ENTITY] == "sensor.goe_abc123_nrg_11"
+    assert data[CONF_RFID_ENTITY] == "select.goe_abc123_trx"
+    assert data[CONF_RFID_UID_ENTITY] is None
     assert data[CONF_CHARGER_HOST] == "192.168.1.100"
     assert data[CONF_CHARGER_NAME] == "My go-e Charger"
     assert data[CONF_PRICING_MODE] == "static"
@@ -279,9 +287,11 @@ def test_charger_profiles_structure() -> None:
     assert "generic" in CHARGER_PROFILES
 
     goe = CHARGER_PROFILES["goe_gemini"]
-    assert goe["car_status_charging_value"] == 2
+    assert goe["car_status_charging_value"] == "Charging"
     assert goe["requires_charger_host"] is True
     assert "{serial}" in goe["car_status_sensor"]
+    assert goe["session_energy_unit"] == "kWh"
+    assert goe["rfid_last_uid_sensor"] is None
 
     generic = CHARGER_PROFILES["generic"]
     assert generic["requires_charger_host"] is False

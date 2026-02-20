@@ -10,7 +10,19 @@ from homeassistant.helpers import device_registry as dr
 
 from .charger_profiles import CHARGER_PROFILES
 from .config_store import ConfigStore
-from .const import CONF_CHARGER_NAME, CONF_CHARGER_PROFILE, DEFAULT_CHARGER_NAME, DOMAIN
+from .const import (
+    CONF_CHARGER_NAME,
+    CONF_CHARGER_PROFILE,
+    CONF_MAX_STORED_SESSIONS,
+    CONF_PERSISTENCE_INTERVAL_S,
+    DEFAULT_CHARGER_NAME,
+    DEFAULT_MAX_STORED_SESSIONS,
+    DEFAULT_PERSISTENCE_INTERVAL_S,
+    DOMAIN,
+    PLATFORMS,
+)
+from .session_engine import SessionEngine
+from .session_store import SessionStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -89,10 +101,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         model=model,
     )
 
+    # Set up session store and load persisted sessions
+    max_sessions = entry.options.get(CONF_MAX_STORED_SESSIONS, DEFAULT_MAX_STORED_SESSIONS)
+    session_store = SessionStore(hass, max_sessions=max_sessions)
+    await session_store.async_load()
+
+    # Set up session engine and register state listeners
+    session_engine = SessionEngine(hass, entry, config_store, session_store)
+    session_engine.async_setup()
+
+    # Schedule periodic persistence of active session
+    persistence_interval = entry.options.get(CONF_PERSISTENCE_INTERVAL_S, DEFAULT_PERSISTENCE_INTERVAL_S)
+    session_store.schedule_periodic_save(
+        hass,
+        entry,
+        persistence_interval,
+        session_engine.get_active_session_dict,
+    )
+
+    hass.data[DOMAIN][entry.entry_id]["session_store"] = session_store
+    hass.data[DOMAIN][entry.entry_id]["session_engine"] = session_engine
+
+    # Forward setup to sensor and binary_sensor platforms
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    hass.data[DOMAIN].pop(entry.entry_id, None)
-    return True
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+    return unload_ok

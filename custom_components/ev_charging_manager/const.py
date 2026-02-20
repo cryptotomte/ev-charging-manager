@@ -1,5 +1,9 @@
 """Constants for EV Charging Manager."""
 
+from enum import StrEnum
+
+from homeassistant.const import Platform
+
 DOMAIN = "ev_charging_manager"
 
 # Configuration keys
@@ -44,9 +48,45 @@ DEFAULT_CHARGER_NAME = "EV Charger"
 DEFAULT_ENERGY_UNIT = "Wh"
 DEFAULT_PRICING_MODE = "static"
 DEFAULT_STATIC_PRICE_KWH = 2.50
-DEFAULT_CAR_STATUS_CHARGING_VALUE = 2
+DEFAULT_CAR_STATUS_CHARGING_VALUE = "Charging"
 DEFAULT_CHARGING_EFFICIENCY = 0.90
 
 # ConfigStore settings
 STORE_KEY = "ev_charging_manager_config"
 STORE_VERSION = 1
+
+
+# Session engine state
+class SessionEngineState(StrEnum):
+    """States for the session engine state machine."""
+
+    IDLE = "idle"
+    TRACKING = "tracking"
+    COMPLETING = "completing"
+
+
+# Session options configuration keys
+CONF_MIN_SESSION_DURATION_S = "min_session_duration_s"
+CONF_MIN_SESSION_ENERGY_WH = "min_session_energy_wh"
+CONF_PERSISTENCE_INTERVAL_S = "persistence_interval_s"
+CONF_MAX_STORED_SESSIONS = "max_stored_sessions"
+
+# Session options defaults
+DEFAULT_MIN_SESSION_DURATION_S = 60
+DEFAULT_MIN_SESSION_ENERGY_WH = 50
+DEFAULT_PERSISTENCE_INTERVAL_S = 300
+DEFAULT_MAX_STORED_SESSIONS = 1000
+
+# Session store settings
+SESSION_STORE_KEY = "ev_charging_manager_sessions"
+SESSION_STORE_VERSION = 1
+
+# Session lifecycle events
+EVENT_SESSION_STARTED = "ev_charging_manager_session_started"
+EVENT_SESSION_COMPLETED = "ev_charging_manager_session_completed"
+
+# Dispatcher signal for sensor updates (format with entry_id)
+SIGNAL_SESSION_UPDATE = "ev_charging_manager_session_update_{}"
+
+# Platforms to forward to
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]

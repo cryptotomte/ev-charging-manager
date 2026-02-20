@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ev_charging_manager.config_store import ConfigStore
+from custom_components.ev_charging_manager.const import DOMAIN
 
 # Standard mock data for charger config entry
 MOCK_CHARGER_DATA = {
@@ -115,3 +116,93 @@ async def setup_entry_with_subentries(
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return hass.config_entries.async_get_entry(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Session engine fixtures (PR-03: Core Session Engine)
+# ---------------------------------------------------------------------------
+
+# Entity IDs for mock charger (matching MOCK_CHARGER_DATA serial "abc123")
+MOCK_CAR_STATUS_ENTITY = "sensor.goe_abc123_car_value"
+MOCK_TRX_ENTITY = "select.goe_abc123_trx"
+MOCK_ENERGY_ENTITY = "sensor.goe_abc123_wh"
+MOCK_POWER_ENTITY = "sensor.goe_abc123_nrg_11"
+
+# Vehicle subentry data for session tests (Peugeot 3008 PHEV)
+MOCK_VEHICLE_SUBENTRY = {
+    "name": "Peugeot 3008 PHEV",
+    "battery_capacity_kwh": 14.4,
+    "usable_battery_kwh": 14.4,
+    "charging_phases": 1,
+    "max_charging_power_kw": 3.7,
+    "charging_efficiency": 0.88,
+}
+
+# User subentry data for session tests (Petra, regular)
+MOCK_USER_SUBENTRY = {
+    "name": "Petra",
+    "type": "regular",
+    "active": True,
+    "created_at": "2026-01-01T00:00:00+00:00",
+}
+
+# RFID mapping subentry data: card_index=1 (trx=2), linked to Petra + Peugeot
+MOCK_RFID_SUBENTRY = {
+    "card_index": 1,
+    "card_uid": "04:B7:C8:D2:E1:F3:A2",
+    "user_id": "mock_user_subentry_id",
+    "vehicle_id": "mock_vehicle_subentry_id",
+    "active": True,
+    "deactivated_by": None,
+}
+
+
+@pytest.fixture
+def mock_session_engine_entry() -> MockConfigEntry:
+    """Return a full config entry for session engine tests.
+
+    Includes charger data. Subentries (vehicle, user, RFID) must be added
+    separately via entry.add_subentry() in tests that need them.
+    """
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        title="My go-e Charger",
+    )
+
+
+async def setup_session_engine(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> ConfigEntry:
+    """Set up the full integration including session engine and sensor platforms.
+
+    Initializes charger entity states to idle/null before setup so listeners
+    are registered with a clean baseline.
+    """
+    # Pre-set charger entities to idle state
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return hass.config_entries.async_get_entry(entry.entry_id)
+
+
+async def start_charging_session(
+    hass: HomeAssistant,
+    trx_value: str = "2",
+) -> None:
+    """Simulate a charger starting a session by firing state changes."""
+    hass.states.async_set(MOCK_TRX_ENTITY, trx_value)
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+
+async def stop_charging_session(hass: HomeAssistant) -> None:
+    """Simulate a charger ending a session."""
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    await hass.async_block_till_done()

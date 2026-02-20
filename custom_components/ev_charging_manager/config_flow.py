@@ -11,6 +11,7 @@ from homeassistant.config_entries import (
     ConfigFlow,
     ConfigFlowResult,
     ConfigSubentryFlow,
+    OptionsFlow,
     SubentryFlowResult,
 )
 from homeassistant.core import callback
@@ -26,6 +27,10 @@ from .const import (
     CONF_CHARGER_SERIAL,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
+    CONF_MAX_STORED_SESSIONS,
+    CONF_MIN_SESSION_DURATION_S,
+    CONF_MIN_SESSION_ENERGY_WH,
+    CONF_PERSISTENCE_INTERVAL_S,
     CONF_POWER_ENTITY,
     CONF_PRICING_MODE,
     CONF_RFID_ENTITY,
@@ -35,6 +40,10 @@ from .const import (
     DEFAULT_CHARGER_NAME,
     DEFAULT_CHARGING_EFFICIENCY,
     DEFAULT_ENERGY_UNIT,
+    DEFAULT_MAX_STORED_SESSIONS,
+    DEFAULT_MIN_SESSION_DURATION_S,
+    DEFAULT_MIN_SESSION_ENERGY_WH,
+    DEFAULT_PERSISTENCE_INTERVAL_S,
     DEFAULT_PRICING_MODE,
     DEFAULT_STATIC_PRICE_KWH,
     DOMAIN,
@@ -83,6 +92,12 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the EV Charging Manager config flow."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Return the options flow handler."""
+        return OptionsFlowHandler()
 
     @classmethod
     @callback
@@ -323,6 +338,72 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                 "charger_name": charger_name,
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Options flow
+# ---------------------------------------------------------------------------
+
+
+class OptionsFlowHandler(OptionsFlow):
+    """Handle EV Charging Manager options."""
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        opts = self.config_entry.options
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_MIN_SESSION_DURATION_S,
+                    default=opts.get(CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0, max=3600, step=1, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_MIN_SESSION_ENERGY_WH,
+                    default=opts.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0, max=10000, step=1, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_PERSISTENCE_INTERVAL_S,
+                    default=opts.get(CONF_PERSISTENCE_INTERVAL_S, DEFAULT_PERSISTENCE_INTERVAL_S),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=60, max=3600, step=1, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_MAX_STORED_SESSIONS,
+                    default=opts.get(CONF_MAX_STORED_SESSIONS, DEFAULT_MAX_STORED_SESSIONS),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=100, max=10000, step=1, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+            }
+        )
+
+        return self.async_show_form(step_id="init", data_schema=schema)
 
 
 # ---------------------------------------------------------------------------

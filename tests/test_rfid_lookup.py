@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from custom_components.ev_charging_manager.rfid_lookup import RfidLookup
 
 # ---------------------------------------------------------------------------
@@ -41,16 +39,19 @@ MAPPING_INACTIVE = {
 
 def make_lookup(mappings=None, users=None, vehicles=None) -> RfidLookup:
     """Build a RfidLookup with optional test data."""
-    return RfidLookup({
-        "rfid_mappings": mappings or [],
-        "users": users or [],
-        "vehicles": vehicles or [],
-    })
+    return RfidLookup(
+        {
+            "rfid_mappings": mappings or [],
+            "users": users or [],
+            "vehicles": vehicles or [],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 def test_trx_none_returns_none():
     """trx=None means no session — return None."""
@@ -115,6 +116,7 @@ def test_type_agnostic_int_vs_string():
 def test_unmapped_index_returns_unknown(caplog):
     """trx=5 with no mapping for index 4 → Unknown/unmapped + warning."""
     import logging
+
     lookup = make_lookup()
     with caplog.at_level(logging.WARNING):
         result = lookup.resolve(5)
@@ -128,6 +130,7 @@ def test_unmapped_index_returns_unknown(caplog):
 def test_inactive_mapping_returns_unknown(caplog):
     """Inactive RFID card → Unknown/rfid_inactive + warning."""
     import logging
+
     lookup = make_lookup(
         mappings=[MAPPING_INACTIVE],
         users=[USER_PETRA],
@@ -144,6 +147,7 @@ def test_inactive_mapping_returns_unknown(caplog):
 def test_unexpected_format_returns_unknown(caplog):
     """trx='abc' is unexpected format → Unknown + warning."""
     import logging
+
     lookup = make_lookup()
     with caplog.at_level(logging.WARNING):
         result = lookup.resolve("abc")

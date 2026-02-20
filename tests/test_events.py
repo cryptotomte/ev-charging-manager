@@ -27,11 +27,17 @@ from tests.conftest import (
 
 async def _add_vehicle(hass, entry_id, name="Peugeot 3008 PHEV", battery=14.4) -> str:
     result = await hass.config_entries.subentries.async_init(
-        (entry_id, "vehicle"), context={"source": "user"},
+        (entry_id, "vehicle"),
+        context={"source": "user"},
     )
     await hass.config_entries.subentries.async_configure(
         result["flow_id"],
-        {"name": name, "battery_capacity_kwh": battery, "charging_phases": "1", "charging_efficiency": 0.88},
+        {
+            "name": name,
+            "battery_capacity_kwh": battery,
+            "charging_phases": "1",
+            "charging_efficiency": 0.88,
+        },
     )
     await hass.async_block_till_done()
     entry = hass.config_entries.async_get_entry(entry_id)
@@ -40,10 +46,12 @@ async def _add_vehicle(hass, entry_id, name="Peugeot 3008 PHEV", battery=14.4) -
 
 async def _add_user(hass, entry_id, name="Petra") -> str:
     result = await hass.config_entries.subentries.async_init(
-        (entry_id, "user"), context={"source": "user"},
+        (entry_id, "user"),
+        context={"source": "user"},
     )
     await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"name": name, "type": "regular"},
+        result["flow_id"],
+        {"name": name, "type": "regular"},
     )
     await hass.async_block_till_done()
     entry = hass.config_entries.async_get_entry(entry_id)
@@ -52,7 +60,8 @@ async def _add_user(hass, entry_id, name="Petra") -> str:
 
 async def _add_rfid(hass, entry_id, card_index, user_id, vehicle_id=None) -> None:
     result = await hass.config_entries.subentries.async_init(
-        (entry_id, "rfid_mapping"), context={"source": "user"},
+        (entry_id, "rfid_mapping"),
+        context={"source": "user"},
     )
     user_input = {"card_index": str(card_index), "user_id": user_id}
     if vehicle_id:

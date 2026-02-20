@@ -11,8 +11,13 @@ from custom_components.ev_charging_manager.session_store import SessionStore
 
 
 def make_session(session_id: str = "abc", energy: float = 5.0) -> dict:
-    """Create a minimal session dict for testing."""
-    return {"id": session_id, "energy_kwh": energy, "user_name": "Petra"}
+    """Create a minimal completed session dict for testing."""
+    return {
+        "id": session_id,
+        "energy_kwh": energy,
+        "user_name": "Petra",
+        "ended_at": "2026-03-01T12:00:00+00:00",
+    }
 
 
 @pytest.fixture
@@ -100,9 +105,24 @@ async def test_periodic_save_is_scheduled(hass: HomeAssistant):
     # Interval should be 300 seconds
     call_args = mock_track.call_args
     from datetime import timedelta
+
     assert call_args[0][2] == timedelta(seconds=300)
     # Unload callback should be registered
     assert len(unload_callbacks) == 1
+
+
+async def test_load_discards_incomplete_session_snapshots(hass: HomeAssistant):
+    """Incomplete sessions (ended_at=None) from crash recovery are discarded on load."""
+    stored_data = [
+        make_session("completed_1"),
+        {"id": "incomplete", "energy_kwh": 1.0, "user_name": "Test"},  # no ended_at
+    ]
+    store = SessionStore(hass)
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored_data):
+        result = await store.async_load()
+    assert len(result) == 1
+    assert result[0]["id"] == "completed_1"
+    assert store.sessions == result
 
 
 async def test_save_active_session(hass: HomeAssistant):

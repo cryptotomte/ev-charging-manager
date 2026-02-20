@@ -29,7 +29,9 @@ class SessionStore:
     Retention: when sessions exceed max_sessions, oldest (index 0) are pruned.
     """
 
-    def __init__(self, hass: HomeAssistant, max_sessions: int = DEFAULT_MAX_STORED_SESSIONS) -> None:
+    def __init__(
+        self, hass: HomeAssistant, max_sessions: int = DEFAULT_MAX_STORED_SESSIONS
+    ) -> None:
         """Initialize the session store."""
         self._store: Store[list[dict[str, Any]]] = Store(
             hass, SESSION_STORE_VERSION, SESSION_STORE_KEY
@@ -49,7 +51,15 @@ class SessionStore:
             _LOGGER.debug("No existing session store found, starting fresh")
             self._sessions = []
         else:
-            self._sessions = stored
+            # Filter out in-progress snapshots left by async_save_active_session
+            # (ended_at is None/missing for incomplete sessions)
+            complete = [s for s in stored if s.get("ended_at") is not None]
+            if len(complete) < len(stored):
+                _LOGGER.info(
+                    "Discarded %d incomplete session snapshot(s) from storage",
+                    len(stored) - len(complete),
+                )
+            self._sessions = complete
             _LOGGER.debug("Loaded %d sessions from storage", len(self._sessions))
         return self._sessions
 

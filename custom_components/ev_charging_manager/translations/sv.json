@@ -66,6 +66,42 @@
             "already_configured": "Denna integration är redan konfigurerad. Varje laddare kräver en separat instans."
         }
     },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Sessionsmotoralternativ",
+                "description": "Justera inställningar för sessionsfiltrering och sparning.",
+                "data": {
+                    "min_session_duration_s": "Minsta sessionslängd (sekunder)",
+                    "min_session_energy_wh": "Minsta sessionsenergi (Wh)",
+                    "persistence_interval_s": "Intervall för autosparning (sekunder)",
+                    "max_stored_sessions": "Maximalt antal lagrade sessioner"
+                },
+                "data_description": {
+                    "min_session_duration_s": "Sessioner kortare än detta kasseras som mikrosessioner (0–3600 s, standard 60)",
+                    "min_session_energy_wh": "Sessioner med mindre energi än detta kasseras (0–10000 Wh, standard 50)",
+                    "persistence_interval_s": "Hur ofta en aktiv session sparas till disk vid HA-omstart (60–3600 s, standard 300)",
+                    "max_stored_sessions": "Äldsta sessioner tas bort när denna gräns överskrids (100–10000, standard 1000)"
+                }
+            }
+        }
+    },
+    "entity": {
+        "sensor": {
+            "current_user": { "name": "Aktuell anv\u00e4ndare" },
+            "current_vehicle": { "name": "Aktuellt fordon" },
+            "session_energy": { "name": "Sessionsenergi" },
+            "session_duration": { "name": "Sessionsl\u00e4ngd" },
+            "session_cost": { "name": "Sessionskostnad" },
+            "session_charge_price": { "name": "Laddpris" },
+            "session_power": { "name": "Sessionseffekt" },
+            "session_soc_added": { "name": "SoC tillagd" },
+            "status": { "name": "Status" }
+        },
+        "binary_sensor": {
+            "charging": { "name": "Laddar" }
+        }
+    },
     "config_subentries": {
         "vehicle": {
             "entry_type": "Fordon",

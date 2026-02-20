@@ -55,6 +55,7 @@ DEFAULT_CHARGING_EFFICIENCY = 0.90
 STORE_KEY = "ev_charging_manager_config"
 STORE_VERSION = 1
 
+
 # Session engine state
 class SessionEngineState(StrEnum):
     """States for the session engine state machine."""
@@ -62,6 +63,7 @@ class SessionEngineState(StrEnum):
     IDLE = "idle"
     TRACKING = "tracking"
     COMPLETING = "completing"
+
 
 # Session options configuration keys
 CONF_MIN_SESSION_DURATION_S = "min_session_duration_s"

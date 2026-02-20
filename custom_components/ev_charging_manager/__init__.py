@@ -111,7 +111,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     session_engine.async_setup()
 
     # Schedule periodic persistence of active session
-    persistence_interval = entry.options.get(CONF_PERSISTENCE_INTERVAL_S, DEFAULT_PERSISTENCE_INTERVAL_S)
+    persistence_interval = entry.options.get(
+        CONF_PERSISTENCE_INTERVAL_S, DEFAULT_PERSISTENCE_INTERVAL_S
+    )
     session_store.schedule_periodic_save(
         hass,
         entry,

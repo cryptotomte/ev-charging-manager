@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-import pytest
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -23,23 +22,20 @@ from tests.conftest import (
     MOCK_CAR_STATUS_ENTITY,
     MOCK_CHARGER_DATA,
     MOCK_ENERGY_ENTITY,
-    MOCK_POWER_ENTITY,
-    MOCK_RFID_SUBENTRY,
     MOCK_TRX_ENTITY,
-    MOCK_USER_SUBENTRY,
-    MOCK_VEHICLE_SUBENTRY,
     setup_session_engine,
     start_charging_session,
     stop_charging_session,
 )
 
-
 # ---------------------------------------------------------------------------
 # Subentry helpers (using HA subentry flow API, same as lifecycle tests)
 # ---------------------------------------------------------------------------
 
-async def _add_vehicle(hass, entry_id, name="Peugeot 3008 PHEV",
-                       battery=14.4, efficiency=0.88) -> str:
+
+async def _add_vehicle(
+    hass, entry_id, name="Peugeot 3008 PHEV", battery=14.4, efficiency=0.88
+) -> str:
     """Add a vehicle subentry and return its subentry_id."""
     result = await hass.config_entries.subentries.async_init(
         (entry_id, "vehicle"),
@@ -55,7 +51,11 @@ async def _add_vehicle(hass, entry_id, name="Peugeot 3008 PHEV",
         },
     )
     await hass.async_block_till_done()
-    return result.get("result", {}).subentry_id if hasattr(result.get("result", None), "subentry_id") else _get_last_subentry_id(hass, entry_id, "vehicle")
+    return (
+        result.get("result", {}).subentry_id
+        if hasattr(result.get("result", None), "subentry_id")
+        else _get_last_subentry_id(hass, entry_id, "vehicle")
+    )
 
 
 async def _add_user(hass, entry_id, name="Petra") -> str:
@@ -105,6 +105,7 @@ async def _setup_full_engine(hass, entry_id) -> None:
 # ---------------------------------------------------------------------------
 # T014: State machine transition tests
 # ---------------------------------------------------------------------------
+
 
 async def test_idle_to_tracking_on_charging_with_trx(hass: HomeAssistant):
     """IDLE → TRACKING when car_value=Charging and trx is set."""
@@ -266,6 +267,7 @@ async def test_duration_calculated_on_session_end(hass: HomeAssistant):
 async def test_network_gap_sensor_unavailable_session_continues(hass: HomeAssistant, caplog):
     """Mid-session energy sensor unavailability keeps last value + logs warning."""
     import logging
+
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
     await setup_session_engine(hass, entry)
 
@@ -321,6 +323,7 @@ async def test_mid_session_trx_change_snapshot_preserved(hass: HomeAssistant):
 # T015: Unknown user tests (US2)
 # ---------------------------------------------------------------------------
 
+
 async def test_trx_zero_creates_unknown_session(hass: HomeAssistant):
     """trx=0 creates a session with user=Unknown/no_rfid."""
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
@@ -341,6 +344,7 @@ async def test_trx_zero_creates_unknown_session(hass: HomeAssistant):
 async def test_unmapped_trx_creates_unknown_session(hass: HomeAssistant, caplog):
     """trx=5 with no mapping for index 4 creates Unknown session + warning."""
     import logging
+
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
     await setup_session_engine(hass, entry)
 
@@ -357,6 +361,7 @@ async def test_unmapped_trx_creates_unknown_session(hass: HomeAssistant, caplog)
 async def test_inactive_rfid_creates_unknown_session(hass: HomeAssistant, caplog):
     """Inactive RFID card creates Unknown/rfid_inactive session + warning."""
     import logging
+
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
     await setup_session_engine(hass, entry)
 
@@ -409,6 +414,7 @@ async def test_type_agnostic_trx_int_vs_string(hass: HomeAssistant):
 # ---------------------------------------------------------------------------
 # T022: RFID UID tests (US6)
 # ---------------------------------------------------------------------------
+
 
 async def test_lri_sensor_uid_captured(hass: HomeAssistant):
     """When lri/tsi entity has a UID, it is stored in session.rfid_uid."""
@@ -468,3 +474,38 @@ async def test_uid_included_in_session_started_event(hass: HomeAssistant):
 
     assert len(started_events) == 1
     assert started_events[0].data["rfid_uid"] == "AB:CD:EF:12:34:56:78"
+
+
+async def test_two_chargers_independent(hass: HomeAssistant):
+    """Two config entries (two chargers) use independent SessionEngines."""
+
+    # Second charger with distinct entity IDs
+    charger_b_data = {
+        **MOCK_CHARGER_DATA,
+        "car_status_entity": "sensor.charger_b_car_value",
+        "rfid_entity": "select.charger_b_trx",
+        "energy_entity": "sensor.charger_b_wh",
+        "power_entity": "sensor.charger_b_nrg_11",
+        "charger_name": "Charger B",
+    }
+
+    entry_a = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Charger A")
+    entry_b = MockConfigEntry(domain=DOMAIN, data=charger_b_data, title="Charger B")
+
+    await setup_session_engine(hass, entry_a)
+    await setup_session_engine(hass, entry_b)
+
+    engine_a = hass.data[DOMAIN][entry_a.entry_id]["session_engine"]
+    engine_b = hass.data[DOMAIN][entry_b.entry_id]["session_engine"]
+
+    # Start session on charger A only
+    await start_charging_session(hass, trx_value="0")
+
+    assert engine_a.state == SessionEngineState.TRACKING
+    assert engine_b.state == SessionEngineState.IDLE
+
+    # Stop charger A — charger B remains idle
+    await stop_charging_session(hass)
+
+    assert engine_a.state == SessionEngineState.IDLE
+    assert engine_b.state == SessionEngineState.IDLE

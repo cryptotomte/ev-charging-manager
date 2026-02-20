@@ -28,17 +28,19 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up EV Charging Manager sensor entities from a config entry."""
-    async_add_entities([
-        CurrentUserSensor(hass, entry),
-        CurrentVehicleSensor(hass, entry),
-        SessionEnergySensor(hass, entry),
-        SessionDurationSensor(hass, entry),
-        SessionCostSensor(hass, entry),
-        SessionChargePriceSensor(hass, entry),
-        SessionPowerSensor(hass, entry),
-        SessionSocAddedSensor(hass, entry),
-        StatusSensor(hass, entry),
-    ])
+    async_add_entities(
+        [
+            CurrentUserSensor(hass, entry),
+            CurrentVehicleSensor(hass, entry),
+            SessionEnergySensor(hass, entry),
+            SessionDurationSensor(hass, entry),
+            SessionCostSensor(hass, entry),
+            SessionChargePriceSensor(hass, entry),
+            SessionPowerSensor(hass, entry),
+            SessionSocAddedSensor(hass, entry),
+            StatusSensor(hass, entry),
+        ]
+    )
 
 
 class _SessionSensorBase(SensorEntity):
@@ -67,9 +69,7 @@ class _SessionSensorBase(SensorEntity):
     async def async_added_to_hass(self) -> None:
         """Subscribe to SessionEngine dispatcher signal."""
         signal = SIGNAL_SESSION_UPDATE.format(self._entry.entry_id)
-        self.async_on_remove(
-            async_dispatcher_connect(self._hass, signal, self._handle_update)
-        )
+        self.async_on_remove(async_dispatcher_connect(self._hass, signal, self._handle_update))
 
     def _engine(self):
         """Return the SessionEngine for this entry."""
@@ -87,6 +87,11 @@ class _SessionSensorBase(SensorEntity):
             return None
         return engine.active_session
 
+    @property
+    def available(self) -> bool:
+        """Return True only when a session is active (TRACKING state)."""
+        return self._is_tracking()
+
 
 class CurrentUserSensor(_SessionSensorBase):
     """Shows the name of the user currently charging."""
@@ -97,8 +102,7 @@ class CurrentUserSensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_current_user"
-        self._attr_name = "Current User"
-        self.entity_id = f"sensor.{DOMAIN}_current_user"
+        self._attr_translation_key = "current_user"
 
     @property
     def native_value(self) -> str | None:
@@ -116,7 +120,7 @@ class CurrentVehicleSensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_current_vehicle"
-        self._attr_name = "Current Vehicle"
+        self._attr_translation_key = "current_vehicle"
 
     @property
     def native_value(self) -> str | None:
@@ -137,7 +141,7 @@ class SessionEnergySensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_session_energy"
-        self._attr_name = "Session Energy"
+        self._attr_translation_key = "session_energy"
 
     @property
     def native_value(self) -> float | None:
@@ -158,7 +162,7 @@ class SessionDurationSensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_session_duration"
-        self._attr_name = "Session Duration"
+        self._attr_translation_key = "session_duration"
 
     @property
     def native_value(self) -> str | None:
@@ -166,7 +170,9 @@ class SessionDurationSensor(_SessionSensorBase):
         if session is None:
             return None
         from datetime import datetime
+
         from homeassistant.util import dt as dt_util
+
         try:
             started = datetime.fromisoformat(session.started_at)
             elapsed = int((dt_util.utcnow() - started).total_seconds())
@@ -188,7 +194,7 @@ class SessionCostSensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_session_cost"
-        self._attr_name = "Session Cost"
+        self._attr_translation_key = "session_cost"
 
     @property
     def native_value(self) -> float | None:
@@ -207,7 +213,12 @@ class SessionChargePriceSensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_session_charge_price"
-        self._attr_name = "Session Charge Price"
+        self._attr_translation_key = "session_charge_price"
+
+    @property
+    def available(self) -> bool:
+        """Always unavailable — charge price not implemented until PR-06."""
+        return False
 
     @property
     def native_value(self) -> None:
@@ -226,7 +237,7 @@ class SessionPowerSensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_session_power"
-        self._attr_name = "Session Power"
+        self._attr_translation_key = "session_power"
 
     @property
     def native_value(self) -> float | None:
@@ -245,7 +256,15 @@ class SessionSocAddedSensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_session_soc_added"
-        self._attr_name = "Session SoC Added"
+        self._attr_translation_key = "session_soc_added"
+
+    @property
+    def available(self) -> bool:
+        """Available only when tracking AND vehicle battery capacity is known."""
+        session = self._active_session()
+        if session is None:
+            return False
+        return session.vehicle_battery_kwh is not None
 
     @property
     def native_value(self) -> float | None:
@@ -274,7 +293,12 @@ class StatusSensor(_SessionSensorBase):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
         self._attr_unique_id = f"{entry.entry_id}_status"
-        self._attr_name = "Status"
+        self._attr_translation_key = "status"
+
+    @property
+    def available(self) -> bool:
+        """Always available — status sensor never goes unavailable."""
+        return True
 
     @property
     def native_value(self) -> str:

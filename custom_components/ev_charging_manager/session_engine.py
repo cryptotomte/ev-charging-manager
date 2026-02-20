@@ -17,19 +17,15 @@ from .const import (
     CONF_CAR_STATUS_ENTITY,
     CONF_CHARGER_NAME,
     CONF_ENERGY_ENTITY,
-    CONF_MAX_STORED_SESSIONS,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
-    CONF_PERSISTENCE_INTERVAL_S,
     CONF_POWER_ENTITY,
     CONF_RFID_ENTITY,
     CONF_RFID_UID_ENTITY,
     CONF_STATIC_PRICE_KWH,
     DEFAULT_CAR_STATUS_CHARGING_VALUE,
-    DEFAULT_MAX_STORED_SESSIONS,
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
-    DEFAULT_PERSISTENCE_INTERVAL_S,
     DEFAULT_STATIC_PRICE_KWH,
     EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
@@ -194,12 +190,16 @@ class SessionEngine:
     def _handle_idle_state(self) -> None:
         """Evaluate IDLE → TRACKING transition."""
         if self._is_charging() and self._is_trx_active():
+            # Set state synchronously to prevent duplicate tasks from rapid events
+            self._state = SessionEngineState.TRACKING
             self._hass.async_create_task(self._async_start_session())
 
     def _handle_tracking_state(self, event: Event) -> None:
         """Update session or evaluate TRACKING → COMPLETING transition."""
         # Check for session end condition first
         if not self._is_charging():
+            # Set state synchronously to prevent duplicate completion tasks
+            self._state = SessionEngineState.COMPLETING
             self._hass.async_create_task(self._async_complete_session())
             return
 
@@ -331,8 +331,12 @@ class SessionEngine:
             session.avg_power_w = 0.0
 
         # Read options with defaults
-        min_duration = self._entry.options.get(CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S)
-        min_energy_wh = self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
+        min_duration = self._entry.options.get(
+            CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
+        )
+        min_energy_wh = self._entry.options.get(
+            CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH
+        )
         min_energy_kwh = min_energy_wh / 1000.0
 
         _LOGGER.info(

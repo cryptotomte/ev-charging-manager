@@ -23,6 +23,7 @@ from .const import (
     CONF_CHARGER_HOST,
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
+    CONF_CHARGER_SERIAL,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
     CONF_POWER_ENTITY,
@@ -99,20 +100,34 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self.data: dict[str, Any] = {}
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Handle the initial step — redirect to charger type selection."""
-        return await self.async_step_charger_type()
+    @staticmethod
+    def _profile_needs_serial(profile: dict[str, Any]) -> bool:
+        """Check if any sensor pattern in the profile contains {serial}."""
+        for key, value in profile.items():
+            if isinstance(value, str) and "{serial}" in value:
+                return True
+        return False
 
-    async def async_step_charger_type(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Step 0: Select charger profile."""
+    def _resolve_suggested(self, pattern: str | None) -> str | None:
+        """Replace {serial} placeholder with actual serial number."""
+        if pattern is None:
+            return None
+        serial = self.data.get(CONF_CHARGER_SERIAL)
+        if serial and "{serial}" in pattern:
+            return pattern.replace("{serial}", serial)
+        return pattern
+
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Handle the initial step — select charger type."""
         if user_input is not None:
             self.data[CONF_CHARGER_PROFILE] = user_input[CONF_CHARGER_PROFILE]
+            profile = CHARGER_PROFILES[self.data[CONF_CHARGER_PROFILE]]
+            if self._profile_needs_serial(profile):
+                return await self.async_step_serial()
             return await self.async_step_charger_entities()
 
         return self.async_show_form(
-            step_id="charger_type",
+            step_id="user",
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_CHARGER_PROFILE): selector.SelectSelector(
@@ -124,6 +139,21 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                             mode=selector.SelectSelectorMode.LIST,
                         )
                     ),
+                }
+            ),
+        )
+
+    async def async_step_serial(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Step 0b: Ask for charger serial number (profiles with {serial} patterns)."""
+        if user_input is not None:
+            self.data[CONF_CHARGER_SERIAL] = user_input[CONF_CHARGER_SERIAL]
+            return await self.async_step_charger_entities()
+
+        return self.async_show_form(
+            step_id="serial",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_CHARGER_SERIAL): selector.TextSelector(),
                 }
             ),
         )
@@ -166,7 +196,7 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
             _make_entity_key(
                 CONF_CAR_STATUS_ENTITY,
                 required=True,
-                suggested=profile.get("car_status_sensor"),
+                suggested=self._resolve_suggested(profile.get("car_status_sensor")),
             ): entity_selector,
             _make_entity_key(
                 CONF_CAR_STATUS_CHARGING_VALUE,
@@ -174,11 +204,11 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                 suggested=str(profile["car_status_charging_value"])
                 if profile.get("car_status_charging_value") is not None
                 else None,
-            ): vol.Any(vol.Coerce(int), str),
+            ): selector.TextSelector(),
             _make_entity_key(
                 CONF_ENERGY_ENTITY,
                 required=True,
-                suggested=profile.get("session_energy_sensor"),
+                suggested=self._resolve_suggested(profile.get("session_energy_sensor")),
             ): entity_selector,
             vol.Required(
                 CONF_ENERGY_UNIT,
@@ -192,23 +222,23 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
             _make_entity_key(
                 CONF_POWER_ENTITY,
                 required=True,
-                suggested=profile.get("power_sensor"),
+                suggested=self._resolve_suggested(profile.get("power_sensor")),
             ): entity_selector,
             _make_entity_key(
                 CONF_RFID_ENTITY,
                 required=False,
-                suggested=profile.get("rfid_sensor"),
-            ): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
+                suggested=self._resolve_suggested(profile.get("rfid_sensor")),
+            ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor", "select"])),
             _make_entity_key(
                 CONF_TOTAL_ENERGY_ENTITY,
                 required=False,
-                suggested=profile.get("total_energy_sensor"),
+                suggested=self._resolve_suggested(profile.get("total_energy_sensor")),
             ): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
             _make_entity_key(
                 CONF_RFID_UID_ENTITY,
                 required=False,
-                suggested=profile.get("rfid_last_uid_sensor"),
-            ): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
+                suggested=self._resolve_suggested(profile.get("rfid_last_uid_sensor")),
+            ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor", "select"])),
             vol.Optional(CONF_CHARGER_NAME, default=DEFAULT_CHARGER_NAME): selector.TextSelector(),
         }
 
@@ -285,11 +315,12 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
             charger_name = self.data.get(CONF_CHARGER_NAME, DEFAULT_CHARGER_NAME)
             return self.async_create_entry(title=charger_name, data=self.data)
 
+        charger_name = self.data.get(CONF_CHARGER_NAME, DEFAULT_CHARGER_NAME)
         return self.async_show_form(
             step_id="confirm",
             data_schema=vol.Schema({}),
             description_placeholders={
-                "charger_name": self.data.get(CONF_CHARGER_NAME, DEFAULT_CHARGER_NAME),
+                "charger_name": charger_name,
             },
         )
 

@@ -1,10 +1,20 @@
 {
     "config": {
         "step": {
-            "charger_type": {
+            "user": {
                 "title": "Välj laddartyp",
                 "data": {
                     "charger_profile": "Laddartyp"
+                }
+            },
+            "serial": {
+                "title": "Laddarens serienummer",
+                "description": "Ange serienumret för din laddare. Det används för att identifiera rätt sensorentiteter. Du hittar det i go-e appen eller på själva laddaren.",
+                "data": {
+                    "charger_serial": "Serienummer"
+                },
+                "data_description": {
+                    "charger_serial": "Laddarens serienummer (t.ex. 409787)"
                 }
             },
             "charger_entities": {
@@ -23,8 +33,8 @@
                     "charger_host": "Laddarens värd / IP"
                 },
                 "data_description": {
-                    "car_status_entity": "Sensor som rapporterar bilens anslutningsstatus (t.ex. sensor.goe_{serial}_car_0)",
-                    "car_status_charging_value": "Sensorvärde som betyder 'laddning pågår' (t.ex. 2 för go-e, 'charging' för Easee)",
+                    "car_status_entity": "Sensor som rapporterar bilens anslutningsstatus (t.ex. sensor.goe_123456_car_value)",
+                    "car_status_charging_value": "Sensorvärde som betyder ''laddning pågår'' (t.ex. 2 för go-e, ''charging'' för Easee)",
                     "energy_entity": "Sensor som rapporterar sessionsenergi",
                     "energy_unit": "Enhet som energisensorn använder",
                     "power_entity": "Sensor som rapporterar aktuell laddningseffekt i Watt",
@@ -44,7 +54,7 @@
             },
             "confirm": {
                 "title": "Slutför installation",
-                "description": "Din EV Charging Manager för '{charger_name}' är redo att installeras. Klicka på Skicka för att slutföra installationen och registrera laddarenheten."
+                "description": "Din EV Charging Manager för ''{charger_name}'' är redo att installeras. Klicka på Skicka för att slutföra installationen och registrera laddarenheten."
             }
         },
         "error": {
@@ -74,7 +84,7 @@
                         "charging_efficiency": "Laddningseffektivitet"
                     },
                     "data_description": {
-                        "name": "Ett vänligt namn för fordonet (t.ex. 'Peugeot 3008 PHEV')",
+                        "name": "Ett vänligt namn för fordonet (t.ex. ''Peugeot 3008 PHEV'')",
                         "battery_capacity_kwh": "Total batterikapacitet i kWh",
                         "usable_battery_kwh": "Användbar del av batteriet i kWh (standardvärde: total kapacitet om ej angivet)",
                         "charging_phases": "Antal laddningsfaser (1 eller 3)",
@@ -117,7 +127,7 @@
                         "type": "Användartyp"
                     },
                     "data_description": {
-                        "name": "Personens namn (t.ex. 'Paul')",
+                        "name": "Personens namn (t.ex. ''Paul'')",
                         "type": "Vanlig användare eller gäst med egen prissättning"
                     }
                 },
@@ -130,8 +140,8 @@
                     },
                     "data_description": {
                         "guest_pricing_method": "Hur laddningspriset ska beräknas för denna gäst",
-                        "price_per_kwh": "Fast pris per kWh (krävs för metoden 'fast pris')",
-                        "markup_factor": "Multiplicera baspriset med denna faktor (krävs för metoden 'påslag', måste vara > 1,0)"
+                        "price_per_kwh": "Fast pris per kWh (krävs för metoden ''fast pris'')",
+                        "markup_factor": "Multiplicera baspriset med denna faktor (krävs för metoden ''påslag'', måste vara > 1,0)"
                     }
                 },
                 "reconfigure": {
@@ -157,8 +167,8 @@
                     },
                     "data_description": {
                         "guest_pricing_method": "Hur laddningspriset ska beräknas för denna gäst",
-                        "price_per_kwh": "Fast pris per kWh (krävs för metoden 'fast pris')",
-                        "markup_factor": "Multiplicera baspriset med denna faktor (krävs för metoden 'påslag')"
+                        "price_per_kwh": "Fast pris per kWh (krävs för metoden ''fast pris'')",
+                        "markup_factor": "Multiplicera baspriset med denna faktor (krävs för metoden ''påslag'')"
                     }
                 }
             },

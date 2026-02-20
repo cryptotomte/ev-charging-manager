@@ -20,14 +20,14 @@ from typing import Any
 CHARGER_PROFILES: dict[str, dict[str, Any]] = {
     "goe_gemini": {
         "name": "go-e Charger (Gemini / Gemini flex)",
-        "car_status_sensor": "sensor.goe_{serial}_car_0",
-        "car_status_charging_value": 2,
+        "car_status_sensor": "sensor.goe_{serial}_car_value",
+        "car_status_charging_value": "Charging",
         "session_energy_sensor": "sensor.goe_{serial}_wh",
-        "session_energy_unit": "Wh",
-        "power_sensor": "sensor.goe_{serial}_nrg_total_power",
+        "session_energy_unit": "kWh",
+        "power_sensor": "sensor.goe_{serial}_nrg_11",
         "total_energy_sensor": "sensor.goe_{serial}_eto",
-        "rfid_sensor": "sensor.goe_{serial}_trx",
-        "rfid_last_uid_sensor": "sensor.goe_{serial}_lri",
+        "rfid_sensor": "select.goe_{serial}_trx",
+        "rfid_last_uid_sensor": None,
         "rfid_discovery": None,  # Placeholder — implemented in PR-08
         "requires_charger_host": True,
     },

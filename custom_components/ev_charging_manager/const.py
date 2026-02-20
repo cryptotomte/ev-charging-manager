@@ -14,6 +14,7 @@ CONF_TOTAL_ENERGY_ENTITY = "total_energy_entity"
 CONF_RFID_UID_ENTITY = "rfid_uid_entity"
 CONF_CHARGER_NAME = "charger_name"
 CONF_CHARGER_HOST = "charger_host"
+CONF_CHARGER_SERIAL = "charger_serial"
 CONF_PRICING_MODE = "pricing_mode"
 CONF_STATIC_PRICE_KWH = "static_price_kwh"
 

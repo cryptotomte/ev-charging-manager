@@ -23,6 +23,8 @@ from .const import (
 )
 from .session_engine import SessionEngine
 from .session_store import SessionStore
+from .stats_engine import StatsEngine
+from .stats_store import StatsStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -123,6 +125,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id]["session_store"] = session_store
     hass.data[DOMAIN][entry.entry_id]["session_engine"] = session_engine
+
+    # Set up stats store and engine
+    stats_store = StatsStore(hass)
+    stats_engine = StatsEngine(hass, entry, stats_store)
+    await stats_engine.async_setup()
+    hass.data[DOMAIN][entry.entry_id]["stats_engine"] = stats_engine
 
     # Forward setup to sensor and binary_sensor platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

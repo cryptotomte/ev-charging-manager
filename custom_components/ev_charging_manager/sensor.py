@@ -18,6 +18,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, SIGNAL_SESSION_UPDATE, SessionEngineState
+from .stats_sensor import create_stats_sensors
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,19 +29,28 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up EV Charging Manager sensor entities from a config entry."""
-    async_add_entities(
-        [
-            CurrentUserSensor(hass, entry),
-            CurrentVehicleSensor(hass, entry),
-            SessionEnergySensor(hass, entry),
-            SessionDurationSensor(hass, entry),
-            SessionCostSensor(hass, entry),
-            SessionChargePriceSensor(hass, entry),
-            SessionPowerSensor(hass, entry),
-            SessionSocAddedSensor(hass, entry),
-            StatusSensor(hass, entry),
-        ]
-    )
+    # Session metric sensors (PR-03)
+    entities: list[Any] = [
+        CurrentUserSensor(hass, entry),
+        CurrentVehicleSensor(hass, entry),
+        SessionEnergySensor(hass, entry),
+        SessionDurationSensor(hass, entry),
+        SessionCostSensor(hass, entry),
+        SessionChargePriceSensor(hass, entry),
+        SessionPowerSensor(hass, entry),
+        SessionSocAddedSensor(hass, entry),
+        StatusSensor(hass, entry),
+    ]
+
+    # Per-user statistics sensors (PR-04, T011)
+    config_store = hass.data[DOMAIN][entry.entry_id]["config_store"]
+    user_names: list[str] = [u["name"] for u in config_store.data.get("users", [])]
+    # "Unknown" user always exists in stats (FR-007)
+    if "Unknown" not in user_names:
+        user_names.append("Unknown")
+    entities.extend(create_stats_sensors(hass, entry, user_names))
+
+    async_add_entities(entities)
 
 
 class _SessionSensorBase(SensorEntity):

@@ -81,6 +81,13 @@ DEFAULT_MAX_STORED_SESSIONS = 1000
 SESSION_STORE_KEY = "ev_charging_manager_sessions"
 SESSION_STORE_VERSION = 1
 
+# Stats store settings
+STATS_STORE_KEY = "ev_charging_manager_stats"
+STATS_STORE_VERSION = 1
+
+# Dispatcher signal for stats sensor updates (format with entry_id)
+SIGNAL_STATS_UPDATE = "ev_charging_manager_stats_update_{}"
+
 # Session lifecycle events
 EVENT_SESSION_STARTED = "ev_charging_manager_session_started"
 EVENT_SESSION_COMPLETED = "ev_charging_manager_session_completed"

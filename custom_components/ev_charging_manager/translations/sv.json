@@ -96,7 +96,14 @@
             "session_charge_price": { "name": "Laddpris" },
             "session_power": { "name": "Sessionseffekt" },
             "session_soc_added": { "name": "SoC tillagd" },
-            "status": { "name": "Status" }
+            "status": { "name": "Status" },
+            "user_total_energy": { "name": "{user} total energi" },
+            "user_total_cost": { "name": "{user} total kostnad" },
+            "user_session_count": { "name": "{user} sessioner" },
+            "user_avg_session_energy": { "name": "{user} genomsnittlig sessionsenergi" },
+            "user_last_session": { "name": "{user} senaste session" },
+            "guest_last_energy": { "name": "G\u00e4stens senaste energi" },
+            "guest_last_charge_price": { "name": "G\u00e4stens senaste laddpris" }
         },
         "binary_sensor": {
             "charging": { "name": "Laddar" }

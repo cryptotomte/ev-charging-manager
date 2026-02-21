@@ -96,7 +96,14 @@
             "session_charge_price": { "name": "Session Charge Price" },
             "session_power": { "name": "Session Power" },
             "session_soc_added": { "name": "Session SoC Added" },
-            "status": { "name": "Status" }
+            "status": { "name": "Status" },
+            "user_total_energy": { "name": "{user} Total Energy" },
+            "user_total_cost": { "name": "{user} Total Cost" },
+            "user_session_count": { "name": "{user} Sessions" },
+            "user_avg_session_energy": { "name": "{user} Avg Session Energy" },
+            "user_last_session": { "name": "{user} Last Session" },
+            "guest_last_energy": { "name": "Guest Last Energy" },
+            "guest_last_charge_price": { "name": "Guest Last Charge Price" }
         },
         "binary_sensor": {
             "charging": { "name": "Charging" }

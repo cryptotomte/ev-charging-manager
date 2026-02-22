@@ -51,5 +51,7 @@ home-assistant_v2.db
 .claude/
 .specify/
 CLAUDE.md
-docs/prd/
+docs/*
+!docs/charger-profiles/
+!docs/grafana-queries.md
 specs/

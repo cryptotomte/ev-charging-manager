@@ -28,7 +28,12 @@ CHARGER_PROFILES: dict[str, dict[str, Any]] = {
         "total_energy_sensor": "sensor.goe_{serial}_eto",
         "rfid_sensor": "select.goe_{serial}_trx",
         "rfid_last_uid_sensor": None,
-        "rfid_discovery": None,  # Placeholder — implemented in PR-08
+        "rfid_discovery": {
+            "provider": "goe",
+            "fw_detection_filter": "fwv",
+            "cards_array_filter": "cards",
+            "flat_keys_format": True,
+        },
         "requires_charger_host": True,
     },
     "easee_home": {

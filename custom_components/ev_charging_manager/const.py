@@ -121,3 +121,25 @@ NOTIFICATION_ID_UNKNOWN_SESSIONS = "ev_charging_manager_unknown_sessions_{}"
 # Threshold for proactive unknown-session notifications (PR-07)
 UNKNOWN_SESSION_THRESHOLD = 3
 UNKNOWN_SESSION_WINDOW_DAYS = 7
+
+# RFID discovery constants (PR-08)
+CONF_CARD_UID = "card_uid"
+DISCOVERY_TIMEOUT = 5  # seconds
+MAX_CARD_SLOTS = 10
+MAX_ENERGY_KWH = 1_000_000
+
+# Provider identifiers
+PROVIDER_GOE = "goe"
+
+# go-e API filter strings
+GOE_FILTER_FWV = "fwv"
+GOE_FILTER_CARDS = "cards"
+GOE_FILTER_LRI_RDE = "lri,rde"
+
+# Flat key suffixes for go-e FW >=60 format
+GOE_FLAT_KEY_SUFFIX_NAME = "n"
+GOE_FLAT_KEY_SUFFIX_ENERGY = "e"
+GOE_FLAT_KEY_SUFFIX_INSTALLED = "i"
+
+# Firmware version threshold for flat key format
+GOE_FLAT_KEYS_FW_THRESHOLD = 60

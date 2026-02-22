@@ -17,6 +17,7 @@ from .const import (
     CONF_CAR_STATUS_ENTITY,
     CONF_CHARGER_NAME,
     CONF_ENERGY_ENTITY,
+    CONF_ETO_ENTITY,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
     CONF_POWER_ENTITY,
@@ -37,6 +38,11 @@ from .const import (
     EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
     SIGNAL_SESSION_UPDATE,
+    UNKNOWN_REASON_RFID_INACTIVE,
+    UNKNOWN_REASON_RFID_TYPE_ERROR,
+    UNKNOWN_REASON_RFID_UNMAPPED,
+    UNKNOWN_REASON_TRX_NULL,
+    UNKNOWN_REASON_TRX_ZERO,
     SessionEngineState,
 )
 from .models import GuestPricing
@@ -50,6 +56,14 @@ _LOGGER = logging.getLogger(__name__)
 
 # States that indicate an entity has no valid value
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, "null", ""}
+
+# Map RfidResolution.reason → diagnostic reason constant
+_RFID_REASON_MAP: dict[str, str] = {
+    "no_rfid": UNKNOWN_REASON_TRX_ZERO,
+    "unmapped": UNKNOWN_REASON_RFID_UNMAPPED,
+    "rfid_inactive": UNKNOWN_REASON_RFID_INACTIVE,
+    "type_error": UNKNOWN_REASON_RFID_TYPE_ERROR,
+}
 
 
 class SessionEngine:
@@ -89,6 +103,14 @@ class SessionEngine:
         # Guest pricing snapshot (PR-06) — set at session start, cleared at session end
         self._guest_pricing: GuestPricing | None = None
 
+        # PR-07: Data gap flag — set True on first unavailable sensor during TRACKING
+        self._data_gap: bool = False
+        # PR-07: Total energy counter snapshot at session start (for cross-validation)
+        self._eto_start: float | None = None
+        # PR-07: Last unknown session diagnostic reason (persists until next unknown session)
+        self._last_unknown_reason: str | None = None
+        self._last_unknown_at: str | None = None
+
         # Spot mode tracking state
         self._hour_energy_snapshot: float = 0.0  # relative energy at last hour boundary
         self._hour_start_time: str = ""  # ISO timestamp of current hour start
@@ -125,6 +147,238 @@ class SessionEngine:
     def active_session(self) -> Session | None:
         """Return the active session, or None if idle."""
         return self._active_session
+
+    @property
+    def last_unknown_reason(self) -> str | None:
+        """Return the last diagnostic reason for an unknown session."""
+        return self._last_unknown_reason
+
+    @property
+    def last_unknown_at(self) -> str | None:
+        """Return the ISO timestamp when the last unknown reason was set."""
+        return self._last_unknown_at
+
+    async def async_recover(self, snapshot: dict | None) -> None:
+        """Recover an active session after a system restart.
+
+        Called from async_setup_entry() after SessionStore.async_load() and before
+        async_setup(). Compares the saved session snapshot with the current charger
+        state to determine the correct recovery path:
+
+        - Same card + still charging → resume in TRACKING (reconstructed=True)
+        - Same card + energy counter reset → treat as new context, complete old
+        - Charging stopped → complete old with best available data
+        - Different card → complete old, let state machine pick up new session
+        - No snapshot / corrupt snapshot → start idle (logged, no crash)
+        """
+        if snapshot is None:
+            return
+
+        try:
+            await self._async_do_recover(snapshot)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error(
+                "Session recovery failed — starting fresh (error: %s). Snapshot data: %s",
+                err,
+                snapshot.get("id", "?"),
+            )
+            # Ensure clean IDLE state on any unexpected failure
+            self._state = SessionEngineState.IDLE
+            self._active_session = None
+
+    async def _async_do_recover(self, snapshot: dict) -> None:
+        """Execute the recovery logic (may raise on malformed snapshot)."""
+        charging_value = self._entry.data.get(
+            CONF_CAR_STATUS_CHARGING_VALUE, DEFAULT_CAR_STATUS_CHARGING_VALUE
+        )
+        car_status = self._get_car_status()
+        is_charging = car_status == charging_value
+
+        # Determine saved rfid_index from snapshot
+        saved_rfid_index: int | None = snapshot.get("rfid_index")
+
+        # Determine current rfid_index from trx entity
+        current_trx_raw = self._get_trx()
+        current_rfid_index: int | None = None
+        if current_trx_raw is not None:
+            try:
+                trx_int = int(current_trx_raw)
+                if trx_int > 0:
+                    current_rfid_index = trx_int - 1
+            except (ValueError, TypeError):
+                pass
+
+        # Energy counter reset check: if current energy < saved energy_start, wh reset
+        current_energy = self._get_energy() or 0.0
+        energy_start = float(snapshot.get("energy_start_kwh", 0.0))
+        energy_counter_reset = current_energy < energy_start
+
+        # Same session: same card + no energy counter reset
+        is_same_session = (saved_rfid_index == current_rfid_index) and not energy_counter_reset
+
+        if is_charging and is_same_session:
+            # Resume same session in TRACKING
+            self._restore_session_from_snapshot(snapshot, current_energy)
+            _LOGGER.info(
+                "Session recovered (resuming): id=%s user=%s energy=%.3f kWh",
+                snapshot.get("id"),
+                snapshot.get("user_name"),
+                self._active_session.energy_kwh if self._active_session else 0.0,
+            )
+        else:
+            # Complete the old session with best available data
+            reason = (
+                "energy counter reset"
+                if energy_counter_reset
+                else ("not charging" if not is_charging else "different card")
+            )
+            _LOGGER.info(
+                "Session recovery: completing old session (reason: %s) id=%s",
+                reason,
+                snapshot.get("id"),
+            )
+            await self._complete_snapshot_as_session(snapshot, current_energy)
+
+            # If charger is still charging with a (different) card, let state machine handle it
+            if is_charging:
+                self._handle_idle_state()
+
+    def _restore_session_from_snapshot(self, snapshot: dict, current_energy: float) -> None:
+        """Restore an active session from a snapshot dict, resuming in TRACKING state.
+
+        Note: Spot pricing hourly callbacks are NOT restored. If the original session
+        used spot pricing, the running cost display will use existing price_details
+        but no new hourly boundaries will be captured. This is a known limitation —
+        energy tracking continuity is the primary recovery goal.
+        """
+        session = Session(
+            id=snapshot["id"],
+            user_name=snapshot.get("user_name", "Unknown"),
+            user_type=snapshot.get("user_type", "unknown"),
+            vehicle_name=snapshot.get("vehicle_name"),
+            vehicle_battery_kwh=snapshot.get("vehicle_battery_kwh"),
+            efficiency_factor=snapshot.get("efficiency_factor"),
+            rfid_index=snapshot.get("rfid_index"),
+            rfid_uid=snapshot.get("rfid_uid"),
+            started_at=snapshot.get("started_at", dt_util.utcnow().isoformat()),
+            energy_start_kwh=float(snapshot.get("energy_start_kwh", 0.0)),
+            energy_kwh=max(0.0, current_energy - float(snapshot.get("energy_start_kwh", 0.0))),
+            cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
+            cost_method=snapshot.get("cost_method", "static"),
+            price_details=snapshot.get("price_details"),
+            charger_name=snapshot.get("charger_name", ""),
+            max_power_w=float(snapshot.get("max_power_w", 0.0)),
+            reconstructed=True,
+        )
+
+        self._active_session = session
+        self._last_energy_kwh = current_energy
+        self._last_power_w = self._get_power() or 0.0
+        self._state = SessionEngineState.TRACKING
+
+    async def _complete_snapshot_as_session(self, snapshot: dict, current_energy: float) -> None:
+        """Complete a snapshot as a reconstructed session with best available data."""
+        # Best energy: use current charger reading if > energy_start, else saved energy_kwh
+        energy_start = float(snapshot.get("energy_start_kwh", 0.0))
+        saved_energy_kwh = float(snapshot.get("energy_kwh", 0.0))
+
+        if current_energy >= energy_start:
+            best_energy = current_energy - energy_start
+        else:
+            # Energy counter reset — use last known accumulated energy
+            best_energy = saved_energy_kwh
+
+        now = dt_util.utcnow()
+        started_iso = snapshot.get("started_at", now.isoformat())
+        try:
+            started = datetime.fromisoformat(started_iso)
+            duration_s = int((now - started).total_seconds())
+        except (ValueError, TypeError):
+            duration_s = 0
+
+        session = Session(
+            id=snapshot["id"],
+            user_name=snapshot.get("user_name", "Unknown"),
+            user_type=snapshot.get("user_type", "unknown"),
+            vehicle_name=snapshot.get("vehicle_name"),
+            vehicle_battery_kwh=snapshot.get("vehicle_battery_kwh"),
+            efficiency_factor=snapshot.get("efficiency_factor"),
+            rfid_index=snapshot.get("rfid_index"),
+            rfid_uid=snapshot.get("rfid_uid"),
+            started_at=started_iso,
+            ended_at=now.isoformat(),
+            duration_seconds=duration_s,
+            energy_start_kwh=energy_start,
+            energy_kwh=round(best_energy, 3),
+            cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
+            cost_method=snapshot.get("cost_method", "static"),
+            price_details=snapshot.get("price_details"),
+            charger_name=snapshot.get("charger_name", ""),
+            max_power_w=float(snapshot.get("max_power_w", 0.0)),
+            reconstructed=True,
+            data_gap=bool(snapshot.get("data_gap", False)),
+        )
+
+        if duration_s > 0 and session.energy_kwh > 0:
+            session.avg_power_w = (session.energy_kwh * 3_600_000) / duration_s
+
+        # Apply micro-session filter
+        min_duration = self._entry.options.get(
+            CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
+        )
+        min_energy_wh = self._entry.options.get(
+            CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH
+        )
+        is_micro = duration_s < min_duration or session.energy_kwh < (min_energy_wh / 1000.0)
+
+        if not is_micro:
+            await self._session_store.add_session(session.to_dict())
+            self._hass.bus.async_fire(
+                EVENT_SESSION_COMPLETED,
+                self._build_completed_event_data(session),
+            )
+            _LOGGER.warning(
+                "Recovered session completed (reconstructed): id=%s energy=%.3f kWh",
+                session.id,
+                session.energy_kwh,
+            )
+        else:
+            _LOGGER.info(
+                "Recovered micro-session discarded: id=%s duration=%ds energy=%.3f kWh",
+                session.id,
+                duration_s,
+                session.energy_kwh,
+            )
+
+        self._state = SessionEngineState.IDLE
+
+    def _build_completed_event_data(self, session: Session) -> dict[str, Any]:
+        """Build the EVENT_SESSION_COMPLETED payload from a finalized session."""
+        return {
+            "session_id": session.id,
+            "user_name": session.user_name,
+            "user_type": session.user_type,
+            "vehicle_name": session.vehicle_name,
+            "energy_kwh": round(session.energy_kwh, 2),
+            "cost_kr": round(session.cost_total_kr, 2),
+            "charge_price_kr": (
+                round(session.charge_price_total_kr, 2)
+                if session.charge_price_total_kr is not None
+                else None
+            ),
+            "duration_minutes": round((session.duration_seconds or 0) / 60),
+            "avg_power_w": round(session.avg_power_w, 1),
+            "estimated_soc_added_pct": (
+                round(session.estimated_soc_added_pct, 1)
+                if session.estimated_soc_added_pct is not None
+                else None
+            ),
+            "started_at": session.started_at,
+            "ended_at": session.ended_at,
+            "cost_method": session.cost_method,
+            "reconstructed": session.reconstructed,
+            "data_gap": session.data_gap,
+        }
 
     @callback
     def async_setup(self) -> None:
@@ -197,6 +451,20 @@ class SessionEngine:
         except (ValueError, TypeError):
             return None
 
+    def _get_eto(self) -> float | None:
+        """Return the charger's total energy counter (ETO) in kWh, or None if unavailable."""
+        entity_id = self._entry.options.get(CONF_ETO_ENTITY)
+        if not entity_id:
+            return None
+        val = self._get_entity_state(entity_id)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            _LOGGER.warning("ETO entity %s has non-numeric value: %r", entity_id, val)
+            return None
+
     def _read_spot_price(self) -> float | None:
         """Read current spot price from configured sensor. Returns None if unavailable."""
         entity_id = self._entry.data.get(CONF_SPOT_PRICE_ENTITY)
@@ -251,10 +519,14 @@ class SessionEngine:
         # Update energy and power with latest values
         energy = self._get_energy()
         if energy is None:
-            _LOGGER.warning(
-                "Energy entity unavailable during active session — keeping last value %.3f kWh",
-                self._last_energy_kwh,
-            )
+            if not self._data_gap:
+                # Set data gap flag on first unavailable reading
+                self._data_gap = True
+                _LOGGER.warning(
+                    "Energy entity unavailable during active session — "
+                    "keeping last value %.3f kWh, flagging data gap",
+                    self._last_energy_kwh,
+                )
         else:
             self._last_energy_kwh = energy
 
@@ -381,6 +653,25 @@ class SessionEngine:
         else:
             self._guest_pricing = None
 
+        # PR-07: Record diagnostic reason when session attributed to unknown user (FR-010/011)
+        session_user_type = resolution.user_type if resolution else "unknown"
+        if session_user_type == "unknown":
+            if resolution is None:
+                self._last_unknown_reason = UNKNOWN_REASON_TRX_NULL
+            else:
+                self._last_unknown_reason = _RFID_REASON_MAP.get(
+                    resolution.reason or "", UNKNOWN_REASON_RFID_UNMAPPED
+                )
+            self._last_unknown_at = now_iso
+            _LOGGER.debug(
+                "Unknown session started: reason=%s trx=%s",
+                self._last_unknown_reason,
+                trx,
+            )
+
+        # PR-07: Snapshot ETO counter at session start for cross-validation (FR-016/017)
+        self._eto_start = self._get_eto()
+
         # Spot mode session initialization
         if self._pricing.mode == "spot":
             self._active_session.cost_method = "spot"
@@ -490,34 +781,39 @@ class SessionEngine:
         is_micro = duration_s < min_duration or session.energy_kwh < min_energy_kwh
 
         if not is_micro:
+            # PR-07: Energy cross-validation against ETO counter (FR-016/017/018)
+            eto_end = self._get_eto()
+            if self._eto_start is not None and eto_end is not None:
+                session.charger_total_before_kwh = self._eto_start
+                session.charger_total_after_kwh = eto_end
+                eto_diff = eto_end - self._eto_start
+                if eto_diff > 0 and session.energy_kwh > 0:
+                    deviation = abs(eto_diff - session.energy_kwh) / max(
+                        eto_diff, session.energy_kwh
+                    )
+                    if deviation > 0.05:
+                        _LOGGER.warning(
+                            "Energy cross-validation: tracked=%.3f kWh, ETO diff=%.3f kWh, "
+                            "deviation=%.1f%% (>5%%) — session id=%s",
+                            session.energy_kwh,
+                            eto_diff,
+                            deviation * 100,
+                            session.id,
+                        )
+
             # Calculate final guest charge price (PR-06)
             charge_price = self._calculate_charge_price(session)
             if charge_price is not None:
                 session.charge_price_total_kr = charge_price
 
+            # Transfer data quality flags to session before persisting
+            session.data_gap = self._data_gap
+
             # Persist and fire completed event
             await self._session_store.add_session(session.to_dict())
             self._hass.bus.async_fire(
                 EVENT_SESSION_COMPLETED,
-                {
-                    "session_id": session.id,
-                    "user_name": session.user_name,
-                    "user_type": session.user_type,
-                    "vehicle_name": session.vehicle_name,
-                    "energy_kwh": round(session.energy_kwh, 2),
-                    "cost_kr": round(session.cost_total_kr, 2),
-                    "charge_price_kr": round(charge_price, 2) if charge_price is not None else None,
-                    "duration_minutes": round(duration_s / 60),
-                    "avg_power_w": round(session.avg_power_w, 1),
-                    "estimated_soc_added_pct": (
-                        round(session.estimated_soc_added_pct, 1)
-                        if session.estimated_soc_added_pct is not None
-                        else None
-                    ),
-                    "started_at": session.started_at,
-                    "ended_at": session.ended_at,
-                    "cost_method": session.cost_method,
-                },
+                self._build_completed_event_data(session),
             )
             _LOGGER.info("Session completed and persisted: id=%s", session.id)
         else:
@@ -535,6 +831,8 @@ class SessionEngine:
         self._last_power_w = 0.0
         self._hour_energy_snapshot = 0.0
         self._hour_start_time = ""
+        self._data_gap = False
+        self._eto_start = None
         self._state = SessionEngineState.IDLE
         self._dispatch_update()
 

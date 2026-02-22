@@ -73,8 +73,8 @@ class Session:
     estimated_soc_added_pct: float | None = None
 
     # Charger meter (PR-07)
-    charger_total_before_kwh: None = None
-    charger_total_after_kwh: None = None
+    charger_total_before_kwh: float | None = None
+    charger_total_after_kwh: float | None = None
 
     # Data quality flags (PR-07)
     data_gap: bool = False

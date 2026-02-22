@@ -96,9 +96,11 @@ async def test_options_flow_defaults_used_when_no_options_set(hass: HomeAssistan
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
-    # Schema keys carry default values
+    # Schema keys carry default values (skip Optional fields without an explicit default)
     schema = result["data_schema"].schema
-    defaults = {str(k): k.default() for k in schema if hasattr(k, "default")}
+    defaults = {
+        str(k): k.default() for k in schema if hasattr(k, "default") and callable(k.default)
+    }
     assert defaults.get(CONF_MIN_SESSION_DURATION_S) == DEFAULT_MIN_SESSION_DURATION_S
     assert defaults.get(CONF_MIN_SESSION_ENERGY_WH) == DEFAULT_MIN_SESSION_ENERGY_WH
     assert defaults.get(CONF_PERSISTENCE_INTERVAL_S) == DEFAULT_PERSISTENCE_INTERVAL_S

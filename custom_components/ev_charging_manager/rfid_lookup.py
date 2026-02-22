@@ -38,7 +38,7 @@ class RfidLookup:
             trx_int = int(trx_value)
         except (ValueError, TypeError):
             _LOGGER.warning(
-                "Unexpected trx value format: %r — treating as unknown",
+                "Unexpected trx value format: %r — treating as type error",
                 trx_value,
             )
             return RfidResolution(
@@ -48,7 +48,7 @@ class RfidLookup:
                 vehicle_battery_kwh=None,
                 efficiency_factor=None,
                 rfid_index=None,
-                reason="unmapped",
+                reason="type_error",
             )
 
         # trx=0 means no RFID card used

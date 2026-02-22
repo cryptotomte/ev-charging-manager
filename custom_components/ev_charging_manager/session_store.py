@@ -44,24 +44,36 @@ class SessionStore:
         """Return the in-memory session list."""
         return self._sessions
 
-    async def async_load(self) -> list[dict[str, Any]]:
-        """Load sessions from disk. Returns empty list if no file exists."""
+    async def async_load(self) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Load sessions from disk.
+
+        Returns a tuple of (completed_sessions, active_snapshot_or_None).
+        The active_snapshot is the last periodic save of an in-progress session
+        (ended_at is None/missing). Only the most recent incomplete entry is
+        treated as a recovery snapshot; any extras are discarded.
+        """
         stored = await self._store.async_load()
         if stored is None:
             _LOGGER.debug("No existing session store found, starting fresh")
             self._sessions = []
-        else:
-            # Filter out in-progress snapshots left by async_save_active_session
-            # (ended_at is None/missing for incomplete sessions)
-            complete = [s for s in stored if s.get("ended_at") is not None]
-            if len(complete) < len(stored):
-                _LOGGER.info(
-                    "Discarded %d incomplete session snapshot(s) from storage",
-                    len(stored) - len(complete),
-                )
-            self._sessions = complete
-            _LOGGER.debug("Loaded %d sessions from storage", len(self._sessions))
-        return self._sessions
+            return self._sessions, None
+
+        # Separate completed sessions from active snapshot(s)
+        complete = [s for s in stored if s.get("ended_at") is not None]
+        incomplete = [s for s in stored if s.get("ended_at") is None]
+
+        self._sessions = complete
+        _LOGGER.debug("Loaded %d completed sessions from storage", len(self._sessions))
+
+        active_snapshot: dict[str, Any] | None = None
+        if incomplete:
+            active_snapshot = incomplete[-1]  # most recent snapshot
+            _LOGGER.info(
+                "Found active session snapshot for recovery: id=%s",
+                active_snapshot.get("id", "?"),
+            )
+
+        return self._sessions, active_snapshot
 
     async def async_save(self) -> None:
         """Persist in-memory sessions to disk."""

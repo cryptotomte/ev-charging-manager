@@ -17,7 +17,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, SIGNAL_SESSION_UPDATE, SessionEngineState
+from .const import CONF_CAR_STATUS_ENTITY, DOMAIN, SIGNAL_SESSION_UPDATE, SessionEngineState
 from .stats_sensor import create_stats_sensors
 
 _LOGGER = logging.getLogger(__name__)
@@ -324,3 +324,22 @@ class StatusSensor(_SessionSensorBase):
         if engine is None:
             return SessionEngineState.IDLE
         return engine.state
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return diagnostic attributes: last unknown reason, timestamp, charger connectivity."""
+        engine = self._engine()
+        # charger_connected: True when car_status entity is reachable (not unavailable/unknown)
+        car_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
+        charger_connected: bool = False
+        if car_entity:
+            car_state = self._hass.states.get(car_entity)
+            charger_connected = car_state is not None and car_state.state not in (
+                "unavailable",
+                "unknown",
+            )
+        return {
+            "last_unknown_reason": engine.last_unknown_reason if engine else None,
+            "last_unknown_at": engine.last_unknown_at if engine else None,
+            "charger_connected": charger_connected,
+        }

@@ -38,7 +38,7 @@ async def test_load_empty_store_returns_defaults(hass: HomeAssistant) -> None:
     """Loading a missing store returns empty dict and None guest_last."""
     store = StatsStore(hass)
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=None):
-        user_stats, guest_last = await store.async_load()
+        user_stats, guest_last, _ = await store.async_load()
 
     assert user_stats == {}
     assert guest_last is None
@@ -62,7 +62,7 @@ async def test_save_and_load_roundtrip_preserves_userstats(hass: HomeAssistant) 
         await store.async_save(user_stats_in, None)
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
-        user_stats_out, guest_last_out = await store.async_load()
+        user_stats_out, guest_last_out, _ = await store.async_load()
 
     assert "Petra" in user_stats_out
     out = user_stats_out["Petra"]
@@ -97,7 +97,7 @@ async def test_save_and_load_roundtrip_preserves_guest_last(hass: HomeAssistant)
         await store.async_save({}, guest)
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
-        _, guest_out = await store.async_load()
+        _, guest_out, _ = await store.async_load()
 
     assert guest_out is not None
     assert guest_out.energy_kwh == 32.1
@@ -117,7 +117,7 @@ async def test_load_skips_malformed_user_entry(hass: HomeAssistant) -> None:
     }
 
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=bad_data):
-        user_stats, _ = await store.async_load()
+        user_stats, _, _ = await store.async_load()
 
     # Only the valid entry survives
     assert "Petra" in user_stats
@@ -130,7 +130,7 @@ async def test_load_handles_missing_guest_last(hass: HomeAssistant) -> None:
     data = {"user_stats": {}, "guest_last": None}
 
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=data):
-        _, guest_last = await store.async_load()
+        _, guest_last, _ = await store.async_load()
 
     assert guest_last is None
 
@@ -154,7 +154,7 @@ async def test_save_multiple_users(hass: HomeAssistant) -> None:
         await store.async_save({"Petra": petra, "Paul": paul, "Unknown": unknown}, None)
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
-        user_stats, _ = await store.async_load()
+        user_stats, _, _ = await store.async_load()
 
     assert set(user_stats.keys()) == {"Petra", "Paul", "Unknown"}
     assert user_stats["Paul"].session_count == 2

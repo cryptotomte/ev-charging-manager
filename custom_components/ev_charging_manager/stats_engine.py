@@ -12,12 +12,20 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
+from homeassistant.components.persistent_notification import async_create as pn_async_create
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_utc_time_change
+from homeassistant.util import dt as dt_util
 
-from .const import EVENT_SESSION_COMPLETED, SIGNAL_STATS_UPDATE
+from .const import (
+    EVENT_SESSION_COMPLETED,
+    NOTIFICATION_ID_UNKNOWN_SESSIONS,
+    SIGNAL_STATS_UPDATE,
+    UNKNOWN_SESSION_THRESHOLD,
+    UNKNOWN_SESSION_WINDOW_DAYS,
+)
 
 if TYPE_CHECKING:
     from .stats_store import StatsStore
@@ -132,6 +140,23 @@ class GuestLastSession:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _prune_old_unknown_times(times: list[str]) -> list[str]:
+    """Remove ISO timestamps older than UNKNOWN_SESSION_WINDOW_DAYS days."""
+    cutoff = dt_util.utcnow().timestamp() - UNKNOWN_SESSION_WINDOW_DAYS * 86400
+    result: list[str] = []
+    for ts in times:
+        try:
+            if datetime.fromisoformat(ts).timestamp() >= cutoff:
+                result.append(ts)
+        except (ValueError, TypeError):
+            pass  # Discard malformed timestamps
+    return result
+
+
 # StatsEngine (T004 skeleton + T009 accumulation + T014-T015 rollover)
 # ---------------------------------------------------------------------------
 
@@ -157,6 +182,8 @@ class StatsEngine:
         self._stats_store = stats_store
         self._user_stats: dict[str, UserStats] = {}
         self._guest_last: GuestLastSession | None = None
+        # PR-07: ISO timestamp list of unknown sessions for proactive warning (US5)
+        self._unknown_session_times: list[str] = []
         self._unsub_event: Callable[[], None] | None = None
         self._unsub_midnight: Callable[[], None] | None = None
 
@@ -173,7 +200,11 @@ class StatsEngine:
     async def async_setup(self) -> None:
         """Load persisted stats, ensure Unknown user exists, subscribe to events."""
         # Load persisted statistics (T003/T010)
-        self._user_stats, self._guest_last = await self._stats_store.async_load()
+        (
+            self._user_stats,
+            self._guest_last,
+            self._unknown_session_times,
+        ) = await self._stats_store.async_load()
 
         # Always ensure "Unknown" user entry exists (FR-007, T018)
         if "Unknown" not in self._user_stats:
@@ -264,8 +295,35 @@ class StatsEngine:
                 session_at=ended_at,
             )
 
+        # PR-07: Track unknown sessions for proactive warning (US5, FR-012/013/014/015)
+        if user_type == "unknown":
+            now_iso = dt_util.utcnow().isoformat()
+            self._unknown_session_times.append(now_iso)
+            self._unknown_session_times = _prune_old_unknown_times(self._unknown_session_times)
+            if len(self._unknown_session_times) >= UNKNOWN_SESSION_THRESHOLD:
+                notification_id = NOTIFICATION_ID_UNKNOWN_SESSIONS.format(self._entry.entry_id)
+                pn_async_create(
+                    self._hass,
+                    (
+                        f"**{len(self._unknown_session_times)} unknown charging sessions** "
+                        f"detected in the last {UNKNOWN_SESSION_WINDOW_DAYS} days.\n\n"
+                        "Sessions were attributed to 'Unknown' because no RFID card was "
+                        "detected or the card was not mapped to a user. "
+                        "Check your RFID mappings in the integration settings."
+                    ),
+                    title="EV Charging Manager — Unknown Sessions",
+                    notification_id=notification_id,
+                )
+                _LOGGER.info(
+                    "Proactive notification fired: %d unknown sessions in %d days",
+                    len(self._unknown_session_times),
+                    UNKNOWN_SESSION_WINDOW_DAYS,
+                )
+
         # Persist and notify sensors
-        await self._stats_store.async_save(self._user_stats, self._guest_last)
+        await self._stats_store.async_save(
+            self._user_stats, self._guest_last, self._unknown_session_times
+        )
         self._dispatch_update()
 
         _LOGGER.debug(

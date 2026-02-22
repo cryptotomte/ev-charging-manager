@@ -39,6 +39,7 @@ from .const import (
     SIGNAL_SESSION_UPDATE,
     SessionEngineState,
 )
+from .models import GuestPricing
 from .pricing import PricingEngine, SpotConfig
 from .rfid_lookup import RfidLookup
 from .session import Session
@@ -84,6 +85,9 @@ class SessionEngine:
 
         # Note: RfidLookup is created fresh at session start using current ConfigStore data
         # (ConfigStore may be updated by subentry changes between sessions)
+
+        # Guest pricing snapshot (PR-06) — set at session start, cleared at session end
+        self._guest_pricing: GuestPricing | None = None
 
         # Spot mode tracking state
         self._hour_energy_snapshot: float = 0.0  # relative energy at last hour boundary
@@ -277,6 +281,10 @@ class SessionEngine:
 
             session.max_power_w = max(session.max_power_w, self._last_power_w)
 
+            # Update real-time guest charge price (PR-06)
+            if self._guest_pricing is not None:
+                session.charge_price_total_kr = self._calculate_charge_price(session)
+
             if session.vehicle_battery_kwh is not None:
                 session.estimated_soc_added_pct = estimate_soc(
                     session.energy_kwh, session.efficiency_factor, session.vehicle_battery_kwh
@@ -365,6 +373,13 @@ class SessionEngine:
             energy_kwh=0.0,
             charger_name=charger_name,
         )
+
+        # Snapshot guest pricing at session start (PR-06)
+        if resolution is not None and resolution.guest_pricing is not None:
+            self._guest_pricing = GuestPricing.from_dict(resolution.guest_pricing)
+            self._active_session.charge_price_method = self._guest_pricing.method
+        else:
+            self._guest_pricing = None
 
         # Spot mode session initialization
         if self._pricing.mode == "spot":
@@ -475,6 +490,11 @@ class SessionEngine:
         is_micro = duration_s < min_duration or session.energy_kwh < min_energy_kwh
 
         if not is_micro:
+            # Calculate final guest charge price (PR-06)
+            charge_price = self._calculate_charge_price(session)
+            if charge_price is not None:
+                session.charge_price_total_kr = charge_price
+
             # Persist and fire completed event
             await self._session_store.add_session(session.to_dict())
             self._hass.bus.async_fire(
@@ -486,7 +506,7 @@ class SessionEngine:
                     "vehicle_name": session.vehicle_name,
                     "energy_kwh": round(session.energy_kwh, 2),
                     "cost_kr": round(session.cost_total_kr, 2),
-                    "charge_price_kr": None,
+                    "charge_price_kr": round(charge_price, 2) if charge_price is not None else None,
                     "duration_minutes": round(duration_s / 60),
                     "avg_power_w": round(session.avg_power_w, 1),
                     "estimated_soc_added_pct": (
@@ -510,12 +530,29 @@ class SessionEngine:
 
         # Reset to IDLE
         self._active_session = None
+        self._guest_pricing = None
         self._last_energy_kwh = 0.0
         self._last_power_w = 0.0
         self._hour_energy_snapshot = 0.0
         self._hour_start_time = ""
         self._state = SessionEngineState.IDLE
         self._dispatch_update()
+
+    def _calculate_charge_price(self, session: Session) -> float | None:
+        """Calculate what the guest pays for the current session energy/cost.
+
+        Fixed: energy_kwh × price_per_kwh
+        Markup: cost_total_kr × markup_factor
+
+        Returns None if no guest pricing is configured.
+        """
+        if self._guest_pricing is None:
+            return None
+        if self._guest_pricing.method == "fixed" and self._guest_pricing.price_per_kwh is not None:
+            return round(session.energy_kwh * self._guest_pricing.price_per_kwh, 2)
+        if self._guest_pricing.method == "markup" and self._guest_pricing.markup_factor is not None:
+            return round(session.cost_total_kr * self._guest_pricing.markup_factor, 2)
+        return None
 
     def _dispatch_update(self) -> None:
         """Send dispatcher signal to notify sensor entities of state change."""

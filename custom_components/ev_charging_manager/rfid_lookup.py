@@ -137,6 +137,11 @@ class RfidLookup:
                 vehicle_battery_kwh = vehicle.get("battery_capacity_kwh")
                 efficiency_factor = vehicle.get("charging_efficiency")
 
+        # Extract guest pricing snapshot if user is a guest (PR-06)
+        guest_pricing: dict | None = None
+        if user_type == "guest":
+            guest_pricing = user.get("guest_pricing")
+
         return RfidResolution(
             user_name=user_name,
             user_type=user_type,
@@ -145,4 +150,5 @@ class RfidLookup:
             efficiency_factor=efficiency_factor,
             rfid_index=rfid_index,
             reason="matched",
+            guest_pricing=guest_pricing,
         )

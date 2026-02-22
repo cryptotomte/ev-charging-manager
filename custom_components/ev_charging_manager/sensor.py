@@ -215,10 +215,11 @@ class SessionCostSensor(_SessionSensorBase):
 
 
 class SessionChargePriceSensor(_SessionSensorBase):
-    """Shows the charge price (always unavailable in this PR — implemented in PR-06)."""
+    """Shows the guest charge price during an active guest session (kr)."""
 
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_native_unit_of_measurement = "kr"
+    _attr_suggested_display_precision = 2
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
@@ -227,13 +228,19 @@ class SessionChargePriceSensor(_SessionSensorBase):
 
     @property
     def available(self) -> bool:
-        """Always unavailable — charge price not implemented until PR-06."""
-        return False
+        """Available only when TRACKING an active guest session."""
+        if not self._is_tracking():
+            return False
+        session = self._active_session()
+        return session is not None and session.charge_price_method is not None
 
     @property
-    def native_value(self) -> None:
-        """Always unavailable until PR-06."""
-        return None
+    def native_value(self) -> float | None:
+        """Return the current guest charge price, or None if unavailable."""
+        session = self._active_session()
+        if session is None or session.charge_price_total_kr is None:
+            return None
+        return round(session.charge_price_total_kr, 2)
 
 
 class SessionPowerSensor(_SessionSensorBase):

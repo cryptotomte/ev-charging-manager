@@ -18,6 +18,7 @@ class RfidResolution:
     efficiency_factor: float | None
     rfid_index: int | None  # trx-1, None for trx=0
     reason: str  # "matched", "unmapped", "rfid_inactive", "no_rfid"
+    guest_pricing: dict | None = None  # Guest pricing config snapshot (PR-06)
 
 
 @dataclass
@@ -65,8 +66,8 @@ class Session:
     price_details: list[dict] | None = None
 
     # Charge price (PR-06)
-    charge_price_total_kr: None = None
-    charge_price_method: None = None
+    charge_price_total_kr: float | None = None
+    charge_price_method: str | None = None
 
     # SoC estimate
     estimated_soc_added_pct: float | None = None

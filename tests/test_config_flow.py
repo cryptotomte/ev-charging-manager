@@ -158,40 +158,6 @@ async def test_config_flow_generic_profile(hass: HomeAssistant) -> None:
     assert data[CONF_CHARGER_HOST] is None
 
 
-async def test_config_flow_zaptec_maps_to_generic(hass: HomeAssistant) -> None:
-    """Zaptec profile has no pre-fills but stores distinct 'zaptec' key."""
-    hass.states.async_set("sensor.zaptec_status", "connected")
-    hass.states.async_set("sensor.zaptec_energy", "0")
-    hass.states.async_set("sensor.zaptec_power", "0")
-
-    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {CONF_CHARGER_PROFILE: "zaptec"},
-    )
-    assert result["step_id"] == "charger_entities"
-
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {
-            CONF_CAR_STATUS_ENTITY: "sensor.zaptec_status",
-            CONF_CAR_STATUS_CHARGING_VALUE: "charging",
-            CONF_ENERGY_ENTITY: "sensor.zaptec_energy",
-            CONF_ENERGY_UNIT: "kWh",
-            CONF_POWER_ENTITY: "sensor.zaptec_power",
-        },
-    )
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"],
-        {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.00},
-    )
-    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
-
-    assert result["type"] == FlowResultType.CREATE_ENTRY
-    # Profile key must be "zaptec", not "generic"
-    assert result["data"][CONF_CHARGER_PROFILE] == "zaptec"
-
-
 # ---------------------------------------------------------------------------
 # User Story 3 — Sensor validation
 # ---------------------------------------------------------------------------
@@ -289,8 +255,6 @@ async def test_config_flow_invalid_optional_valid_mandatory(
 def test_charger_profiles_structure() -> None:
     """CHARGER_PROFILES contains all required profiles with correct attributes."""
     assert "goe_gemini" in CHARGER_PROFILES
-    assert "easee_home" in CHARGER_PROFILES
-    assert "zaptec" in CHARGER_PROFILES
     assert "generic" in CHARGER_PROFILES
 
     goe = CHARGER_PROFILES["goe_gemini"]

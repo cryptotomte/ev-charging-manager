@@ -72,12 +72,12 @@ async def test_multiple_instances(hass: HomeAssistant) -> None:
     entry2 = MockConfigEntry(
         domain=DOMAIN,
         data={
-            "charger_profile": "easee_home",
-            "car_status_entity": "sensor.easee_status",
+            "charger_profile": "generic",
+            "car_status_entity": "sensor.driveway_car_status",
             "car_status_charging_value": "charging",
-            "energy_entity": "sensor.easee_session_energy",
+            "energy_entity": "sensor.driveway_energy",
             "energy_unit": "kWh",
-            "power_entity": "sensor.easee_power",
+            "power_entity": "sensor.driveway_power",
             "rfid_entity": None,
             "total_energy_entity": None,
             "rfid_uid_entity": None,

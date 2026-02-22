@@ -34,7 +34,7 @@
                 },
                 "data_description": {
                     "car_status_entity": "Sensor reporting the car connection state (e.g. sensor.goe_123456_car_value)",
-                    "car_status_charging_value": "Sensor value that means ''currently charging'' (e.g. 2 for go-e, ''charging'' for Easee)",
+                    "car_status_charging_value": "Sensor value that means ''currently charging'' (e.g. Charging for go-e)",
                     "energy_entity": "Sensor reporting session energy consumption",
                     "energy_unit": "Unit reported by the energy sensor",
                     "power_entity": "Sensor reporting current charging power in Watts",

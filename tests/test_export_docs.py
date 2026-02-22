@@ -125,6 +125,9 @@ async def test_session_completed_event_has_all_influxdb_fields(hass: HomeAssista
     assert "charger_name" in event_data
     assert event_data["charger_name"] == "My go-e Charger"
 
+    # G1: rfid_index must always exist in completed event (even when None)
+    assert "rfid_index" in event_data
+
 
 def _extract_event_field(template_str: str) -> str | None:
     """Extract the event data field name from a Jinja2 template string.

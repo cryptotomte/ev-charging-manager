@@ -136,6 +136,7 @@ async def test_session_completed_event_fields(hass: HomeAssistant):
     assert "estimated_soc_added_pct" in data
     assert "started_at" in data
     assert "ended_at" in data
+    assert data["rfid_index"] == 1  # card_index=1 → rfid_index=1
 
 
 async def test_no_completed_event_for_micro_session(hass: HomeAssistant):

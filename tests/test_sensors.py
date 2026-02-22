@@ -260,3 +260,40 @@ async def test_cost_sensor_device_class(hass: HomeAssistant):
     state = hass.states.get("sensor.my_go_e_charger_session_cost")
     assert state is not None
     assert state.attributes.get("device_class") == "monetary"
+
+
+async def test_status_sensor_last_session_attributes_after_completed_session(
+    hass: HomeAssistant,
+):
+    """StatusSensor exposes last_session_user and last_session_rfid_index after session."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+
+    session_start = datetime(2026, 3, 1, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch(f"{_ENGINE_MODULE}.dt_util") as mock_dt:
+        mock_dt.utcnow.return_value = session_start
+
+        await setup_session_engine(hass, entry)
+        vehicle_id = await _add_vehicle(hass, entry.entry_id)
+        user_id = await _add_user(hass, entry.entry_id)
+        await _add_rfid(hass, entry.entry_id, card_index=1, user_id=user_id, vehicle_id=vehicle_id)
+
+        # Before any session, attributes should be None
+        status = hass.states.get("sensor.my_go_e_charger_status")
+        assert status.attributes.get("last_session_user") is None
+        assert status.attributes.get("last_session_rfid_index") is None
+
+        # Start and complete a session
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+        await start_charging_session(hass, trx_value="2")
+
+        mock_dt.utcnow.return_value = session_start + timedelta(seconds=120)
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "5.0")
+        await hass.async_block_till_done()
+
+        await stop_charging_session(hass)
+
+    # After session, status sensor should have last session info
+    status = hass.states.get("sensor.my_go_e_charger_status")
+    assert status.attributes.get("last_session_user") == "Petra"
+    assert status.attributes.get("last_session_rfid_index") == 1

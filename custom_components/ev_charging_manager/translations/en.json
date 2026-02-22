@@ -52,6 +52,22 @@
                     "static_price_kwh": "Price per kWh"
                 }
             },
+            "spot_config": {
+                "title": "Spot Price Configuration",
+                "description": "Configure spot pricing parameters.",
+                "data": {
+                    "spot_price_entity": "Price sensor",
+                    "spot_additional_cost_kwh": "Additional cost per kWh",
+                    "spot_vat_multiplier": "VAT multiplier",
+                    "spot_fallback_price_kwh": "Fallback price"
+                },
+                "data_description": {
+                    "spot_price_entity": "Select the sensor that provides the current electricity spot price",
+                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (kr/kWh)",
+                    "spot_vat_multiplier": "1.25 = 25% Swedish VAT",
+                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (kr/kWh)"
+                }
+            },
             "confirm": {
                 "title": "Complete Setup",
                 "description": "Your EV Charging Manager for ''{charger_name}'' is ready to install. Click Submit to complete the setup and register the charger device."
@@ -60,6 +76,7 @@
         "error": {
             "entity_not_found": "Entity not found in Home Assistant. Check the entity ID and try again.",
             "entity_unavailable": "Entity exists but is unavailable or in an unknown state. Ensure the underlying integration is running.",
+            "entity_invalid": "Entity exists but has a non-numeric state. A spot price sensor must report a number.",
             "invalid_price": "Price must be greater than 0."
         },
         "abort": {
@@ -83,7 +100,29 @@
                     "persistence_interval_s": "How often an active session is saved to disk in case of HA restart (60–3600 s, default 300)",
                     "max_stored_sessions": "Oldest sessions are pruned when this limit is exceeded (100–10000, default 1000)"
                 }
+            },
+            "pricing": {
+                "title": "Pricing",
+                "description": "Switch between static and spot pricing modes.",
+                "data": {
+                    "pricing_mode": "Pricing Mode",
+                    "static_price_kwh": "Price per kWh",
+                    "spot_price_entity": "Price sensor",
+                    "spot_additional_cost_kwh": "Additional cost per kWh",
+                    "spot_vat_multiplier": "VAT multiplier",
+                    "spot_fallback_price_kwh": "Fallback price"
+                },
+                "data_description": {
+                    "spot_price_entity": "Select the sensor that provides the current electricity spot price",
+                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (kr/kWh)",
+                    "spot_vat_multiplier": "1.25 = 25% Swedish VAT",
+                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (kr/kWh)"
+                }
             }
+        },
+        "error": {
+            "entity_not_found": "Entity not found in Home Assistant. Check the entity ID and try again.",
+            "entity_invalid": "Entity exists but has a non-numeric state. A spot price sensor must report a number."
         }
     },
     "entity": {

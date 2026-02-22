@@ -35,6 +35,10 @@ from .const import (
     CONF_PRICING_MODE,
     CONF_RFID_ENTITY,
     CONF_RFID_UID_ENTITY,
+    CONF_SPOT_ADDITIONAL_COST_KWH,
+    CONF_SPOT_FALLBACK_PRICE_KWH,
+    CONF_SPOT_PRICE_ENTITY,
+    CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
     CONF_TOTAL_ENERGY_ENTITY,
     DEFAULT_CHARGER_NAME,
@@ -45,6 +49,9 @@ from .const import (
     DEFAULT_MIN_SESSION_ENERGY_WH,
     DEFAULT_PERSISTENCE_INTERVAL_S,
     DEFAULT_PRICING_MODE,
+    DEFAULT_SPOT_ADDITIONAL_COST_KWH,
+    DEFAULT_SPOT_FALLBACK_PRICE_KWH,
+    DEFAULT_SPOT_VAT_MULTIPLIER,
     DEFAULT_STATIC_PRICE_KWH,
     DOMAIN,
 )
@@ -290,6 +297,8 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
         """Step 2: Configure pricing mode and static price."""
         if user_input is not None:
             self.data.update(user_input)
+            if user_input.get(CONF_PRICING_MODE) == "spot":
+                return await self.async_step_spot_config()
             return await self.async_step_confirm()
 
         return self.async_show_form(
@@ -302,7 +311,7 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                         selector.SelectSelectorConfig(
                             options=[
                                 {"value": "static", "label": "Static price"},
-                                {"value": "spot", "label": "Spot price (placeholder — PR-05)"},
+                                {"value": "spot", "label": "Spot price (via external sensor)"},
                             ],
                             mode=selector.SelectSelectorMode.LIST,
                         )
@@ -320,6 +329,74 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                     ),
                 }
             ),
+        )
+
+    async def async_step_spot_config(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step 2b: Configure spot pricing parameters."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            entity_id = user_input.get(CONF_SPOT_PRICE_ENTITY, "")
+            state = self.hass.states.get(entity_id)
+            if state is None:
+                errors[CONF_SPOT_PRICE_ENTITY] = "entity_not_found"
+            elif state.state in ("unavailable", "unknown"):
+                # Unavailable is acceptable (sensor may be offline temporarily)
+                pass
+            else:
+                try:
+                    float(state.state)
+                except (ValueError, TypeError):
+                    errors[CONF_SPOT_PRICE_ENTITY] = "entity_invalid"
+
+            if not errors:
+                self.data.update(user_input)
+                return await self.async_step_confirm()
+
+        static_price = self.data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH)
+
+        return self.async_show_form(
+            step_id="spot_config",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_SPOT_PRICE_ENTITY): selector.EntitySelector(
+                        selector.EntitySelectorConfig(domain=["sensor", "input_number"])
+                    ),
+                    vol.Required(
+                        CONF_SPOT_ADDITIONAL_COST_KWH, default=DEFAULT_SPOT_ADDITIONAL_COST_KWH
+                    ): vol.All(
+                        selector.NumberSelector(
+                            selector.NumberSelectorConfig(
+                                min=0.0, max=50.0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                            )
+                        ),
+                        vol.Coerce(float),
+                    ),
+                    vol.Required(
+                        CONF_SPOT_VAT_MULTIPLIER, default=DEFAULT_SPOT_VAT_MULTIPLIER
+                    ): vol.All(
+                        selector.NumberSelector(
+                            selector.NumberSelectorConfig(
+                                min=1.0, max=2.0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                            )
+                        ),
+                        vol.Coerce(float),
+                    ),
+                    vol.Required(
+                        CONF_SPOT_FALLBACK_PRICE_KWH, default=float(static_price)
+                    ): vol.All(
+                        selector.NumberSelector(
+                            selector.NumberSelectorConfig(
+                                min=0.01, max=100.0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                            )
+                        ),
+                        vol.Coerce(float),
+                    ),
+                }
+            ),
+            errors=errors,
         )
 
     async def async_step_confirm(
@@ -348,10 +425,16 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
 class OptionsFlowHandler(OptionsFlow):
     """Handle EV Charging Manager options."""
 
+    def __init__(self) -> None:
+        """Initialize the options flow."""
+        self._new_options: dict[str, Any] = {}
+
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Manage the options."""
+        """Manage the options — session thresholds."""
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
+            # Store thresholds and proceed to pricing step
+            self._new_options = dict(user_input)
+            return await self.async_step_pricing()
 
         opts = self.config_entry.options
         schema = vol.Schema(
@@ -404,6 +487,123 @@ class OptionsFlowHandler(OptionsFlow):
         )
 
         return self.async_show_form(step_id="init", data_schema=schema)
+
+    async def async_step_pricing(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the pricing mode — single step for all pricing fields."""
+        errors: dict[str, str] = {}
+        entry = self.config_entry
+
+        if user_input is not None:
+            pricing_mode = user_input.get(CONF_PRICING_MODE, "static")
+
+            if pricing_mode == "spot":
+                entity_id = user_input.get(CONF_SPOT_PRICE_ENTITY, "")
+                state = self.hass.states.get(entity_id)
+                if state is None:
+                    errors[CONF_SPOT_PRICE_ENTITY] = "entity_not_found"
+                elif state.state not in ("unavailable", "unknown"):
+                    try:
+                        float(state.state)
+                    except (ValueError, TypeError):
+                        errors[CONF_SPOT_PRICE_ENTITY] = "entity_invalid"
+
+            if not errors:
+                # Build updated entry.data with new pricing fields
+                pricing_keys = [
+                    CONF_PRICING_MODE,
+                    CONF_STATIC_PRICE_KWH,
+                    CONF_SPOT_PRICE_ENTITY,
+                    CONF_SPOT_ADDITIONAL_COST_KWH,
+                    CONF_SPOT_VAT_MULTIPLIER,
+                    CONF_SPOT_FALLBACK_PRICE_KWH,
+                ]
+                new_data = dict(entry.data)
+                # Remove all spot keys first (clean slate)
+                for key in pricing_keys:
+                    new_data.pop(key, None)
+                # Add the new pricing values
+                for key in pricing_keys:
+                    if key in user_input:
+                        new_data[key] = user_input[key]
+
+                self.hass.config_entries.async_update_entry(entry, data=new_data)
+                await self.hass.config_entries.async_reload(entry.entry_id)
+                return self.async_create_entry(data=self._new_options)
+
+        # Pre-fill with current entry.data values
+        current_mode = entry.data.get(CONF_PRICING_MODE, DEFAULT_PRICING_MODE)
+        current_static = entry.data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH)
+        current_spot_entity = entry.data.get(CONF_SPOT_PRICE_ENTITY, "")
+        current_add = entry.data.get(
+            CONF_SPOT_ADDITIONAL_COST_KWH, DEFAULT_SPOT_ADDITIONAL_COST_KWH
+        )
+        current_vat = entry.data.get(CONF_SPOT_VAT_MULTIPLIER, DEFAULT_SPOT_VAT_MULTIPLIER)
+        current_fallback = entry.data.get(
+            CONF_SPOT_FALLBACK_PRICE_KWH, DEFAULT_SPOT_FALLBACK_PRICE_KWH
+        )
+
+        schema_dict: dict[Any, Any] = {
+            vol.Required(CONF_PRICING_MODE, default=current_mode): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": "static", "label": "Static price"},
+                        {"value": "spot", "label": "Spot price (via external sensor)"},
+                    ],
+                    mode=selector.SelectSelectorMode.LIST,
+                )
+            ),
+            vol.Required(CONF_STATIC_PRICE_KWH, default=float(current_static)): vol.All(
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.01, max=100.0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                    )
+                ),
+                vol.Coerce(float),
+            ),
+            vol.Optional(CONF_SPOT_PRICE_ENTITY): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["sensor", "input_number"])
+            ),
+            vol.Optional(CONF_SPOT_ADDITIONAL_COST_KWH, default=float(current_add)): vol.All(
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.0, max=50.0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                    )
+                ),
+                vol.Coerce(float),
+            ),
+            vol.Optional(CONF_SPOT_VAT_MULTIPLIER, default=float(current_vat)): vol.All(
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1.0, max=2.0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                    )
+                ),
+                vol.Coerce(float),
+            ),
+            vol.Optional(CONF_SPOT_FALLBACK_PRICE_KWH, default=float(current_fallback)): vol.All(
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.01, max=100.0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                    )
+                ),
+                vol.Coerce(float),
+            ),
+        }
+
+        suggested: dict[str, Any] = {}
+        if current_spot_entity:
+            suggested[CONF_SPOT_PRICE_ENTITY] = current_spot_entity
+
+        schema = vol.Schema(schema_dict)
+        if suggested:
+            schema = self.add_suggested_values_to_schema(schema, suggested)
+
+        return self.async_show_form(
+            step_id="pricing",
+            data_schema=schema,
+            errors=errors,
+        )
 
 
 # ---------------------------------------------------------------------------

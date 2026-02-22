@@ -9,7 +9,7 @@ from typing import Any
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_track_state_change_event, async_track_utc_time_change
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -22,17 +22,24 @@ from .const import (
     CONF_POWER_ENTITY,
     CONF_RFID_ENTITY,
     CONF_RFID_UID_ENTITY,
+    CONF_SPOT_ADDITIONAL_COST_KWH,
+    CONF_SPOT_FALLBACK_PRICE_KWH,
+    CONF_SPOT_PRICE_ENTITY,
+    CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
     DEFAULT_CAR_STATUS_CHARGING_VALUE,
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
+    DEFAULT_SPOT_ADDITIONAL_COST_KWH,
+    DEFAULT_SPOT_FALLBACK_PRICE_KWH,
+    DEFAULT_SPOT_VAT_MULTIPLIER,
     DEFAULT_STATIC_PRICE_KWH,
     EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
     SIGNAL_SESSION_UPDATE,
     SessionEngineState,
 )
-from .pricing import PricingEngine
+from .pricing import PricingEngine, SpotConfig
 from .rfid_lookup import RfidLookup
 from .session import Session
 from .session_store import SessionStore
@@ -78,10 +85,31 @@ class SessionEngine:
         # Note: RfidLookup is created fresh at session start using current ConfigStore data
         # (ConfigStore may be updated by subentry changes between sessions)
 
+        # Spot mode tracking state
+        self._hour_energy_snapshot: float = 0.0  # relative energy at last hour boundary
+        self._hour_start_time: str = ""  # ISO timestamp of current hour start
+        self._hourly_unsub: Any = None  # unsubscribe handle for hourly callback
+
         # Pricing built once (entry.data doesn't change at runtime)
+        pricing_mode = entry.data.get("pricing_mode", "static")
+        spot_config: SpotConfig | None = None
+        if pricing_mode == "spot":
+            spot_config = SpotConfig(
+                price_entity=entry.data.get(CONF_SPOT_PRICE_ENTITY, ""),
+                additional_cost_kwh=entry.data.get(
+                    CONF_SPOT_ADDITIONAL_COST_KWH, DEFAULT_SPOT_ADDITIONAL_COST_KWH
+                ),
+                vat_multiplier=entry.data.get(
+                    CONF_SPOT_VAT_MULTIPLIER, DEFAULT_SPOT_VAT_MULTIPLIER
+                ),
+                fallback_price_kwh=entry.data.get(
+                    CONF_SPOT_FALLBACK_PRICE_KWH, DEFAULT_SPOT_FALLBACK_PRICE_KWH
+                ),
+            )
         self._pricing = PricingEngine(
-            mode=entry.data.get("pricing_mode", "static"),
+            mode=pricing_mode,
             static_price=entry.data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
+            spot_config=spot_config,
         )
 
     @property
@@ -165,6 +193,19 @@ class SessionEngine:
         except (ValueError, TypeError):
             return None
 
+    def _read_spot_price(self) -> float | None:
+        """Read current spot price from configured sensor. Returns None if unavailable."""
+        entity_id = self._entry.data.get(CONF_SPOT_PRICE_ENTITY)
+        if not entity_id:
+            return None
+        state = self._hass.states.get(entity_id)
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return None
+        try:
+            return float(state.state)
+        except (ValueError, TypeError):
+            return None
+
     def _is_charging(self) -> bool:
         """Return True if car status indicates active charging."""
         charging_value = self._entry.data.get(
@@ -222,7 +263,18 @@ class SessionEngine:
             session = self._active_session
             current_energy = self._last_energy_kwh - session.energy_start_kwh
             session.energy_kwh = max(0.0, current_energy)
-            session.cost_total_kr = self._pricing.calculate(session.energy_kwh)
+
+            # Mode-aware cost calculation
+            if self._pricing.mode == "static":
+                session.cost_total_kr = self._pricing.calculate(session.energy_kwh)
+            else:
+                # Spot: running cost = completed hours + current partial hour estimate
+                completed_cost = self._pricing.calculate_spot_total(session.price_details or [])
+                partial_kwh = max(0.0, session.energy_kwh - self._hour_energy_snapshot)
+                spot_price = self._read_spot_price()
+                partial_detail = self._pricing.calculate_spot_hour(partial_kwh, spot_price)
+                session.cost_total_kr = round(completed_cost + partial_detail["cost_kr"], 4)
+
             session.max_power_w = max(session.max_power_w, self._last_power_w)
 
             if session.vehicle_battery_kwh is not None:
@@ -238,6 +290,38 @@ class SessionEngine:
             )
 
         # Notify sensor entities
+        self._dispatch_update()
+
+    @callback
+    def _async_hourly_snapshot(self, now: datetime) -> None:
+        """Capture energy snapshot and calculate cost for the completed hour."""
+        if self._active_session is None or self._pricing.mode != "spot":
+            return
+
+        session = self._active_session
+        current_relative_energy = self._last_energy_kwh - session.energy_start_kwh
+        kwh_this_hour = max(0.0, current_relative_energy - self._hour_energy_snapshot)
+        spot_price = self._read_spot_price()
+
+        if spot_price is None:
+            _LOGGER.warning(
+                "Spot price sensor '%s' unavailable at %s — using fallback %.2f kr/kWh",
+                self._entry.data.get(CONF_SPOT_PRICE_ENTITY),
+                self._hour_start_time,
+                self._pricing.fallback_price or 0.0,
+            )
+
+        detail = self._pricing.calculate_spot_hour(kwh_this_hour, spot_price)
+        detail["hour"] = self._hour_start_time
+        detail["kwh"] = round(kwh_this_hour, 3)
+
+        session.price_details.append(detail)  # type: ignore[union-attr]
+        session.cost_total_kr = self._pricing.calculate_spot_total(session.price_details)
+
+        # Reset for next hour
+        self._hour_energy_snapshot = current_relative_energy
+        self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+
         self._dispatch_update()
 
     async def _async_start_session(self) -> None:
@@ -264,7 +348,8 @@ class SessionEngine:
             if uid_val:
                 rfid_uid = uid_val
 
-        now = dt_util.utcnow().isoformat()
+        now = dt_util.utcnow()
+        now_iso = now.isoformat()
         charger_name = self._entry.data.get(CONF_CHARGER_NAME, "")
 
         self._active_session = Session(
@@ -275,11 +360,25 @@ class SessionEngine:
             efficiency_factor=resolution.efficiency_factor if resolution else None,
             rfid_index=resolution.rfid_index if resolution else None,
             rfid_uid=rfid_uid,
-            started_at=now,
+            started_at=now_iso,
             energy_start_kwh=energy,
             energy_kwh=0.0,
             charger_name=charger_name,
         )
+
+        # Spot mode session initialization
+        if self._pricing.mode == "spot":
+            self._active_session.cost_method = "spot"
+            self._active_session.price_details = []
+            self._hour_energy_snapshot = 0.0  # relative to session start
+            self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+            self._hourly_unsub = async_track_utc_time_change(
+                self._hass,
+                self._async_hourly_snapshot,
+                minute=0,
+                second=0,
+            )
+            self._entry.async_on_unload(self._hourly_unsub)
 
         self._state = SessionEngineState.TRACKING
 
@@ -317,6 +416,31 @@ class SessionEngine:
             self._state = SessionEngineState.IDLE
             self._dispatch_update()
             return
+
+        # Spot mode: capture final partial hour before unsubscribing
+        if self._pricing.mode == "spot" and self._hourly_unsub is not None:
+            self._hourly_unsub()
+            self._hourly_unsub = None
+
+            current_relative_energy = self._last_energy_kwh - session.energy_start_kwh
+            kwh_final = max(0.0, current_relative_energy - self._hour_energy_snapshot)
+            spot_price = self._read_spot_price()
+
+            if spot_price is None:
+                _LOGGER.warning(
+                    "Spot price sensor '%s' unavailable at session end (%s) — "
+                    "using fallback %.2f kr/kWh",
+                    self._entry.data.get(CONF_SPOT_PRICE_ENTITY),
+                    self._hour_start_time,
+                    self._pricing.fallback_price or 0.0,
+                )
+
+            final_detail = self._pricing.calculate_spot_hour(kwh_final, spot_price)
+            final_detail["hour"] = self._hour_start_time
+            final_detail["kwh"] = round(kwh_final, 3)
+
+            session.price_details.append(final_detail)  # type: ignore[union-attr]
+            session.cost_total_kr = self._pricing.calculate_spot_total(session.price_details)
 
         now = dt_util.utcnow()
         started = datetime.fromisoformat(session.started_at)
@@ -372,6 +496,7 @@ class SessionEngine:
                     ),
                     "started_at": session.started_at,
                     "ended_at": session.ended_at,
+                    "cost_method": session.cost_method,
                 },
             )
             _LOGGER.info("Session completed and persisted: id=%s", session.id)
@@ -387,6 +512,8 @@ class SessionEngine:
         self._active_session = None
         self._last_energy_kwh = 0.0
         self._last_power_w = 0.0
+        self._hour_energy_snapshot = 0.0
+        self._hour_start_time = ""
         self._state = SessionEngineState.IDLE
         self._dispatch_update()
 

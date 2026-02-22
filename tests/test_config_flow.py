@@ -20,8 +20,15 @@ from custom_components.ev_charging_manager.const import (
     CONF_PRICING_MODE,
     CONF_RFID_ENTITY,
     CONF_RFID_UID_ENTITY,
+    CONF_SPOT_ADDITIONAL_COST_KWH,
+    CONF_SPOT_FALLBACK_PRICE_KWH,
+    CONF_SPOT_PRICE_ENTITY,
+    CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
     CONF_TOTAL_ENERGY_ENTITY,
+    DEFAULT_SPOT_ADDITIONAL_COST_KWH,
+    DEFAULT_SPOT_FALLBACK_PRICE_KWH,
+    DEFAULT_SPOT_VAT_MULTIPLIER,
     DOMAIN,
 )
 
@@ -296,3 +303,130 @@ def test_charger_profiles_structure() -> None:
     generic = CHARGER_PROFILES["generic"]
     assert generic["requires_charger_host"] is False
     assert generic["car_status_sensor"] is None
+
+
+# ---------------------------------------------------------------------------
+# T014 — Spot pricing config flow (US2)
+# ---------------------------------------------------------------------------
+
+
+async def _setup_to_pricing_step(hass: HomeAssistant) -> dict:
+    """Common helper: set up entities and advance config flow to the pricing step."""
+    hass.states.async_set("sensor.my_car_status", "charging")
+    hass.states.async_set("sensor.my_energy", "500")
+    hass.states.async_set("sensor.my_power", "3700")
+
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_CHARGER_PROFILE: "generic"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_CAR_STATUS_ENTITY: "sensor.my_car_status",
+            CONF_CAR_STATUS_CHARGING_VALUE: "charging",
+            CONF_ENERGY_ENTITY: "sensor.my_energy",
+            CONF_ENERGY_UNIT: "kWh",
+            CONF_POWER_ENTITY: "sensor.my_power",
+            CONF_CHARGER_NAME: "Test Charger",
+        },
+    )
+    assert result["step_id"] == "pricing"
+    return result
+
+
+async def test_config_flow_spot_mode_shows_spot_config_step(hass: HomeAssistant) -> None:
+    """Selecting spot pricing mode routes to spot_config step instead of confirm."""
+    result = await _setup_to_pricing_step(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "spot_config"
+
+
+async def test_config_flow_spot_valid_entity_creates_entry(hass: HomeAssistant) -> None:
+    """Spot mode with valid numeric price entity creates entry with all spot fields."""
+    hass.states.async_set("sensor.spot_price", "0.89")
+    result = await _setup_to_pricing_step(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+    )
+    assert result["step_id"] == "spot_config"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_SPOT_PRICE_ENTITY: "sensor.spot_price",
+            CONF_SPOT_ADDITIONAL_COST_KWH: DEFAULT_SPOT_ADDITIONAL_COST_KWH,
+            CONF_SPOT_VAT_MULTIPLIER: DEFAULT_SPOT_VAT_MULTIPLIER,
+            CONF_SPOT_FALLBACK_PRICE_KWH: DEFAULT_SPOT_FALLBACK_PRICE_KWH,
+        },
+    )
+    assert result["step_id"] == "confirm"
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+    data = result["data"]
+    assert data[CONF_PRICING_MODE] == "spot"
+    assert data[CONF_SPOT_PRICE_ENTITY] == "sensor.spot_price"
+    assert data[CONF_SPOT_ADDITIONAL_COST_KWH] == DEFAULT_SPOT_ADDITIONAL_COST_KWH
+    assert data[CONF_SPOT_VAT_MULTIPLIER] == DEFAULT_SPOT_VAT_MULTIPLIER
+    assert data[CONF_SPOT_FALLBACK_PRICE_KWH] == DEFAULT_SPOT_FALLBACK_PRICE_KWH
+
+
+async def test_config_flow_spot_missing_entity_shows_error(hass: HomeAssistant) -> None:
+    """Spot mode with non-existent price entity shows entity_not_found error."""
+    result = await _setup_to_pricing_step(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+    )
+    assert result["step_id"] == "spot_config"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_SPOT_PRICE_ENTITY: "sensor.does_not_exist",
+            CONF_SPOT_ADDITIONAL_COST_KWH: DEFAULT_SPOT_ADDITIONAL_COST_KWH,
+            CONF_SPOT_VAT_MULTIPLIER: DEFAULT_SPOT_VAT_MULTIPLIER,
+            CONF_SPOT_FALLBACK_PRICE_KWH: DEFAULT_SPOT_FALLBACK_PRICE_KWH,
+        },
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "spot_config"
+    assert result["errors"][CONF_SPOT_PRICE_ENTITY] == "entity_not_found"
+
+
+async def test_config_flow_spot_non_numeric_entity_shows_error(hass: HomeAssistant) -> None:
+    """Spot mode with non-numeric entity state shows entity_invalid error."""
+    hass.states.async_set("sensor.text_price", "not_a_number")
+    result = await _setup_to_pricing_step(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+    )
+    assert result["step_id"] == "spot_config"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_SPOT_PRICE_ENTITY: "sensor.text_price",
+            CONF_SPOT_ADDITIONAL_COST_KWH: DEFAULT_SPOT_ADDITIONAL_COST_KWH,
+            CONF_SPOT_VAT_MULTIPLIER: DEFAULT_SPOT_VAT_MULTIPLIER,
+            CONF_SPOT_FALLBACK_PRICE_KWH: DEFAULT_SPOT_FALLBACK_PRICE_KWH,
+        },
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "spot_config"
+    assert result["errors"][CONF_SPOT_PRICE_ENTITY] == "entity_invalid"

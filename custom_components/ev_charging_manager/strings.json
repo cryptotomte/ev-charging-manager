@@ -92,13 +92,15 @@
                     "min_session_duration_s": "Minimum session duration (seconds)",
                     "min_session_energy_wh": "Minimum session energy (Wh)",
                     "persistence_interval_s": "Auto-save interval (seconds)",
-                    "max_stored_sessions": "Maximum stored sessions"
+                    "max_stored_sessions": "Maximum stored sessions",
+                    "eto_entity": "Charger total energy counter sensor"
                 },
                 "data_description": {
                     "min_session_duration_s": "Sessions shorter than this are discarded as micro-sessions (0–3600 s, default 60)",
                     "min_session_energy_wh": "Sessions with less energy than this are discarded (0–10000 Wh, default 50)",
                     "persistence_interval_s": "How often an active session is saved to disk in case of HA restart (60–3600 s, default 300)",
-                    "max_stored_sessions": "Oldest sessions are pruned when this limit is exceeded (100–10000, default 1000)"
+                    "max_stored_sessions": "Oldest sessions are pruned when this limit is exceeded (100–10000, default 1000)",
+                    "eto_entity": "Optional. Used to cross-validate tracked session energy against the charger''s cumulative energy counter at session start and end. A warning is logged if deviation exceeds 5%."
                 }
             },
             "pricing": {

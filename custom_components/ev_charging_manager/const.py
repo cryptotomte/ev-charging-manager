@@ -104,3 +104,20 @@ SIGNAL_SESSION_UPDATE = "ev_charging_manager_session_update_{}"
 
 # Platforms to forward to
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
+
+# Cross-validation: total energy counter entity (PR-07)
+CONF_ETO_ENTITY = "eto_entity"
+
+# Unknown session diagnostic reason codes (PR-07)
+UNKNOWN_REASON_TRX_NULL = "trx_was_null"
+UNKNOWN_REASON_TRX_ZERO = "trx_was_zero"
+UNKNOWN_REASON_RFID_INACTIVE = "rfid_inactive"
+UNKNOWN_REASON_RFID_UNMAPPED = "rfid_unmapped"
+UNKNOWN_REASON_RFID_TYPE_ERROR = "rfid_type_error"
+
+# Notification ID for recurring unknown-sessions alert (formatted with entry_id)
+NOTIFICATION_ID_UNKNOWN_SESSIONS = "ev_charging_manager_unknown_sessions_{}"
+
+# Threshold for proactive unknown-session notifications (PR-07)
+UNKNOWN_SESSION_THRESHOLD = 3
+UNKNOWN_SESSION_WINDOW_DAYS = 7

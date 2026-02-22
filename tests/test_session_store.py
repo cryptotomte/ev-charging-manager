@@ -42,11 +42,12 @@ async def session_store_with_save(hass: HomeAssistant):
 
 
 async def test_load_empty_store_returns_empty(hass: HomeAssistant):
-    """Loading a missing store returns an empty list."""
+    """Loading a missing store returns ([], None) tuple."""
     store = SessionStore(hass)
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=None):
-        result = await store.async_load()
-    assert result == []
+        sessions, snapshot = await store.async_load()
+    assert sessions == []
+    assert snapshot is None
     assert store.sessions == []
 
 
@@ -111,18 +112,45 @@ async def test_periodic_save_is_scheduled(hass: HomeAssistant):
     assert len(unload_callbacks) == 1
 
 
-async def test_load_discards_incomplete_session_snapshots(hass: HomeAssistant):
-    """Incomplete sessions (ended_at=None) from crash recovery are discarded on load."""
+async def test_load_separates_snapshot_from_completed(hass: HomeAssistant):
+    """Incomplete sessions (ended_at=None) are returned as active snapshot, not in sessions list."""
     stored_data = [
         make_session("completed_1"),
         {"id": "incomplete", "energy_kwh": 1.0, "user_name": "Test"},  # no ended_at
     ]
     store = SessionStore(hass)
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored_data):
-        result = await store.async_load()
-    assert len(result) == 1
-    assert result[0]["id"] == "completed_1"
-    assert store.sessions == result
+        sessions, snapshot = await store.async_load()
+    assert len(sessions) == 1
+    assert sessions[0]["id"] == "completed_1"
+    assert store.sessions == sessions
+    # Active snapshot returned separately (not in sessions list)
+    assert snapshot is not None
+    assert snapshot["id"] == "incomplete"
+
+
+async def test_load_returns_most_recent_snapshot(hass: HomeAssistant):
+    """When multiple incomplete entries exist, the last one is returned as snapshot."""
+    stored_data = [
+        {"id": "snap_old", "energy_kwh": 1.0},  # no ended_at, older
+        {"id": "snap_new", "energy_kwh": 2.0},  # no ended_at, newer
+    ]
+    store = SessionStore(hass)
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored_data):
+        sessions, snapshot = await store.async_load()
+    assert sessions == []
+    assert snapshot is not None
+    assert snapshot["id"] == "snap_new"
+
+
+async def test_load_no_snapshot_when_all_complete(hass: HomeAssistant):
+    """When all stored sessions are complete, snapshot is None."""
+    stored_data = [make_session("s1"), make_session("s2")]
+    store = SessionStore(hass)
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored_data):
+        sessions, snapshot = await store.async_load()
+    assert len(sessions) == 2
+    assert snapshot is None
 
 
 async def test_save_active_session(hass: HomeAssistant):

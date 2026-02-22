@@ -27,6 +27,7 @@ from .const import (
     CONF_CHARGER_SERIAL,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
+    CONF_ETO_ENTITY,
     CONF_MAX_STORED_SESSIONS,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
@@ -483,6 +484,10 @@ class OptionsFlowHandler(OptionsFlow):
                     ),
                     vol.Coerce(int),
                 ),
+                vol.Optional(
+                    CONF_ETO_ENTITY,
+                    description={"suggested_value": opts.get(CONF_ETO_ENTITY)},
+                ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"])),
             }
         )
 

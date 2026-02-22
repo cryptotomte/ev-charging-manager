@@ -106,10 +106,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Set up session store and load persisted sessions
     max_sessions = entry.options.get(CONF_MAX_STORED_SESSIONS, DEFAULT_MAX_STORED_SESSIONS)
     session_store = SessionStore(hass, max_sessions=max_sessions)
-    await session_store.async_load()
+    _sessions, active_snapshot = await session_store.async_load()
 
-    # Set up session engine and register state listeners
+    # Set up session engine and recover any active session before registering listeners
     session_engine = SessionEngine(hass, entry, config_store, session_store)
+    if active_snapshot is not None:
+        await session_engine.async_recover(active_snapshot)
     session_engine.async_setup()
 
     # Schedule periodic persistence of active session

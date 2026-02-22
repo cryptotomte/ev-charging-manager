@@ -153,7 +153,7 @@ def test_unexpected_format_returns_unknown(caplog):
         result = lookup.resolve("abc")
     assert result is not None
     assert result.user_name == "Unknown"
-    assert result.reason == "unmapped"
+    assert result.reason == "type_error"
     assert "Unexpected trx value format" in caplog.text
 
 

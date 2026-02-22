@@ -2,7 +2,8 @@
 
 Entity classes: StatsBaseSensor, UserTotalEnergySensor, UserTotalCostSensor,
 UserSessionCountSensor, UserAvgSessionEnergySensor, UserLastSessionSensor,
-GuestLastEnergySensor, GuestLastChargePriceSensor.
+GuestLastEnergySensor, GuestLastChargePriceSensor, GuestTotalEnergySensor,
+GuestTotalCostSensor.
 
 All sensors are registered through the existing sensor.py platform's
 async_setup_entry (plan.md D3) — this file contains entity class definitions only.
@@ -343,6 +344,62 @@ class GuestLastChargePriceSensor(StatsBaseSensor):
         return round(guest.charge_price_kr, 2)
 
 
+class GuestTotalEnergySensor(StatsBaseSensor):
+    """Lifetime accumulated energy across all guest users (kWh).
+
+    Sums total_energy_kwh for all UserStats where user_type == "guest".
+    """
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        """Initialize."""
+        super().__init__(hass, entry)
+        self._attr_unique_id = f"{entry.entry_id}_guest_total_energy"
+        self._attr_translation_key = "guest_total_energy"
+
+    @property
+    def native_value(self) -> float:
+        """Return lifetime total energy across all guest users."""
+        engine = self._stats_engine()
+        if engine is None:
+            return 0.0
+        total = sum(
+            s.total_energy_kwh for s in engine.user_stats.values() if s.user_type == "guest"
+        )
+        return round(total, 2)
+
+
+class GuestTotalCostSensor(StatsBaseSensor):
+    """Lifetime accumulated cost across all guest users (kr).
+
+    Sums total_cost_kr for all UserStats where user_type == "guest".
+    """
+
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = "kr"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        """Initialize."""
+        super().__init__(hass, entry)
+        self._attr_unique_id = f"{entry.entry_id}_guest_total_cost"
+        self._attr_translation_key = "guest_total_cost"
+
+    @property
+    def native_value(self) -> float:
+        """Return lifetime total cost across all guest users."""
+        engine = self._stats_engine()
+        if engine is None:
+            return 0.0
+        total = sum(s.total_cost_kr for s in engine.user_stats.values() if s.user_type == "guest")
+        return round(total, 2)
+
+
 # ---------------------------------------------------------------------------
 # Factory function
 # ---------------------------------------------------------------------------
@@ -356,7 +413,7 @@ def create_stats_sensors(
     """Create all statistics sensor entities for the given users.
 
     Creates 5 sensors per user (total_energy, total_cost, session_count,
-    avg_session_energy, last_session) plus 2 guest sensors.
+    avg_session_energy, last_session) plus 4 guest sensors.
 
     user_names should include "Unknown" — callers are responsible for ensuring it.
     """
@@ -379,6 +436,8 @@ def create_stats_sensors(
         [
             GuestLastEnergySensor(hass, entry),
             GuestLastChargePriceSensor(hass, entry),
+            GuestTotalEnergySensor(hass, entry),
+            GuestTotalCostSensor(hass, entry),
         ]
     )
 

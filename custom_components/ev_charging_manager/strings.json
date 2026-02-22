@@ -144,7 +144,9 @@
             "user_avg_session_energy": { "name": "{user} Avg Session Energy" },
             "user_last_session": { "name": "{user} Last Session" },
             "guest_last_energy": { "name": "Guest Last Energy" },
-            "guest_last_charge_price": { "name": "Guest Last Charge Price" }
+            "guest_last_charge_price": { "name": "Guest Last Charge Price" },
+            "guest_total_energy": { "name": "Guest Total Energy" },
+            "guest_total_cost": { "name": "Guest Total Cost" }
         },
         "binary_sensor": {
             "charging": { "name": "Charging" }

@@ -342,4 +342,6 @@ class StatusSensor(_SessionSensorBase):
             "last_unknown_reason": engine.last_unknown_reason if engine else None,
             "last_unknown_at": engine.last_unknown_at if engine else None,
             "charger_connected": charger_connected,
+            "last_session_user": engine.last_session_user if engine else None,
+            "last_session_rfid_index": engine.last_session_rfid_index if engine else None,
         }

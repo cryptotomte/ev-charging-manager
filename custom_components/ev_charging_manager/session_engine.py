@@ -111,6 +111,10 @@ class SessionEngine:
         self._last_unknown_reason: str | None = None
         self._last_unknown_at: str | None = None
 
+        # Last completed session info (persists across sessions for StatusSensor attributes)
+        self._last_session_user: str | None = None
+        self._last_session_rfid_index: int | None = None
+
         # Spot mode tracking state
         self._hour_energy_snapshot: float = 0.0  # relative energy at last hour boundary
         self._hour_start_time: str = ""  # ISO timestamp of current hour start
@@ -157,6 +161,16 @@ class SessionEngine:
     def last_unknown_at(self) -> str | None:
         """Return the ISO timestamp when the last unknown reason was set."""
         return self._last_unknown_at
+
+    @property
+    def last_session_user(self) -> str | None:
+        """Return the user name from the last completed session."""
+        return self._last_session_user
+
+    @property
+    def last_session_rfid_index(self) -> int | None:
+        """Return the RFID index from the last completed session."""
+        return self._last_session_rfid_index
 
     async def async_recover(self, snapshot: dict | None) -> None:
         """Recover an active session after a system restart.
@@ -378,6 +392,7 @@ class SessionEngine:
             "cost_method": session.cost_method,
             "reconstructed": session.reconstructed,
             "data_gap": session.data_gap,
+            "rfid_index": session.rfid_index,
             "charger_name": self._entry.data.get("charger_name", "unknown"),
         }
 
@@ -824,6 +839,10 @@ class SessionEngine:
                 duration_s,
                 session.energy_kwh,
             )
+
+        # Record last session info before clearing (for StatusSensor attributes)
+        self._last_session_user = session.user_name
+        self._last_session_rfid_index = session.rfid_index
 
         # Reset to IDLE
         self._active_session = None

@@ -464,3 +464,147 @@ async def test_guest_last_energy_unchanged_after_regular_session(
     state = hass.states.get(entity_id)
     # Still shows the guest's value
     assert float(state.state) == 32.1
+
+
+# ---------------------------------------------------------------------------
+# Guest total sensors (G3)
+# ---------------------------------------------------------------------------
+
+
+async def test_guest_total_energy_sensor_created(
+    hass: HomeAssistant, stats_entry: MockConfigEntry
+) -> None:
+    """guest_total_energy sensor is created and shows 0 before any sessions."""
+    entry = stats_entry
+    registry = er.async_get(hass)
+
+    uid = f"{entry.entry_id}_guest_total_energy"
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, uid)
+    assert entity_id is not None
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert float(state.state) == 0.0
+
+
+async def test_guest_total_cost_sensor_created(
+    hass: HomeAssistant, stats_entry: MockConfigEntry
+) -> None:
+    """guest_total_cost sensor is created and shows 0 before any sessions."""
+    entry = stats_entry
+    registry = er.async_get(hass)
+
+    uid = f"{entry.entry_id}_guest_total_cost"
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, uid)
+    assert entity_id is not None
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert float(state.state) == 0.0
+
+
+async def test_guest_total_sensors_sum_across_guests(
+    hass: HomeAssistant, stats_entry: MockConfigEntry
+) -> None:
+    """guest_total_energy and guest_total_cost sum across multiple guest users."""
+    entry = stats_entry
+    registry = er.async_get(hass)
+
+    # Fire two guest sessions from different guests
+    hass.bus.async_fire(
+        EVENT_SESSION_COMPLETED,
+        {
+            "user_name": "Gäst-Erik",
+            "user_type": "guest",
+            "energy_kwh": 20.0,
+            "cost_kr": 50.0,
+            "started_at": "2026-04-10T14:00:00+02:00",
+            "ended_at": "2026-04-10T15:00:00+02:00",
+        },
+    )
+    await hass.async_block_till_done()
+
+    hass.bus.async_fire(
+        EVENT_SESSION_COMPLETED,
+        {
+            "user_name": "Gäst-Anna",
+            "user_type": "guest",
+            "energy_kwh": 12.5,
+            "cost_kr": 31.25,
+            "started_at": "2026-04-11T10:00:00+02:00",
+            "ended_at": "2026-04-11T11:00:00+02:00",
+        },
+    )
+    await hass.async_block_till_done()
+
+    energy_uid = f"{entry.entry_id}_guest_total_energy"
+    energy_id = registry.async_get_entity_id("sensor", DOMAIN, energy_uid)
+    state = hass.states.get(energy_id)
+    assert float(state.state) == pytest.approx(32.5, abs=0.01)
+
+    cost_uid = f"{entry.entry_id}_guest_total_cost"
+    cost_id = registry.async_get_entity_id("sensor", DOMAIN, cost_uid)
+    state = hass.states.get(cost_id)
+    assert float(state.state) == pytest.approx(81.25, abs=0.01)
+
+
+async def test_guest_total_sensors_ignore_regular_users(
+    hass: HomeAssistant, stats_entry: MockConfigEntry
+) -> None:
+    """guest_total sensors only include guest-type users, not regular or unknown."""
+    entry = stats_entry
+    registry = er.async_get(hass)
+
+    # Guest session
+    hass.bus.async_fire(
+        EVENT_SESSION_COMPLETED,
+        {
+            "user_name": "Gäst-Erik",
+            "user_type": "guest",
+            "energy_kwh": 10.0,
+            "cost_kr": 25.0,
+            "started_at": "2026-04-10T14:00:00+02:00",
+            "ended_at": "2026-04-10T15:00:00+02:00",
+        },
+    )
+    await hass.async_block_till_done()
+
+    # Regular user session — should NOT be included
+    hass.bus.async_fire(
+        EVENT_SESSION_COMPLETED,
+        {
+            "user_name": "Petra",
+            "user_type": "regular",
+            "energy_kwh": 8.0,
+            "cost_kr": 20.0,
+            "started_at": "2026-04-11T09:00:00+02:00",
+            "ended_at": "2026-04-11T10:00:00+02:00",
+        },
+    )
+    await hass.async_block_till_done()
+
+    # Unknown user session — should NOT be included
+    hass.bus.async_fire(
+        EVENT_SESSION_COMPLETED,
+        {
+            "user_name": "Unknown",
+            "user_type": "unknown",
+            "energy_kwh": 5.0,
+            "cost_kr": 12.5,
+            "started_at": "2026-04-12T09:00:00+02:00",
+            "ended_at": "2026-04-12T10:00:00+02:00",
+        },
+    )
+    await hass.async_block_till_done()
+
+    energy_uid = f"{entry.entry_id}_guest_total_energy"
+    energy_id = registry.async_get_entity_id("sensor", DOMAIN, energy_uid)
+    state = hass.states.get(energy_id)
+    # Only guest energy: 10.0
+    assert float(state.state) == pytest.approx(10.0, abs=0.01)
+
+    cost_uid = f"{entry.entry_id}_guest_total_cost"
+    cost_id = registry.async_get_entity_id("sensor", DOMAIN, cost_uid)
+    state = hass.states.get(cost_id)
+    # Only guest cost: 25.0
+    assert float(state.state) == pytest.approx(25.0, abs=0.01)

@@ -21,6 +21,7 @@ from .charger_profiles import CHARGER_PROFILES
 from .const import (
     CONF_CAR_STATUS_CHARGING_VALUE,
     CONF_CAR_STATUS_ENTITY,
+    CONF_CARD_UID,
     CONF_CHARGER_HOST,
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
@@ -55,6 +56,14 @@ from .const import (
     DEFAULT_SPOT_VAT_MULTIPLIER,
     DEFAULT_STATIC_PRICE_KWH,
     DOMAIN,
+)
+from .rfid_discovery import (
+    DiscoveredCard,
+    DiscoveryError,
+    RfidDiscoveryProvider,
+    async_get_charger_host,
+    get_discovery_provider,
+    suggest_user_for_card,
 )
 
 # Fields that must have a valid, reachable HA entity state
@@ -949,21 +958,25 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
 class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
     """Handle RFID mapping subentry add/edit flows."""
 
-    def _get_available_card_indices(self, entry: ConfigEntry) -> list[str]:
-        """Return unused card indices 0-9 as string options."""
-        used = set()
-        for sub in entry.subentries.values():
-            if sub.subentry_type == "rfid_mapping":
-                used.add(sub.data["card_index"])
-        return [str(i) for i in range(10) if i not in used]
+    def __init__(self) -> None:
+        """Initialise flow state."""
+        super().__init__()
+        self._discovered_cards: list[DiscoveredCard] = []
+        self._selected_card: DiscoveredCard | None = None
+        self._last_rfid_uid: str | None = None
+        self._discovery_error: str | None = None
+        self._provider: RfidDiscoveryProvider | None = None
 
-    def _get_active_users(self, entry: ConfigEntry) -> list[selector.SelectOptionDict]:
-        """Return active users as SelectSelector options (FR-019)."""
-        options: list[selector.SelectOptionDict] = []
+    @staticmethod
+    def _iter_active_users(entry: ConfigEntry):
+        """Yield (subentry_id, name) for each active user subentry."""
         for sub in entry.subentries.values():
             if sub.subentry_type == "user" and sub.data.get("active", True):
-                options.append({"value": sub.subentry_id, "label": sub.data["name"]})
-        return options
+                yield sub.subentry_id, sub.data["name"]
+
+    def _get_active_users(self, entry: ConfigEntry) -> list[selector.SelectOptionDict]:
+        """Return active users as SelectSelector options."""
+        return [{"value": sid, "label": name} for sid, name in self._iter_active_users(entry)]
 
     def _get_vehicles(self, entry: ConfigEntry) -> list[selector.SelectOptionDict]:
         """Return all vehicles as SelectSelector options."""
@@ -973,8 +986,194 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
                 options.append({"value": sub.subentry_id, "label": sub.data["name"]})
         return options
 
+    def _get_mapped_card_indices(self, entry: ConfigEntry) -> set[int]:
+        """Return set of card indices already mapped in this entry."""
+        mapped: set[int] = set()
+        for sub in entry.subentries.values():
+            if sub.subentry_type == "rfid_mapping":
+                mapped.add(sub.data["card_index"])
+        return mapped
+
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
-        """Handle adding a new RFID mapping."""
+        """Entry point: attempt discovery, fall back to manual if unsupported/failed."""
+        entry = self._get_entry()
+        profile_key = entry.data.get("charger_profile", "")
+        profile = CHARGER_PROFILES.get(profile_key, {})
+
+        if profile.get("rfid_discovery") is None:
+            # No discovery support — go directly to manual
+            return await self.async_step_manual()
+
+        # Attempt to look up charger host and instantiate provider
+        car_status_entity = entry.data.get("car_status_entity", "")
+        host = await async_get_charger_host(self.hass, car_status_entity)
+        if host is None:
+            # Fall back to charger_host from entry data (direct config)
+            host = entry.data.get("charger_host")
+        if host is None:
+            self._discovery_error = "Cannot determine charger address."
+            return await self.async_step_manual()
+
+        provider = get_discovery_provider(profile, host)
+        if provider is None:
+            return await self.async_step_manual()
+
+        self._provider = provider
+
+        # Run discovery
+        try:
+            cards = await provider.get_programmed_cards(self.hass)
+            self._discovered_cards = cards
+        except DiscoveryError as exc:
+            self._discovery_error = exc.message
+            return await self.async_step_manual()
+
+        # Also fetch lri UID (best-effort)
+        try:
+            self._last_rfid_uid = await provider.get_last_rfid_uid(self.hass)
+        except Exception:  # noqa: BLE001
+            self._last_rfid_uid = None
+
+        return await self.async_step_select_card()
+
+    async def async_step_select_card(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Show discovered cards as a dropdown. User picks one to map."""
+        entry = self._get_entry()
+        mapped_indices = self._get_mapped_card_indices(entry)
+
+        # Filter to programmed and unmapped cards
+        available = [
+            c for c in self._discovered_cards if c.is_programmed and c.index not in mapped_indices
+        ]
+
+        if not available:
+            # All programmed cards are already mapped (or none programmed)
+            self._discovery_error = (
+                "all_slots_mapped"
+                if any(c.is_programmed for c in self._discovered_cards)
+                else "no_programmed_cards"
+            )
+            return await self.async_step_manual()
+
+        if user_input is not None:
+            selected_index = int(user_input["card_index"])
+            selected = next((c for c in available if c.index == selected_index), None)
+            if selected is None:
+                return await self.async_step_select_card(user_input=None)
+            self._selected_card = selected
+            return await self.async_step_map_card()
+
+        # Build options: "#0: Paul (12.3 kWh)" or "#0: Paul (N/A)"
+        options: list[selector.SelectOptionDict] = []
+        for card in available:
+            if card.energy_kwh is not None:
+                energy_str = f"{card.energy_kwh:.1f} kWh"
+            else:
+                energy_str = "N/A"
+            label_name = card.name or "Unknown"
+            label = f"#{card.index}: {label_name} ({energy_str})"
+            options.append({"value": str(card.index), "label": label})
+
+        # Build description placeholders for UID info
+        uid_text = f"Last scanned UID: {self._last_rfid_uid}" if self._last_rfid_uid else ""
+        description_placeholders: dict[str, str] = {
+            "last_uid": uid_text,
+        }
+
+        schema = vol.Schema(
+            {
+                vol.Required("card_index"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }
+        )
+
+        return self.async_show_form(
+            step_id="select_card",
+            data_schema=schema,
+            description_placeholders=description_placeholders,
+        )
+
+    async def async_step_map_card(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Assign the selected discovered card to a user and optional vehicle."""
+        entry = self._get_entry()
+        card = self._selected_card
+        if card is None:
+            return await self.async_step_manual()
+
+        if user_input is not None:
+            data: dict[str, Any] = {
+                "card_index": card.index,
+                CONF_CARD_UID: self._last_rfid_uid,
+                "user_id": user_input["user_id"],
+                "vehicle_id": user_input.get("vehicle_id"),
+                "active": True,
+                "deactivated_by": None,
+            }
+            label_name = card.name or f"slot {card.index + 1}"
+            return self.async_create_entry(
+                title=f"Card #{card.index} ({label_name})",
+                data=data,
+                unique_id=f"rfid_{card.index}",
+            )
+
+        active_users = self._get_active_users(entry)
+        if not active_users:
+            return self.async_abort(reason="no_users")
+        vehicles = self._get_vehicles(entry)
+
+        # Suggest user based on card name match
+        users_for_match = [
+            {"user_id": sid, "user_name": name} for sid, name in self._iter_active_users(entry)
+        ]
+        suggested_user_id = suggest_user_for_card(card.name, users_for_match)
+
+        schema_dict: dict[Any, Any] = {
+            vol.Required("user_id"): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=active_users,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
+        }
+        if vehicles:
+            schema_dict[vol.Optional("vehicle_id")] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=vehicles,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+
+        schema = vol.Schema(schema_dict)
+        if suggested_user_id:
+            schema = self.add_suggested_values_to_schema(schema, {"user_id": suggested_user_id})
+
+        if card.energy_kwh is not None:
+            energy_str = f"{card.energy_kwh:.1f} kWh"
+        else:
+            energy_str = "N/A"
+
+        return self.async_show_form(
+            step_id="map_card",
+            data_schema=schema,
+            description_placeholders={
+                "card_index": str(card.index),
+                "card_name": card.name or "",
+                "card_energy": energy_str,
+            },
+        )
+
+    async def async_step_manual(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Manual RFID mapping form — used when discovery is unavailable or fails."""
         entry = self._get_entry()
         errors: dict[str, str] = {}
 
@@ -990,27 +1189,28 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
             if not errors:
                 data: dict[str, Any] = {
                     "card_index": card_index,
-                    "card_uid": None,
+                    CONF_CARD_UID: None,
                     "user_id": user_input["user_id"],
                     "vehicle_id": user_input.get("vehicle_id"),
                     "active": True,
                     "deactivated_by": None,
                 }
                 return self.async_create_entry(
-                    title=f"Card #{card_index} (go-e slot {card_index + 1})",
+                    title=f"Card #{card_index} (slot {card_index + 1})",
                     data=data,
                     unique_id=f"rfid_{card_index}",
                 )
 
         active_users = self._get_active_users(entry)
+        if not active_users:
+            return self.async_abort(reason="no_users")
         vehicles = self._get_vehicles(entry)
 
         schema_dict: dict[Any, Any] = {
             vol.Required("card_index"): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[
-                        {"value": str(i), "label": f"Card #{i} (go-e slot {i + 1})"}
-                        for i in range(10)
+                        {"value": str(i), "label": f"Card #{i} (slot {i + 1})"} for i in range(10)
                     ],
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
@@ -1030,10 +1230,16 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
                 )
             )
 
+        error_text = f"Discovery failed: {self._discovery_error}" if self._discovery_error else ""
+        description_placeholders: dict[str, str] = {
+            "discovery_error": error_text,
+        }
+
         return self.async_show_form(
-            step_id="user",
+            step_id="manual",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
+            description_placeholders=description_placeholders,
         )
 
     async def async_step_reconfigure(

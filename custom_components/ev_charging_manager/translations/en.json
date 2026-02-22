@@ -268,8 +268,31 @@
                 "user": "Add RFID mapping"
             },
             "step": {
-                "user": {
+                "select_card": {
+                    "title": "Discovered RFID Cards",
+                    "description": "The following RFID cards are programmed in your charger. Select a card to map it to a user.",
+                    "data": {
+                        "card_index": "Select card"
+                    },
+                    "data_description": {
+                        "card_index": "Choose the card you want to assign to a user"
+                    }
+                },
+                "map_card": {
+                    "title": "Assign Card to User",
+                    "description": "Card #{card_index}: {card_name} ({card_energy}). Assign this card to a user.",
+                    "data": {
+                        "user_id": "User",
+                        "vehicle_id": "Vehicle (optional)"
+                    },
+                    "data_description": {
+                        "user_id": "The user this RFID card is assigned to",
+                        "vehicle_id": "The vehicle associated with this card (optional)"
+                    }
+                },
+                "manual": {
                     "title": "Add RFID Mapping",
+                    "description": "Select the card slot index and assign it to a user. Tip: Start a charging session with the card, then check the RFID index in Developer Tools.",
                     "data": {
                         "card_index": "Card slot",
                         "user_id": "User",

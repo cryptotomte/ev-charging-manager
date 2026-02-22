@@ -34,7 +34,7 @@
                 },
                 "data_description": {
                     "car_status_entity": "Sensor som rapporterar bilens anslutningsstatus (t.ex. sensor.goe_123456_car_value)",
-                    "car_status_charging_value": "Sensorvärde som betyder ''laddning pågår'' (t.ex. 2 för go-e, ''charging'' för Easee)",
+                    "car_status_charging_value": "Sensorvärde som betyder ''laddning pågår'' (t.ex. Charging för go-e)",
                     "energy_entity": "Sensor som rapporterar sessionsenergi",
                     "energy_unit": "Enhet som energisensorn använder",
                     "power_entity": "Sensor som rapporterar aktuell laddningseffekt i Watt",

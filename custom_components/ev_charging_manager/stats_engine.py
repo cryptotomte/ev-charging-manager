@@ -256,9 +256,11 @@ class StatsEngine:
 
         # Guest last-session update (T021, FR-008/FR-009)
         if user_type == "guest":
+            raw_charge_price = data.get("charge_price_kr")
+            charge_price_kr = float(raw_charge_price) if raw_charge_price is not None else None
             self._guest_last = GuestLastSession(
                 energy_kwh=energy_kwh,
-                charge_price_kr=None,  # Implemented in PR-06
+                charge_price_kr=charge_price_kr,
                 session_at=ended_at,
             )
 

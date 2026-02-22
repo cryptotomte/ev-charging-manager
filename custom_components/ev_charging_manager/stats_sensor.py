@@ -70,6 +70,13 @@ class StatsBaseSensor(SensorEntity):
             return None
         return engine.user_stats.get(user_name)
 
+    def _get_guest_last(self) -> GuestLastSession | None:
+        """Return the last guest session data, or None if engine not loaded."""
+        engine = self._stats_engine()
+        if engine is None:
+            return None
+        return engine.guest_last
+
 
 # ---------------------------------------------------------------------------
 # Per-user sensors (T010 + T016 monthly attributes)
@@ -290,12 +297,6 @@ class GuestLastEnergySensor(StatsBaseSensor):
         self._attr_unique_id = f"{entry.entry_id}_guest_last_energy"
         self._attr_translation_key = "guest_last_energy"
 
-    def _get_guest_last(self) -> GuestLastSession | None:
-        engine = self._stats_engine()
-        if engine is None:
-            return None
-        return engine.guest_last
-
     @property
     def available(self) -> bool:
         """Available only after at least one guest session has completed."""
@@ -313,7 +314,8 @@ class GuestLastEnergySensor(StatsBaseSensor):
 class GuestLastChargePriceSensor(StatsBaseSensor):
     """Charge price from the most recent guest session (kr).
 
-    Always unavailable — placeholder until PR-06 implements guest pricing.
+    Retains its value until overwritten by the next guest session.
+    Unavailable when no guest session has completed or guest had no pricing configured.
     """
 
     _attr_device_class = SensorDeviceClass.MONETARY
@@ -328,13 +330,17 @@ class GuestLastChargePriceSensor(StatsBaseSensor):
 
     @property
     def available(self) -> bool:
-        """Always unavailable until PR-06."""
-        return False
+        """Available only after a guest session with charge price has completed."""
+        guest = self._get_guest_last()
+        return guest is not None and guest.charge_price_kr is not None
 
     @property
-    def native_value(self) -> None:
-        """Always None until PR-06."""
-        return None
+    def native_value(self) -> float | None:
+        """Return last guest charge price, or None if unavailable."""
+        guest = self._get_guest_last()
+        if guest is None or guest.charge_price_kr is None:
+            return None
+        return round(guest.charge_price_kr, 2)
 
 
 # ---------------------------------------------------------------------------

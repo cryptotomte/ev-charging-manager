@@ -333,10 +333,10 @@ async def test_guest_last_energy_unavailable_before_guest_session(
     assert state.state == STATE_UNAVAILABLE
 
 
-async def test_guest_last_charge_price_always_unavailable(
+async def test_guest_last_charge_price_unavailable_without_price_in_event(
     hass: HomeAssistant, stats_entry: MockConfigEntry
 ) -> None:
-    """guest_last_charge_price is always unavailable (placeholder for PR-06)."""
+    """guest_last_charge_price is unavailable when event has no charge_price_kr."""
     entry = stats_entry
     registry = er.async_get(hass)
 
@@ -344,7 +344,7 @@ async def test_guest_last_charge_price_always_unavailable(
     entity_id = registry.async_get_entity_id("sensor", DOMAIN, uid)
     assert entity_id is not None
 
-    # Even after a guest session
+    # Guest session without charge_price_kr in event data
     hass.bus.async_fire(
         EVENT_SESSION_COMPLETED,
         {
@@ -360,6 +360,41 @@ async def test_guest_last_charge_price_always_unavailable(
 
     state = hass.states.get(entity_id)
     assert state.state == STATE_UNAVAILABLE
+
+
+async def test_guest_last_charge_price_shows_value_after_guest_session(
+    hass: HomeAssistant, stats_entry: MockConfigEntry
+) -> None:
+    """guest_last_charge_price shows 144.45 after a guest session with charge_price_kr (PR-06)."""
+    entry = stats_entry
+    registry = er.async_get(hass)
+
+    uid = f"{entry.entry_id}_guest_last_charge_price"
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, uid)
+    assert entity_id is not None
+
+    # Before any session — unavailable
+    state = hass.states.get(entity_id)
+    assert state.state == STATE_UNAVAILABLE
+
+    # Fire guest session with charge_price_kr
+    hass.bus.async_fire(
+        EVENT_SESSION_COMPLETED,
+        {
+            "user_name": "Gäst-Erik",
+            "user_type": "guest",
+            "energy_kwh": 32.1,
+            "cost_kr": 80.25,
+            "charge_price_kr": 144.45,
+            "started_at": "2026-04-10T14:00:00+02:00",
+            "ended_at": "2026-04-10T15:00:00+02:00",
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state.state != STATE_UNAVAILABLE
+    assert abs(float(state.state) - 144.45) < 0.01
 
 
 async def test_guest_last_energy_updates_after_guest_session(

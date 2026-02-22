@@ -1,0 +1,52 @@
+# EV Charging Manager — InfluxDB Session Export
+#
+# Copy this automation into your Home Assistant automations.yaml (or create via UI).
+# Prerequisites: InfluxDB integration configured in Home Assistant.
+#
+# Measurement: ev_charging_sessions
+#
+# Tags (for GROUP BY / filtering):
+#   user_name       - Name of the user who charged (string)
+#   user_type       - "normal" or "guest" (string)
+#   vehicle_name    - Vehicle name, defaults to "unknown" if not set (string)
+#   cost_method     - "static" or "spot" (string)
+#   charger_name    - Name of the charger (string)
+#
+# Fields (measurement values):
+#   energy_kwh              - Energy consumed (float, kWh)
+#   cost_kr                 - Total cost (float, SEK)
+#   charge_price_kr         - Guest charge price, 0 if not applicable (float, SEK)
+#   duration_minutes        - Session duration (int, minutes)
+#   avg_power_w             - Average power (float, W)
+#   estimated_soc_added_pct - Estimated SoC added, 0 if unavailable (float, %)
+#   data_gap                - Whether data gaps were detected (bool)
+#   reconstructed           - Whether session was recovered after restart (bool)
+#
+# Timestamp: started_at (ISO 8601)
+
+automation:
+  - alias: "EV Charging Manager - InfluxDB Export"
+    description: "Writes completed charging sessions to InfluxDB for long-term analysis"
+    trigger:
+      - platform: event
+        event_type: ev_charging_manager_session_completed
+    action:
+      - service: influxdb.write
+        data:
+          measurement: ev_charging_sessions
+          tags:
+            user_name: "{{ trigger.event.data.user_name }}"
+            user_type: "{{ trigger.event.data.user_type }}"
+            vehicle_name: "{{ trigger.event.data.vehicle_name | default('unknown') }}"
+            cost_method: "{{ trigger.event.data.cost_method | default('static') }}"
+            charger_name: "{{ trigger.event.data.charger_name | default('unknown') }}"
+          fields:
+            energy_kwh: "{{ trigger.event.data.energy_kwh | float }}"
+            cost_kr: "{{ trigger.event.data.cost_kr | float }}"
+            charge_price_kr: "{{ trigger.event.data.charge_price_kr | float(0) }}"
+            duration_minutes: "{{ trigger.event.data.duration_minutes | int }}"
+            avg_power_w: "{{ trigger.event.data.avg_power_w | float }}"
+            estimated_soc_added_pct: "{{ trigger.event.data.estimated_soc_added_pct | float(0) }}"
+            data_gap: "{{ trigger.event.data.data_gap }}"
+            reconstructed: "{{ trigger.event.data.reconstructed }}"
+          timestamp: "{{ trigger.event.data.started_at }}"

@@ -378,6 +378,7 @@ class SessionEngine:
             "cost_method": session.cost_method,
             "reconstructed": session.reconstructed,
             "data_gap": session.data_gap,
+            "charger_name": self._entry.data.get("charger_name", "unknown"),
         }
 
     @callback

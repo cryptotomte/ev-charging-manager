@@ -1,8 +1,8 @@
-"""Tests for SessionEngine state machine (T014, T015, T022 RFID UID)."""
+"""Tests for SessionEngine state machine (T014, T015, T022 RFID UID, T010 spot)."""
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
@@ -15,6 +15,7 @@ from pytest_homeassistant_custom_component.common import (
 
 from custom_components.ev_charging_manager.const import (
     DOMAIN,
+    EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
     SessionEngineState,
 )
@@ -509,3 +510,404 @@ async def test_two_chargers_independent(hass: HomeAssistant):
 
     assert engine_a.state == SessionEngineState.IDLE
     assert engine_b.state == SessionEngineState.IDLE
+
+
+# ---------------------------------------------------------------------------
+# T010: Spot pricing session tests (US1)
+# ---------------------------------------------------------------------------
+
+MOCK_SPOT_PRICE_ENTITY = "sensor.nordpool_kwh"
+
+# Spot config entry data — mirrors quickstart.md scenario setup
+MOCK_SPOT_CHARGER_DATA = {
+    **MOCK_CHARGER_DATA,
+    "pricing_mode": "spot",
+    "spot_price_entity": MOCK_SPOT_PRICE_ENTITY,
+    "spot_additional_cost_kwh": 0.85,
+    "spot_vat_multiplier": 1.25,
+    "spot_fallback_price_kwh": 2.50,
+}
+
+# Options that bypass micro-session filter so all sessions are persisted
+_NO_MICRO = {"min_session_duration_s": 0, "min_session_energy_wh": 0}
+
+
+async def test_static_session_unchanged_by_spot_feature(hass: HomeAssistant):
+    """Static sessions work identically after spot feature is added."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session = engine.active_session
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "5.0")
+    await hass.async_block_till_done()
+
+    assert session.cost_method == "static"
+    assert session.price_details is None
+    assert abs(session.cost_total_kr - 12.50) < 0.01  # 5 × 2.50
+
+
+async def test_spot_session_initializes_with_empty_price_details(hass: HomeAssistant):
+    """Starting a spot session sets cost_method='spot' and price_details=[]."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, title="Test")
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session = engine.active_session
+    assert session is not None
+    assert session.cost_method == "spot"
+    assert session.price_details == []
+
+
+async def test_spot_session_running_cost_includes_partial_hour(hass: HomeAssistant):
+    """During tracking, cost_total_kr includes the partial hour estimate."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, title="Test")
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session = engine.active_session
+
+    # Consume 1.2 kWh (partial hour, no boundary crossed yet)
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await hass.async_block_till_done()
+
+    # Running cost: 1.2 × (0.89 + 0.85) × 1.25 = 2.61 kr
+    assert abs(session.cost_total_kr - 2.61) < 0.01
+    assert session.price_details == []  # no completed hours yet
+
+
+async def test_spot_session_single_hour_price_details(hass: HomeAssistant):
+    """Single-hour session: price_details has 1 entry with correct values."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+
+    # Consume 1.2 kWh, no hour boundary crossed
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await hass.async_block_till_done()
+
+    await stop_charging_session(hass)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.IDLE
+
+    # Session was persisted — verify via completed event
+    assert len(completed_events) == 1
+    event = completed_events[0]
+    assert event.data["cost_method"] == "spot"
+    assert abs(event.data["cost_kr"] - 2.61) < 0.01
+
+
+async def test_spot_session_multi_hour_price_details(hass: HomeAssistant):
+    """Multi-hour session: 3 entries in price_details, total cost matches formula."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    # Spot price for hour 14: 0.89 kr/kWh
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+
+    # Session starts at 14:23 — energy_start = 10.0 kWh
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session = engine.active_session
+    assert session is not None
+
+    # --- Hour 14:23 – 15:00 ---
+    # By 15:00 boundary: total energy = 11.2 (consumed 1.2 kWh this hour)
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await hass.async_block_till_done()
+
+    # Fire hour boundary at 15:00 UTC
+    boundary_15 = datetime(2026, 3, 15, 15, 0, 0, tzinfo=timezone.utc)
+    async_fire_time_changed(hass, boundary_15)
+    await hass.async_block_till_done()
+
+    # 1 completed hour captured
+    assert len(session.price_details) == 1
+    h14 = session.price_details[0]
+    assert abs(h14["kwh"] - 1.2) < 0.001
+    assert h14["spot_price_kr_kwh"] == 0.89
+    assert h14["fallback"] is False
+    assert abs(h14["cost_kr"] - 2.61) < 0.01
+
+    # --- Hour 15:00 – 16:00 ---
+    # Change spot price to 1.23 for hour 15
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "1.23")
+    # By 16:00 boundary: total energy = 14.8 (consumed 3.6 kWh in hour 15)
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "14.8")
+    await hass.async_block_till_done()
+
+    boundary_16 = datetime(2026, 3, 15, 16, 0, 0, tzinfo=timezone.utc)
+    async_fire_time_changed(hass, boundary_16)
+    await hass.async_block_till_done()
+
+    assert len(session.price_details) == 2
+    h15 = session.price_details[1]
+    assert abs(h15["kwh"] - 3.6) < 0.001
+    assert h15["spot_price_kr_kwh"] == 1.23
+    # (1.23 + 0.85) × 1.25 = 2.60 kr/kWh; 3.6 × 2.60 = 9.36 kr
+    assert abs(h15["cost_kr"] - 9.36) < 0.01
+
+    # --- Hour 16:00 – 16:45 (partial) ---
+    # Change spot price to 0.95 for hour 16
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.95")
+    # By session end: total energy = 18.4 (consumed 3.6 kWh in partial hour 16)
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "18.4")
+    await hass.async_block_till_done()
+
+    await stop_charging_session(hass)
+
+    # Session ends: final partial hour captured
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session.price_details) == 3
+    h16 = session.price_details[2]
+    assert abs(h16["kwh"] - 3.6) < 0.001
+    assert h16["spot_price_kr_kwh"] == 0.95
+    # (0.95 + 0.85) × 1.25 = 2.25 kr/kWh; 3.6 × 2.25 = 8.10 kr
+    assert abs(h16["cost_kr"] - 8.10) < 0.01
+
+    # Total: 2.61 + 9.36 + 8.10 = 20.07 kr
+    assert abs(session.cost_total_kr - 20.07) < 0.01
+
+
+async def test_spot_session_completed_event_has_cost_method(hass: HomeAssistant):
+    """SESSION_COMPLETED event includes cost_method='spot'."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await hass.async_block_till_done()
+    await stop_charging_session(hass)
+
+    assert len(completed_events) == 1
+    assert completed_events[0].data["cost_method"] == "spot"
+
+
+async def test_spot_session_price_details_have_required_keys(hass: HomeAssistant):
+    """price_details entries contain all required keys."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await hass.async_block_till_done()
+
+    # Fire hour boundary to capture a price_details entry
+    boundary = datetime(2026, 3, 15, 15, 0, 0, tzinfo=timezone.utc)
+    async_fire_time_changed(hass, boundary)
+    await hass.async_block_till_done()
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session = engine.active_session
+    assert len(session.price_details) == 1
+
+    detail = session.price_details[0]
+    required_keys = {
+        "hour",
+        "kwh",
+        "spot_price_kr_kwh",
+        "total_price_kr_kwh",
+        "cost_kr",
+        "fallback",
+    }
+    assert required_keys == set(detail.keys())
+
+
+# ---------------------------------------------------------------------------
+# T019: Fallback pricing tests (US4)
+# ---------------------------------------------------------------------------
+
+
+async def test_spot_session_fallback_when_sensor_unavailable(hass: HomeAssistant):
+    """When spot sensor is unavailable at hour boundary, fallback price is used."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    # Start with valid spot price
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+
+    # Consume 2.0 kWh then sensor goes unavailable before hour boundary
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "12.0")
+    await hass.async_block_till_done()
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, STATE_UNAVAILABLE)
+
+    # Fire hour boundary — sensor unavailable → fallback used
+    boundary = datetime(2026, 3, 15, 15, 0, 0, tzinfo=timezone.utc)
+    async_fire_time_changed(hass, boundary)
+    await hass.async_block_till_done()
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session = engine.active_session
+    assert len(session.price_details) == 1
+
+    h14 = session.price_details[0]
+    assert h14["fallback"] is True
+    assert h14["spot_price_kr_kwh"] is None
+    # fallback_price_kwh = 2.50, 2.0 kWh × 2.50 = 5.00 kr
+    assert abs(h14["cost_kr"] - 5.00) < 0.01
+    assert abs(h14["total_price_kr_kwh"] - 2.50) < 0.001
+
+
+async def test_spot_session_fallback_at_session_end_when_sensor_unavailable(hass: HomeAssistant):
+    """When spot sensor is unavailable at session end, final partial hour uses fallback."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+
+    # Consume 1.5 kWh then sensor goes unavailable
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.5")
+    await hass.async_block_till_done()
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, STATE_UNAVAILABLE)
+
+    await stop_charging_session(hass)
+
+    assert len(completed_events) == 1
+    event_data = completed_events[0].data
+    assert event_data["cost_method"] == "spot"
+    # Final partial hour: 1.5 kWh at fallback 2.50 kr/kWh = 3.75 kr
+    assert abs(event_data["cost_kr"] - 3.75) < 0.01
+
+
+async def test_spot_session_fallback_logs_warning(hass: HomeAssistant, caplog):
+    """Unavailable spot sensor at hour boundary logs a WARNING."""
+    import logging
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+
+    # Sensor goes unavailable
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, STATE_UNAVAILABLE)
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.ev_charging_manager"):
+        boundary = datetime(2026, 3, 15, 15, 0, 0, tzinfo=timezone.utc)
+        async_fire_time_changed(hass, boundary)
+        await hass.async_block_till_done()
+
+    assert any("fallback" in record.message.lower() for record in caplog.records)
+
+
+async def test_spot_quickstart_scenario_4_fallback_with_recovery(hass: HomeAssistant):
+    """Quickstart Scenario 4: hour 14 OK, hour 15 fallback, hour 16 OK again.
+
+    Exact sequence: sensor available at 15:00 boundary (captures h14 at real price),
+    then unavailable for hour 15, then recovers at 16:00.
+
+    Expected totals from quickstart:
+    - hour 14 (0.89 kr/kWh): 1.2 kWh → 2.61 kr
+    - hour 15 (fallback 2.50): 3.6 kWh → 9.00 kr
+    - hour 16 (0.95 kr/kWh): 2.0 kWh → 4.50 kr
+    - total: 16.11 kr
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+
+    # Session starts in hour 14; energy_start = 10.0 kWh
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session = engine.active_session
+
+    # --- Hour 14:23–15:00: consume 1.2 kWh ---
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await hass.async_block_till_done()
+
+    # Fire 15:00 boundary with sensor still at 0.89 → h14 captured at real price
+    boundary_15 = datetime(2026, 3, 15, 15, 0, 0, tzinfo=timezone.utc)
+    async_fire_time_changed(hass, boundary_15)
+    await hass.async_block_till_done()
+
+    assert len(session.price_details) == 1
+    h14 = session.price_details[0]
+    assert h14["fallback"] is False
+    assert h14["spot_price_kr_kwh"] == 0.89
+    assert abs(h14["kwh"] - 1.2) < 0.001
+    assert abs(h14["cost_kr"] - 2.61) < 0.01  # 1.2 × (0.89+0.85) × 1.25
+
+    # Sensor goes unavailable after 15:00 boundary
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, STATE_UNAVAILABLE)
+
+    # --- Hour 15:00–16:00: consume 3.6 kWh, sensor unavailable ---
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "14.8")
+    await hass.async_block_till_done()
+
+    # Fire 16:00 boundary — sensor still unavailable → h15 fallback
+    boundary_16 = datetime(2026, 3, 15, 16, 0, 0, tzinfo=timezone.utc)
+    async_fire_time_changed(hass, boundary_16)
+    await hass.async_block_till_done()
+
+    assert len(session.price_details) == 2
+    h15 = session.price_details[1]
+    assert h15["fallback"] is True
+    assert h15["spot_price_kr_kwh"] is None
+    assert abs(h15["kwh"] - 3.6) < 0.001
+    assert abs(h15["cost_kr"] - 9.00) < 0.01  # 3.6 × 2.50 fallback
+
+    # Sensor recovers after 16:00 boundary
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.95")
+
+    # --- Hour 16:00–16:30: consume 2.0 kWh at 0.95 ---
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "16.8")
+    await hass.async_block_till_done()
+
+    await stop_charging_session(hass)
+
+    assert len(session.price_details) == 3
+    h16 = session.price_details[2]
+    assert h16["fallback"] is False
+    assert h16["spot_price_kr_kwh"] == 0.95
+    assert abs(h16["kwh"] - 2.0) < 0.001
+    # (0.95 + 0.85) × 1.25 = 2.25; 2.0 × 2.25 = 4.50
+    assert abs(h16["cost_kr"] - 4.50) < 0.01
+
+    # Total exactly matches quickstart Scenario 4: 2.61 + 9.00 + 4.50 = 16.11
+    assert abs(session.cost_total_kr - 16.11) < 0.01

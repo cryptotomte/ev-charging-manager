@@ -59,10 +59,10 @@ class Session:
     phases_used: int | None = None
     max_current_a: float | None = None
 
-    # Cost (static pricing in this PR)
+    # Cost
     cost_total_kr: float = 0.0
     cost_method: str = "static"
-    price_details: None = None
+    price_details: list[dict] | None = None
 
     # Charge price (PR-06)
     charge_price_total_kr: None = None

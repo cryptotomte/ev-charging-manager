@@ -13,6 +13,7 @@ from .config_store import ConfigStore
 from .const import (
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
+    CONF_DEBUG_LOGGING,
     CONF_MAX_STORED_SESSIONS,
     CONF_PERSISTENCE_INTERVAL_S,
     DEFAULT_CHARGER_NAME,
@@ -21,6 +22,7 @@ from .const import (
     DOMAIN,
     PLATFORMS,
 )
+from .debug_logger import DebugLogger
 from .session_engine import SessionEngine
 from .session_store import SessionStore
 from .stats_engine import StatsEngine
@@ -103,13 +105,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         model=model,
     )
 
+    # Set up debug logger (PR-010) — instantiated before session engine
+    debug_logging_enabled = entry.options.get(CONF_DEBUG_LOGGING, False)
+    debug_logger = DebugLogger(hass.config.config_dir)
+    if debug_logging_enabled:
+        debug_logger.enable()
+    hass.data[DOMAIN][entry.entry_id]["debug_logger"] = debug_logger
+    # Disable logger on integration unload to write the DEBUG_OFF marker
+    entry.async_on_unload(debug_logger.disable)
+
     # Set up session store and load persisted sessions
     max_sessions = entry.options.get(CONF_MAX_STORED_SESSIONS, DEFAULT_MAX_STORED_SESSIONS)
     session_store = SessionStore(hass, max_sessions=max_sessions)
     _sessions, active_snapshot = await session_store.async_load()
 
     # Set up session engine and recover any active session before registering listeners
-    session_engine = SessionEngine(hass, entry, config_store, session_store)
+    # Pass None when debug logging is disabled so if-guards in SessionEngine short-circuit
+    session_engine = SessionEngine(
+        hass, entry, config_store, session_store,
+        debug_logger if debug_logging_enabled else None
+    )
     if active_snapshot is not None:
         await session_engine.async_recover(active_snapshot)
     session_engine.async_setup()

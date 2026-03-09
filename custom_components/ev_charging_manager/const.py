@@ -47,6 +47,12 @@ SUBENTRY_TYPE_VEHICLE = "vehicle"
 SUBENTRY_TYPE_USER = "user"
 SUBENTRY_TYPE_RFID_MAPPING = "rfid_mapping"
 
+# Debug logging configuration keys (PR-010)
+CONF_DEBUG_LOGGING = "debug_logging"
+
+# Debug logging defaults (PR-010)
+DEFAULT_DEBUG_LOGGING = False
+
 # Default values
 DEFAULT_CHARGER_NAME = "EV Charger"
 DEFAULT_ENERGY_UNIT = "Wh"
@@ -103,7 +109,7 @@ EVENT_SESSION_COMPLETED = "ev_charging_manager_session_completed"
 SIGNAL_SESSION_UPDATE = "ev_charging_manager_session_update_{}"
 
 # Platforms to forward to
-PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
 
 # Cross-validation: total energy counter entity (PR-07)
 CONF_ETO_ENTITY = "eto_entity"

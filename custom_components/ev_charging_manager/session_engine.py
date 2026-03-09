@@ -45,6 +45,7 @@ from .const import (
     UNKNOWN_REASON_TRX_ZERO,
     SessionEngineState,
 )
+from .debug_logger import DebugLogger
 from .models import GuestPricing
 from .pricing import PricingEngine, SpotConfig
 from .rfid_lookup import RfidLookup
@@ -82,12 +83,14 @@ class SessionEngine:
         entry: Any,  # ConfigEntry — avoiding circular import
         config_store: Any,  # ConfigStore
         session_store: SessionStore,
+        debug_logger: DebugLogger | None = None,
     ) -> None:
         """Initialize the session engine."""
         self._hass = hass
         self._entry = entry
         self._config_store = config_store
         self._session_store = session_store
+        self._debug_logger = debug_logger
 
         self._state = SessionEngineState.IDLE
         self._active_session: Session | None = None
@@ -96,6 +99,9 @@ class SessionEngine:
         self._last_energy_kwh: float = 0.0
         self._last_power_w: float = 0.0
         self._last_trx: str | int | None = None
+
+        # Last known car_value — used for CAR_STATE change detection (PR-010)
+        self._last_car_status: str | None = None
 
         # Note: RfidLookup is created fresh at session start using current ConfigStore data
         # (ConfigStore may be updated by subentry changes between sessions)
@@ -510,6 +516,22 @@ class SessionEngine:
     @callback
     def _async_on_state_change(self, event: Event) -> None:
         """Handle any state change on a watched entity."""
+        # Log car_value changes for diagnostics (PR-010)
+        if self._debug_logger:
+            car_status_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
+            if event.data.get("entity_id") == car_status_entity:
+                new_state = event.data.get("new_state")
+                new_val = new_state.state if new_state else None
+                if new_val not in (STATE_UNAVAILABLE, STATE_UNKNOWN, None, "null", "") and (
+                    new_val != self._last_car_status
+                ):
+                    self._debug_logger.log(
+                        "CAR_STATE",
+                        f"car_value changed: {self._last_car_status} \u2192 {new_val}",
+                    )
+                if new_val and new_val not in (STATE_UNAVAILABLE, STATE_UNKNOWN, "null", ""):
+                    self._last_car_status = new_val
+
         # Dispatch based on current state
         if self._state == SessionEngineState.IDLE:
             self._handle_idle_state()
@@ -627,6 +649,17 @@ class SessionEngine:
         rfid_lookup = RfidLookup(self._config_store.data)
         resolution = rfid_lookup.resolve(trx)
 
+        # Log RFID resolution result for diagnostics (PR-010, T010)
+        if self._debug_logger:
+            if resolution is not None and resolution.user_type != "unknown":
+                self._debug_logger.log(
+                    "RFID_READ",
+                    f"tag={trx} matched user={resolution.user_name} "
+                    f"(rfid_index={resolution.rfid_index})",
+                )
+            else:
+                self._debug_logger.log("RFID_READ", f"tag={trx} unknown")
+
         # Snapshot energy at session start
         energy = self._get_energy()
         if energy is None:
@@ -661,6 +694,16 @@ class SessionEngine:
             energy_kwh=0.0,
             charger_name=charger_name,
         )
+
+        # Log session start for diagnostics (PR-010, T011)
+        if self._debug_logger:
+            user_label = self._active_session.user_name
+            if self._active_session.user_type == "guest":
+                user_label = "guest"
+            self._debug_logger.log(
+                "SESSION_START",
+                f"session_id={self._active_session.id} user={user_label} charger={charger_name}",
+            )
 
         # Snapshot guest pricing at session start (PR-06)
         if resolution is not None and resolution.guest_pricing is not None:
@@ -702,6 +745,16 @@ class SessionEngine:
             )
             self._entry.async_on_unload(self._hourly_unsub)
 
+        # Log IDLE → TRACKING engine decision for diagnostics (PR-010, T011)
+        if self._debug_logger:
+            charging_val = self._entry.data.get(
+                CONF_CAR_STATUS_CHARGING_VALUE, DEFAULT_CAR_STATUS_CHARGING_VALUE
+            )
+            self._debug_logger.log(
+                "ENGINE_DECISION",
+                f"IDLE \u2192 TRACKING (trigger: car_state={charging_val} + rfid=known)",
+            )
+
         self._state = SessionEngineState.TRACKING
 
         _LOGGER.info(
@@ -732,6 +785,15 @@ class SessionEngine:
     async def _async_complete_session(self) -> None:
         """Finalize session: micro-filter, persist, fire event, reset to IDLE."""
         self._state = SessionEngineState.COMPLETING
+
+        # Log TRACKING → COMPLETING engine decision for diagnostics (PR-010, T012)
+        if self._debug_logger:
+            car_val = self._get_car_status() or "unknown"
+            self._debug_logger.log(
+                "ENGINE_DECISION",
+                f"TRACKING \u2192 COMPLETING (trigger: car_state={car_val})",
+            )
+
         session = self._active_session
 
         if session is None:
@@ -838,6 +900,21 @@ class SessionEngine:
                 session.id,
                 duration_s,
                 session.energy_kwh,
+            )
+
+        # Log session stop for diagnostics (PR-010, T012)
+        if self._debug_logger:
+            duration_str = ""
+            if session.duration_seconds is not None:
+                h = session.duration_seconds // 3600
+                m = (session.duration_seconds % 3600) // 60
+                s = session.duration_seconds % 60
+                duration_str = f"{h}:{m:02d}:{s:02d}"
+            self._debug_logger.log(
+                "SESSION_STOP",
+                f"session_id={session.id} "
+                f"energy={round(session.energy_kwh, 3)}kWh "
+                f"duration={duration_str}",
             )
 
         # Record last session info before clearing (for StatusSensor attributes)

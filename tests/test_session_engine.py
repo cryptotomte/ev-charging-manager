@@ -911,3 +911,66 @@ async def test_spot_quickstart_scenario_4_fallback_with_recovery(hass: HomeAssis
 
     # Total exactly matches quickstart Scenario 4: 2.61 + 9.00 + 4.50 = 16.11
     assert abs(session.cost_total_kr - 16.11) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# T024: SessionEngine debug logging — all 6 log() categories called
+# ---------------------------------------------------------------------------
+
+
+async def test_session_engine_debug_logging_all_categories(hass: HomeAssistant, tmp_path):
+    """All 6 debug log categories are emitted during a full charge cycle.
+
+    Injects a real DebugLogger and verifies log() is called for:
+    CAR_STATE, RFID_READ, SESSION_START, ENGINE_DECISION (x2), SESSION_STOP
+    """
+    # Use a real DebugLogger backed by tmp_path
+    hass.config.config_dir = str(tmp_path)
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"debug_logging": True},
+        title="My go-e Charger",
+    )
+    await setup_session_engine(hass, entry)
+    await _setup_full_engine(hass, entry.entry_id)
+
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert debug_logger is not None
+    assert debug_logger.enabled
+
+    # Wrap log() with a spy
+    logged_calls: list[tuple[str, str]] = []
+    original_log = debug_logger.log
+
+    def spy_log(category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log(category, message)
+
+    debug_logger.log = spy_log  # type: ignore[method-assign]
+
+    # Simulate plug-in → charge → unplug
+    await start_charging_session(hass, trx_value="2")  # trx=2 → card_index=1 → Petra
+
+    # Update energy to exceed micro-session threshold
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.2")
+    await hass.async_block_till_done()
+
+    await stop_charging_session(hass)
+
+    categories = [c for c, _ in logged_calls]
+
+    assert "CAR_STATE" in categories, f"CAR_STATE not found in {categories}"
+    assert "RFID_READ" in categories, f"RFID_READ not found in {categories}"
+    assert "SESSION_START" in categories, f"SESSION_START not found in {categories}"
+    assert categories.count("ENGINE_DECISION") >= 2, (
+        f"Expected at least 2 ENGINE_DECISION calls, got {categories}"
+    )
+    assert "SESSION_STOP" in categories, f"SESSION_STOP not found in {categories}"
+
+    # Verify log file actually has content
+    content = open(debug_logger.file_path, encoding="utf-8").read()
+    assert "CAR_STATE" in content
+    assert "SESSION_START" in content
+    assert "SESSION_STOP" in content

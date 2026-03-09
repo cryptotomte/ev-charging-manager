@@ -26,6 +26,7 @@ from .const import (
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
     CONF_CHARGER_SERIAL,
+    CONF_DEBUG_LOGGING,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
     CONF_ETO_ENTITY,
@@ -45,6 +46,7 @@ from .const import (
     CONF_TOTAL_ENERGY_ENTITY,
     DEFAULT_CHARGER_NAME,
     DEFAULT_CHARGING_EFFICIENCY,
+    DEFAULT_DEBUG_LOGGING,
     DEFAULT_ENERGY_UNIT,
     DEFAULT_MAX_STORED_SESSIONS,
     DEFAULT_MIN_SESSION_DURATION_S,
@@ -497,6 +499,10 @@ class OptionsFlowHandler(OptionsFlow):
                     CONF_ETO_ENTITY,
                     description={"suggested_value": opts.get(CONF_ETO_ENTITY)},
                 ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"])),
+                vol.Optional(
+                    CONF_DEBUG_LOGGING,
+                    default=opts.get(CONF_DEBUG_LOGGING, DEFAULT_DEBUG_LOGGING),
+                ): selector.BooleanSelector(),
             }
         )
 

@@ -102,6 +102,8 @@ class SessionEngine:
 
         # Last known car_value — used for CAR_STATE change detection (PR-010)
         self._last_car_status: str | None = None
+        # Previous car_value — used to detect balancing cycles (PR-011)
+        self._prev_car_status: str | None = None
 
         # Note: RfidLookup is created fresh at session start using current ConfigStore data
         # (ConfigStore may be updated by subentry changes between sessions)
@@ -516,21 +518,20 @@ class SessionEngine:
     @callback
     def _async_on_state_change(self, event: Event) -> None:
         """Handle any state change on a watched entity."""
-        # Log car_value changes for diagnostics (PR-010)
-        if self._debug_logger:
-            car_status_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
-            if event.data.get("entity_id") == car_status_entity:
-                new_state = event.data.get("new_state")
-                new_val = new_state.state if new_state else None
-                if new_val not in (STATE_UNAVAILABLE, STATE_UNKNOWN, None, "null", "") and (
-                    new_val != self._last_car_status
-                ):
+        # Track car_value changes for diagnostics and balancing cycle detection (PR-010/011)
+        car_status_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
+        if event.data.get("entity_id") == car_status_entity:
+            new_state = event.data.get("new_state")
+            new_val = new_state.state if new_state else None
+            if new_val not in _INVALID_STATES and new_val != self._last_car_status:
+                if self._debug_logger:
                     self._debug_logger.log(
                         "CAR_STATE",
                         f"car_value changed: {self._last_car_status} \u2192 {new_val}",
                     )
-                if new_val and new_val not in (STATE_UNAVAILABLE, STATE_UNKNOWN, "null", ""):
-                    self._last_car_status = new_val
+                self._prev_car_status = self._last_car_status
+            if new_val and new_val not in _INVALID_STATES:
+                self._last_car_status = new_val
 
         # Dispatch based on current state
         if self._state == SessionEngineState.IDLE:
@@ -541,6 +542,14 @@ class SessionEngine:
     def _handle_idle_state(self) -> None:
         """Evaluate IDLE → TRACKING transition."""
         if self._is_charging() and self._is_trx_active():
+            # Block session start if car came directly from Complete (balancing cycle, PR-011)
+            if self._prev_car_status == "Complete":
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        "BALANCING_SKIP",
+                        "session start blocked — Complete → Charging (balancing cycle)",
+                    )
+                return
             # Set state synchronously to prevent duplicate tasks from rapid events
             self._state = SessionEngineState.TRACKING
             self._hass.async_create_task(self._async_start_session())

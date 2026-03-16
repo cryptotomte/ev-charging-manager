@@ -14,6 +14,7 @@ from custom_components.ev_charging_manager.const import (
 )
 from custom_components.ev_charging_manager.stats_engine import _prune_old_unknown_times
 from tests.conftest import (
+    MOCK_CAR_STATUS_ENTITY,
     MOCK_CHARGER_DATA,
     MOCK_ENERGY_ENTITY,
     setup_session_engine,
@@ -28,10 +29,17 @@ _PN_CREATE_PATCH = "custom_components.ev_charging_manager.stats_engine.pn_async_
 
 
 async def _complete_unknown_session(hass: HomeAssistant) -> None:
-    """Helper: start and stop a session attributed to Unknown (trx=0)."""
+    """Helper: start and stop a session attributed to Unknown (trx=0).
+
+    Includes an Idle transition after the session ends so that the next call
+    to start_charging_session is not treated as a balancing cycle by the engine
+    (Complete → Idle clears the balancing-cycle guard).
+    """
     hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
     await start_charging_session(hass, trx_value="0")
     await stop_charging_session(hass)
+    # Simulate car returning to Idle between sessions (prevents balancing-cycle guard)
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
     await hass.async_block_till_done()
 
 

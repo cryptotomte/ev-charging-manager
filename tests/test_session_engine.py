@@ -974,3 +974,225 @@ async def test_session_engine_debug_logging_all_categories(hass: HomeAssistant, 
     assert "CAR_STATE" in content
     assert "SESSION_START" in content
     assert "SESSION_STOP" in content
+
+
+# ---------------------------------------------------------------------------
+# PR-011: Balancing cycle fix — prevent spurious sessions from Complete → Charging
+# ---------------------------------------------------------------------------
+
+
+async def test_balancing_cycle_does_not_start_session(hass: HomeAssistant):
+    """Complete → Charging (balancing cycle) must NOT start a session.
+
+    Sets _prev_car_status = 'Complete' directly, then fires Charging state event.
+    The engine must remain IDLE with no active session.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.IDLE
+
+    # Simulate end of a charging session: car is now in Complete
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    await hass.async_block_till_done()
+
+    # Now fire the balancing cycle: Complete → Charging
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert engine.active_session is None
+    assert engine._prev_car_status == "Complete"
+
+
+async def test_multiple_balancing_cycles_no_sessions(hass: HomeAssistant):
+    """Three consecutive Complete → Charging → Complete cycles must not create any session."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Set trx active
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    await hass.async_block_till_done()
+
+    # Fire three balancing cycles
+    for _ in range(3):
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+        await hass.async_block_till_done()
+
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        assert engine.state == SessionEngineState.IDLE, (
+            "Engine should remain IDLE during balancing cycle"
+        )
+        assert engine.active_session is None
+
+    assert engine.state == SessionEngineState.IDLE
+    assert engine.active_session is None
+
+
+async def test_balancing_skip_logged_when_debug_enabled(hass: HomeAssistant, tmp_path):
+    """BALANCING_SKIP must be logged when a balancing cycle is blocked with debug enabled."""
+    hass.config.config_dir = str(tmp_path)
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"debug_logging": True},
+        title="Test",
+    )
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert debug_logger is not None
+
+    # Spy on log calls
+    logged_calls: list[tuple[str, str]] = []
+    original_log = debug_logger.log
+
+    def spy_log(category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log(category, message)
+
+    debug_logger.log = spy_log  # type: ignore[method-assign]
+
+    # Trigger a balancing cycle: set Complete then Charging
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    await hass.async_block_till_done()
+
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    categories = [c for c, _ in logged_calls]
+    assert "BALANCING_SKIP" in categories, f"BALANCING_SKIP not found in {categories}"
+
+    # Verify message content
+    skip_messages = [msg for cat, msg in logged_calls if cat == "BALANCING_SKIP"]
+    assert any("Complete" in msg for msg in skip_messages)
+
+    assert engine.state == SessionEngineState.IDLE
+
+
+async def test_trx_change_during_balancing_still_blocked(hass: HomeAssistant):
+    """Guard must not be bypassed by a trx change while car is still in Charging (from Complete).
+
+    Sequence: Complete → Charging (guard fires), then trx changes → still IDLE.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Set trx and transition to Complete
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    await hass.async_block_till_done()
+
+    # Balancing cycle starts: Complete → Charging
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+
+    # Change trx while still in Charging state that came from Complete
+    hass.states.async_set(MOCK_TRX_ENTITY, "3")
+    await hass.async_block_till_done()
+
+    # Guard must still hold — _prev_car_status remains "Complete"
+    assert engine.state == SessionEngineState.IDLE
+    assert engine.active_session is None
+
+
+async def test_new_session_after_idle_clears_guard(hass: HomeAssistant):
+    """Complete → Idle → Wait for car → Charging must start a new session normally.
+
+    The intermediate Idle state updates _prev_car_status to 'Idle', so the guard
+    does not fire when Charging is reached.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # End of previous session: car reaches Complete
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    await hass.async_block_till_done()
+
+    # Car unplugs and goes through Idle
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    await hass.async_block_till_done()
+
+    assert engine._prev_car_status == "Complete"
+    assert engine._last_car_status == "Idle"
+
+    # Car re-plugs → Wait for car
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Wait for car")
+    await hass.async_block_till_done()
+
+    assert engine._prev_car_status == "Idle"
+
+    # New charge starts
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None
+
+
+async def test_new_session_via_wait_for_car_clears_guard(hass: HomeAssistant):
+    """Complete → Wait for car → Charging must start a new session.
+
+    Skipping Idle: prev_car_status updates to 'Complete' after first transition,
+    then to 'Wait for car' before Charging — guard does not fire.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # End of previous session
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    await hass.async_block_till_done()
+
+    # Car transitions directly to Wait for car (no Idle step)
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Wait for car")
+    await hass.async_block_till_done()
+
+    assert engine._prev_car_status == "Complete"
+    assert engine._last_car_status == "Wait for car"
+
+    # Charging starts — prev is now 'Wait for car', guard does not fire
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None
+
+
+async def test_cold_start_no_prev_state_does_not_block_session(hass: HomeAssistant):
+    """On cold start (_prev_car_status=None), a Charging event must start a session.
+
+    FR-004: _prev_car_status defaults to None on engine init (HA restart).
+    None != 'Complete' so the guard does not fire.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Verify cold-start default
+    assert engine._prev_car_status is None
+
+    # Fire Charging without any prior Complete — simulates HA restart mid-session
+    await start_charging_session(hass, trx_value="2")
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None

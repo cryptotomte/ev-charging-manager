@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
@@ -1196,3 +1196,466 @@ async def test_cold_start_no_prev_state_does_not_block_session(hass: HomeAssista
 
     assert engine.state == SessionEngineState.TRACKING
     assert engine.active_session is not None
+
+
+# ---------------------------------------------------------------------------
+# PR-012: Sensor unavailability grace during active sessions
+# ---------------------------------------------------------------------------
+
+
+async def test_session_survives_car_status_unknown(hass: HomeAssistant):
+    """T002: Session stays TRACKING when car_status transitions to STATE_UNKNOWN then back.
+
+    A transient unknown state must not end an active charging session.
+    Energy accumulation must be continuous across the glitch.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "5.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Sensor goes unknown — session must survive
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None
+
+    # Sensor recovers to Charging
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "6.5")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert abs(engine.active_session.energy_kwh - 1.5) < 0.001
+
+
+async def test_session_survives_car_status_unavailable(hass: HomeAssistant):
+    """T003: Session stays TRACKING when car_status transitions to STATE_UNAVAILABLE then back.
+
+    Mirrors T002 but for STATE_UNAVAILABLE (hardware disconnect / HA entity removed).
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "3.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Sensor goes unavailable — session must survive
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNAVAILABLE)
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None
+
+    # Sensor recovers
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "4.2")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert abs(engine.active_session.energy_kwh - 1.2) < 0.001
+
+
+async def test_session_ends_normally_on_complete_no_glitch(hass: HomeAssistant):
+    """T004: Session ends normally when car_status goes directly to Complete (no regression).
+
+    Validates that the grace mechanism does not interfere with the normal end path.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Advance time and energy to pass micro-session filter
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=120))
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.1")
+    await hass.async_block_till_done()
+
+    # Normal end: car goes to Complete
+    await stop_charging_session(hass)
+
+    assert engine.state == SessionEngineState.IDLE
+
+
+async def test_session_ends_after_unknown_then_complete(hass: HomeAssistant):
+    """T005: Session ends when car_status goes STATE_UNKNOWN then "Complete".
+
+    Grace activates on unknown, then session terminates on the valid Complete state.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Advance time and energy to pass micro-session filter
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=120))
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.1")
+    await hass.async_block_till_done()
+
+    # Transient glitch — session must survive
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Valid Complete state — session must end
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+
+
+async def test_session_ends_after_unknown_then_idle(hass: HomeAssistant):
+    """T006: Session ends when car_status goes STATE_UNKNOWN then "Idle".
+
+    Grace activates on unknown, then session terminates on the valid Idle state
+    (non-Complete valid end — e.g. cable disconnected without reaching Complete).
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Advance time and energy to pass micro-session filter
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=120))
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.1")
+    await hass.async_block_till_done()
+
+    # Transient glitch — session must survive
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Valid Idle state — session must end
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+
+
+async def test_balancing_fix_still_blocks_complete_to_charging(hass: HomeAssistant):
+    """T007: BMS balancing fix (PR-011) still blocks Complete → Charging in IDLE state.
+
+    Validates that the grace mechanism (PR-012) does not interfere with the
+    balancing cycle guard added in PR-011.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # End of a session: car reaches Complete
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+
+    # Balancing cycle: Complete → Charging must NOT start a new session
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert engine.active_session is None
+    assert engine._prev_car_status == "Complete"
+
+
+async def test_energy_accumulates_through_car_status_glitch(hass: HomeAssistant):
+    """T008: Energy continues accumulating correctly through a sensor glitch.
+
+    The last valid energy value is preserved during the glitch, and new
+    readings after recovery are correctly attributed to the session.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session = engine.active_session
+    assert session is not None
+    assert session.energy_start_kwh == 10.0
+
+    # Energy increases before glitch
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.5")
+    await hass.async_block_till_done()
+    assert abs(session.energy_kwh - 1.5) < 0.001
+
+    # Sensor glitch — car_status becomes unknown, energy entity still has last value
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    # Session alive, energy preserved at last known value
+    assert engine.state == SessionEngineState.TRACKING
+    assert abs(session.energy_kwh - 1.5) < 0.001
+
+    # Recovery: car_status and energy both come back
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "13.0")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    # energy_kwh = 13.0 - 10.0 = 3.0
+    assert abs(session.energy_kwh - 3.0) < 0.001
+
+
+async def test_data_gap_set_after_car_status_glitch(hass: HomeAssistant):
+    """T010: data_gap is True after a car_status sensor glitch during TRACKING."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Verify no data gap before glitch
+    assert engine._data_gap is False
+
+    # Trigger glitch
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    # data_gap must be flagged
+    assert engine._data_gap is True
+
+
+async def test_data_gap_false_when_no_glitch(hass: HomeAssistant):
+    """T011: data_gap stays False for a clean session with no sensor glitches."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Normal energy updates — no glitches
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "1.0")
+    await hass.async_block_till_done()
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "2.0")
+    await hass.async_block_till_done()
+
+    # No glitch → data_gap must remain False
+    assert engine._data_gap is False
+
+
+async def test_data_gap_set_on_first_glitch_stays_true(hass: HomeAssistant):
+    """T012: data_gap is set on the first glitch and stays True through multiple glitches."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    assert engine._data_gap is False
+
+    # First glitch — must set data_gap
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+    assert engine._data_gap is True
+
+    # Recovery
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    # Second glitch — data_gap stays True (not reset between glitches)
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNAVAILABLE)
+    await hass.async_block_till_done()
+    assert engine._data_gap is True
+
+    # Third glitch
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+    assert engine._data_gap is True
+
+
+async def test_debug_log_car_state_unavail_when_logger_enabled(hass: HomeAssistant, tmp_path):
+    """T015: Debug log records CAR_STATE_UNAVAIL when logger is enabled and glitch occurs."""
+    hass.config.config_dir = str(tmp_path)
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"debug_logging": True},
+        title="Test",
+    )
+    await setup_session_engine(hass, entry)
+
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert debug_logger is not None
+
+    # Spy on log calls
+    logged_calls: list[tuple[str, str]] = []
+    original_log = debug_logger.log
+
+    def spy_log(category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log(category, message)
+
+    debug_logger.log = spy_log  # type: ignore[method-assign]
+
+    # Start a session then trigger a glitch
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    categories = [c for c, _ in logged_calls]
+    assert "CAR_STATE_UNAVAIL" in categories, f"CAR_STATE_UNAVAIL not found in {categories}"
+
+    messages = [msg for cat, msg in logged_calls if cat == "CAR_STATE_UNAVAIL"]
+    assert any("keeping session alive" in msg for msg in messages)
+
+
+async def test_no_debug_log_when_logger_is_none(hass: HomeAssistant):
+    """T016: No crash and no debug log entry when debug logger is disabled (None)."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Verify logger is disabled
+    assert engine._debug_logger is None
+
+    # Start a session and trigger a glitch — must not raise
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    # Session survived the glitch, no exception raised
+    assert engine.state == SessionEngineState.TRACKING
+
+
+async def test_simultaneous_car_status_and_energy_unavailable(hass: HomeAssistant):
+    """T017: Session survives when both car_status and energy go unavailable simultaneously.
+
+    Double-glitch scenario: both sensors report unknown/unavailable at the same time.
+    The session must stay TRACKING, energy stays at last known value, and data_gap is True.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Start a session with a known energy reading
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "1.5")
+    await start_charging_session(hass, trx_value="0")
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine._data_gap is False
+
+    last_energy = engine._last_energy_kwh
+
+    # Both sensors go unavailable simultaneously
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    hass.states.async_set(MOCK_ENERGY_ENTITY, STATE_UNAVAILABLE)
+    await hass.async_block_till_done()
+
+    # Session must survive
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None
+
+    # Energy stays at last known value
+    assert engine._last_energy_kwh == last_energy
+
+    # Data gap must be flagged
+    assert engine._data_gap is True
+
+
+async def test_unknown_car_status_in_idle_does_not_start_session(hass: HomeAssistant):
+    """T018: STATE_UNKNOWN car_status while IDLE with a valid trx does not start a session.
+
+    The engine must stay IDLE — an unknown/unavailable sensor reading is not a charging event.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test")
+    await setup_session_engine(hass, entry)
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Set a valid trx (session would start if car_status were "Charging")
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+
+    # car_status goes unknown — must NOT start a session
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert engine.active_session is None
+
+
+async def test_debug_log_car_state_transition_to_invalid(hass: HomeAssistant, tmp_path):
+    """T019: Debug log records CAR_STATE transition when car_status goes to STATE_UNKNOWN.
+
+    With debug logger enabled: after a session starts (car_status = "Charging"), setting
+    car_status to STATE_UNKNOWN must produce a CAR_STATE log entry showing the transition.
+    """
+    hass.config.config_dir = str(tmp_path)
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"debug_logging": True},
+        title="Test",
+    )
+    await setup_session_engine(hass, entry)
+
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert debug_logger is not None
+
+    logged_calls: list[tuple[str, str]] = []
+    original_log = debug_logger.log
+
+    def spy_log(category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log(category, message)
+
+    debug_logger.log = spy_log  # type: ignore[method-assign]
+
+    # Start a session so car_status is "Charging"
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    await start_charging_session(hass, trx_value="0")
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Trigger transition to invalid state
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+    await hass.async_block_till_done()
+
+    # CAR_STATE log must record the transition from "Charging" to STATE_UNKNOWN
+    car_state_msgs = [msg for cat, msg in logged_calls if cat == "CAR_STATE"]
+    assert any("Charging" in msg for msg in car_state_msgs), (
+        f"Expected 'Charging' in CAR_STATE messages, got: {car_state_msgs}"
+    )

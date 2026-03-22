@@ -122,8 +122,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Set up session engine and recover any active session before registering listeners
     # Pass None when debug logging is disabled so if-guards in SessionEngine short-circuit
     session_engine = SessionEngine(
-        hass, entry, config_store, session_store,
-        debug_logger if debug_logging_enabled else None
+        hass, entry, config_store, session_store, debug_logger if debug_logging_enabled else None
     )
     if active_snapshot is not None:
         await session_engine.async_recover(active_snapshot)

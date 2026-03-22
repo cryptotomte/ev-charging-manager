@@ -530,6 +530,14 @@ class SessionEngine:
                         f"car_value changed: {self._last_car_status} \u2192 {new_val}",
                     )
                 self._prev_car_status = self._last_car_status
+            elif new_val in _INVALID_STATES:
+                # Log transitions to invalid states (unknown/unavailable) for diagnostics.
+                # Do NOT update _last_car_status — keep the last known valid value.
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        "CAR_STATE",
+                        f"car_value changed: {self._last_car_status} \u2192 {new_val}",
+                    )
             if new_val and new_val not in _INVALID_STATES:
                 self._last_car_status = new_val
 
@@ -556,12 +564,35 @@ class SessionEngine:
 
     def _handle_tracking_state(self, event: Event) -> None:
         """Update session or evaluate TRACKING → COMPLETING transition."""
-        # Check for session end condition first
-        if not self._is_charging():
-            # Set state synchronously to prevent duplicate completion tasks
-            self._state = SessionEngineState.COMPLETING
-            self._hass.async_create_task(self._async_complete_session())
-            return
+        # Three-way evaluation of car_status during an active session:
+        #   1. None (unknown/unavailable) → ignore: keep session alive, flag data gap
+        #   2. charging_value            → continue tracking normally
+        #   3. any other valid value     → valid non-charging state → end session
+        car_status = self._get_car_status()
+
+        if car_status is None:
+            # Sensor is unknown or unavailable — keep the session alive.
+            # Flag data gap on first occurrence and warn (consistent with energy sensor path).
+            if not self._data_gap:
+                self._data_gap = True
+                _LOGGER.warning(
+                    "Car status sensor unavailable during active session — "
+                    "keeping session alive, flagging data gap"
+                )
+            if self._debug_logger:
+                self._debug_logger.log(
+                    "CAR_STATE_UNAVAIL",
+                    "car_status sensor unavailable during active session — keeping session alive",
+                )
+        else:
+            charging_value = self._entry.data.get(
+                CONF_CAR_STATUS_CHARGING_VALUE, DEFAULT_CAR_STATUS_CHARGING_VALUE
+            )
+            if car_status != charging_value:
+                # Valid non-charging state (e.g. "Complete", "Idle") → end session.
+                self._state = SessionEngineState.COMPLETING
+                self._hass.async_create_task(self._async_complete_session())
+                return
 
         # Update energy and power with latest values
         energy = self._get_energy()

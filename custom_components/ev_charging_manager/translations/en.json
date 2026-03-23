@@ -70,7 +70,7 @@
             },
             "confirm": {
                 "title": "Complete Setup",
-                "description": "Your EV Charging Manager for ''{charger_name}'' is ready to install. Click Submit to complete the setup and register the charger device."
+                "description": "Your EV Charging Manager for \"{charger_name}\" is ready to install. Click Submit to complete the setup and register the charger device."
             }
         },
         "error": {
@@ -246,9 +246,6 @@
                     "data_description": {
                         "name": "Name of the person",
                         "active": "Whether this user is active. Deactivating cascades to RFID mappings."
-                    },
-                    "description_placeholders": {
-                        "type": "User type: {type}"
                     }
                 },
                 "reconfigure_guest_pricing": {
@@ -324,9 +321,6 @@
                         "user_id": "The user this RFID card is assigned to",
                         "vehicle_id": "The vehicle associated with this card (optional)",
                         "active": "Whether this mapping is active"
-                    },
-                    "description_placeholders": {
-                        "card_index": "Card slot: {card_index}"
                     }
                 }
             },

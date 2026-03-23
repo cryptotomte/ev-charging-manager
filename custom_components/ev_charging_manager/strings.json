@@ -246,7 +246,7 @@
                     "data_description": {
                         "name": "Name of the person",
                         "active": "Whether this user is active. Deactivating cascades to RFID mappings."
-                    },
+                    }
                 },
                 "reconfigure_guest_pricing": {
                     "title": "Edit Guest Pricing",

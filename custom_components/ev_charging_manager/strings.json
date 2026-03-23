@@ -70,7 +70,7 @@
             },
             "confirm": {
                 "title": "Complete Setup",
-                "description": "Your EV Charging Manager for ''{charger_name}'' is ready to install. Click Submit to complete the setup and register the charger device."
+                "description": "Your EV Charging Manager for \"{charger_name}\" is ready to install. Click Submit to complete the setup and register the charger device."
             }
         },
         "error": {
@@ -247,9 +247,6 @@
                         "name": "Name of the person",
                         "active": "Whether this user is active. Deactivating cascades to RFID mappings."
                     },
-                    "description_placeholders": {
-                        "type": "User type: {type}"
-                    }
                 },
                 "reconfigure_guest_pricing": {
                     "title": "Edit Guest Pricing",

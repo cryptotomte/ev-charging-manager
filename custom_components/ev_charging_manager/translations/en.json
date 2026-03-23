@@ -324,9 +324,6 @@
                         "user_id": "The user this RFID card is assigned to",
                         "vehicle_id": "The vehicle associated with this card (optional)",
                         "active": "Whether this mapping is active"
-                    },
-                    "description_placeholders": {
-                        "card_index": "Card slot: {card_index}"
                     }
                 }
             },

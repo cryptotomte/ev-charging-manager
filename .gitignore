@@ -54,4 +54,5 @@ CLAUDE.md
 docs/*
 !docs/charger-profiles/
 !docs/grafana-queries.md
+!docs/images/
 specs/

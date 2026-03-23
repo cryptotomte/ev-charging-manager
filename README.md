@@ -19,6 +19,19 @@ Everything runs locally inside Home Assistant -- no cloud services required.
 
 ---
 
+## Screenshots
+
+### Options Flow — Session Engine Settings
+![Session engine options](docs/images/config_flow_step_1.png)
+
+### Options Flow — Pricing Configuration
+![Pricing configuration](docs/images/config_flow_step_2.png)
+
+### Device Page — Sensors Overview
+![Integration device page](docs/images/integration_page.png)
+
+---
+
 ## Prerequisites
 
 Before installing, make sure you have:

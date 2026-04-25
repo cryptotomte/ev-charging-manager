@@ -15,6 +15,7 @@ from custom_components.ev_charging_manager.const import (
     SessionEngineState,
 )
 from tests.conftest import (
+    MOCK_CAR_STATUS_ENTITY,
     MOCK_CHARGER_DATA,
     MOCK_ENERGY_ENTITY,
     setup_session_engine,
@@ -221,6 +222,10 @@ async def test_reason_persists_through_normal_session(hass: HomeAssistant) -> No
     user_id = await _add_user(hass, entry.entry_id, name="Petra")
     await _add_rfid(hass, entry.entry_id, card_index=1, user_id=user_id)
 
+    # Simulate car unplug — clears the balancing gate (_awaiting_reset) so a new session can start
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    await hass.async_block_till_done()
+
     # Second session: identified (trx=2 → Petra)
     hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
     await start_charging_session(hass, trx_value="2")
@@ -252,6 +257,10 @@ async def test_reason_overwritten_by_next_unknown_session(hass: HomeAssistant) -
     await stop_charging_session(hass)
     await hass.async_block_till_done()
     assert engine._last_unknown_reason == UNKNOWN_REASON_TRX_ZERO
+
+    # Simulate car unplug — clears the balancing gate so a new session can start
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    await hass.async_block_till_done()
 
     # Second unknown: trx=2 (unmapped) → rfid_unmapped
     hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")

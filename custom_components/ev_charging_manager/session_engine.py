@@ -102,8 +102,9 @@ class SessionEngine:
 
         # Last known car_value — used for CAR_STATE change detection (PR-010)
         self._last_car_status: str | None = None
-        # Previous car_value — used to detect balancing cycles (PR-011)
-        self._prev_car_status: str | None = None
+        # Gate flag: True when a session has just ended and a balancing cycle must be
+        # blocked until car_status transitions to "Idle" or "Wait for car" (PR-013)
+        self._awaiting_reset: bool = False
 
         # Note: RfidLookup is created fresh at session start using current ConfigStore data
         # (ConfigStore may be updated by subentry changes between sessions)
@@ -204,7 +205,9 @@ class SessionEngine:
                 err,
                 snapshot.get("id", "?"),
             )
-            # Ensure clean IDLE state on any unexpected failure
+            # Ensure clean IDLE state on any unexpected failure.
+            # _awaiting_reset defaults to False and is not modified here — gate stays
+            # disengaged on recovery failure so a cold-start session can proceed.
             self._state = SessionEngineState.IDLE
             self._active_session = None
 
@@ -260,6 +263,14 @@ class SessionEngine:
                 snapshot.get("id"),
             )
             await self._complete_snapshot_as_session(snapshot, current_energy)
+
+            # Engage the balancing gate if the charger is still in "Complete" at recovery time,
+            # or if car_status is unknown/unavailable (sensor not yet loaded). Balancing cycles
+            # that started during HA downtime must be blocked (spec FR-010). Defensive
+            # engagement on None is safe: the gate only delays a new session until the car
+            # transitions to Idle or Wait for car; false negatives produce spurious sessions.
+            if car_status == "Complete" or car_status is None:
+                self._awaiting_reset = True
 
             # If charger is still charging with a (different) card, let state machine handle it
             if is_charging:
@@ -518,7 +529,7 @@ class SessionEngine:
     @callback
     def _async_on_state_change(self, event: Event) -> None:
         """Handle any state change on a watched entity."""
-        # Track car_value changes for diagnostics and balancing cycle detection (PR-010/011)
+        # Track car_value changes for diagnostics and gate management (PR-010/013)
         car_status_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
         if event.data.get("entity_id") == car_status_entity:
             new_state = event.data.get("new_state")
@@ -529,7 +540,6 @@ class SessionEngine:
                         "CAR_STATE",
                         f"car_value changed: {self._last_car_status} \u2192 {new_val}",
                     )
-                self._prev_car_status = self._last_car_status
             elif new_val in _INVALID_STATES:
                 # Log transitions to invalid states (unknown/unavailable) for diagnostics.
                 # Do NOT update _last_car_status — keep the last known valid value.
@@ -540,6 +550,13 @@ class SessionEngine:
                     )
             if new_val and new_val not in _INVALID_STATES:
                 self._last_car_status = new_val
+                # Clear the balancing gate when car reaches a legitimate post-session state.
+                # Only "Idle" and "Wait for car" confirm the car has left the Complete
+                # state and a new session is valid. Other valid values (Complete, Charging,
+                # plus any charger-specific states) must not clear the gate (spec FR-002/003/008).
+                # Invalid states (unknown, unavailable) are already filtered by the outer guard.
+                if new_val in {"Idle", "Wait for car"}:
+                    self._awaiting_reset = False
 
         # Dispatch based on current state
         if self._state == SessionEngineState.IDLE:
@@ -550,8 +567,12 @@ class SessionEngine:
     def _handle_idle_state(self) -> None:
         """Evaluate IDLE → TRACKING transition."""
         if self._is_charging() and self._is_trx_active():
-            # Block session start if car came directly from Complete (balancing cycle, PR-011)
-            if self._prev_car_status == "Complete":
+            # Block session start if a session recently ended and the car has not yet
+            # transitioned to Idle or Wait for car (balancing cycle guard, PR-013).
+            # _awaiting_reset is set synchronously in _async_complete_session and cleared
+            # only on car_status → "Idle" or "Wait for car", making the guard
+            # event-order-independent (spec FR-001/005).
+            if self._awaiting_reset:
                 if self._debug_logger:
                     self._debug_logger.log(
                         "BALANCING_SKIP",
@@ -971,6 +992,16 @@ class SessionEngine:
         self._data_gap = False
         self._eto_start = None
         self._state = SessionEngineState.IDLE
+        # Engage the balancing-cycle gate only when the charger reports the exact
+        # "Complete" state at session end. Go-e chargers use "Complete" + {"Idle",
+        # "Wait for car"} as the balancing-cycle signal pair. For chargers on the
+        # generic profile that use different state strings, engagement would never
+        # clear (spec FR-006/007 — explicit over implicit to match FR-008).
+        # Using _last_car_status (updated synchronously in the state-change handler)
+        # also handles the concurrency race: if the car has already transitioned
+        # to Idle or Wait for car during the _session_store.add_session await,
+        # _last_car_status will reflect that and the gate won't incorrectly engage.
+        self._awaiting_reset = self._last_car_status == "Complete"
         self._dispatch_update()
 
     def _calculate_charge_price(self, session: Session) -> float | None:

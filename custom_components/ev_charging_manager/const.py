@@ -90,6 +90,15 @@ DEFAULT_MIN_SESSION_ENERGY_WH = 50
 DEFAULT_PERSISTENCE_INTERVAL_S = 300
 DEFAULT_MAX_STORED_SESSIONS = 1000
 
+# Promotion thresholds for stuck-gate scenarios (PR-19 / spec 014).
+# When the balancing-cycle gate is engaged but objective evidence shows
+# the car is actually charging (sustained interval or significant
+# energy delivered), the engine "promotes" the situation to a new
+# tracked session. These defaults are derived from forensic data on
+# the 2026-04-26 production incident.
+DEFAULT_PROMOTE_DURATION_S = 300  # 5 minutes
+DEFAULT_PROMOTE_ENERGY_KWH = 0.5  # 0.5 kWh
+
 # Session store settings
 SESSION_STORE_KEY = "ev_charging_manager_sessions"
 SESSION_STORE_VERSION = 1

@@ -31,6 +31,8 @@ from .const import (
     DEFAULT_CAR_STATUS_CHARGING_VALUE,
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
+    DEFAULT_PROMOTE_DURATION_S,
+    DEFAULT_PROMOTE_ENERGY_KWH,
     DEFAULT_SPOT_ADDITIONAL_COST_KWH,
     DEFAULT_SPOT_FALLBACK_PRICE_KWH,
     DEFAULT_SPOT_VAT_MULTIPLIER,
@@ -105,6 +107,16 @@ class SessionEngine:
         # Gate flag: True when a session has just ended and a balancing cycle must be
         # blocked until car_status transitions to "Idle" or "Wait for car" (PR-013)
         self._awaiting_reset: bool = False
+
+        # PR-019: Promotion mechanism baseline fields.
+        # _gate_charging_started_at: wall-clock time when car_status most recently
+        #   transitioned to "Charging" while the gate was engaged (H1 baseline).
+        # _gate_engaged_energy_kwh: energy reading (kWh) at gate engagement time (H2 baseline).
+        #   Derived from the charger's `wh` counter (exposed in HA as kWh).
+        # _gate_skipped_count: count of BALANCING_SKIP events coalesced since gate engaged.
+        self._gate_charging_started_at: datetime | None = None
+        self._gate_engaged_energy_kwh: float | None = None
+        self._gate_skipped_count: int = 0
 
         # Note: RfidLookup is created fresh at session start using current ConfigStore data
         # (ConfigStore may be updated by subentry changes between sessions)
@@ -271,6 +283,11 @@ class SessionEngine:
             # transitions to Idle or Wait for car; false negatives produce spurious sessions.
             if car_status == "Complete" or car_status is None:
                 self._awaiting_reset = True
+                # PR-019: Snapshot promotion baselines at recovery so H1/H2 can fire post-restart.
+                self._gate_engaged_energy_kwh = self._get_energy()
+                self._gate_charging_started_at = None
+                self._gate_skipped_count = 0
+                self._log_gate_engagement()
 
             # If charger is still charging with a (different) card, let state machine handle it
             if is_charging:
@@ -549,6 +566,7 @@ class SessionEngine:
                         f"car_value changed: {self._last_car_status} \u2192 {new_val}",
                     )
             if new_val and new_val not in _INVALID_STATES:
+                prev_status = self._last_car_status
                 self._last_car_status = new_val
                 # Clear the balancing gate when car reaches a legitimate post-session state.
                 # Only "Idle" and "Wait for car" confirm the car has left the Complete
@@ -556,7 +574,30 @@ class SessionEngine:
                 # plus any charger-specific states) must not clear the gate (spec FR-002/003/008).
                 # Invalid states (unknown, unavailable) are already filtered by the outer guard.
                 if new_val in {"Idle", "Wait for car"}:
+                    # PR-019: Emit GATE_CLEAR summary if suppressed events exist.
+                    if self._awaiting_reset and self._gate_skipped_count > 0:
+                        self._log_gate_clear(new_val)
                     self._awaiting_reset = False
+                    # PR-019: Clear all promotion baselines on legitimate gate-clear.
+                    self._gate_engaged_energy_kwh = None
+                    self._gate_charging_started_at = None
+                    self._gate_skipped_count = 0
+                elif self._awaiting_reset and new_val != prev_status:
+                    # PR-019: Track H1 baseline and H1 reset while gate is engaged.
+                    # Guard on new_val != prev_status: HA can re-fire state_changed events
+                    # on attribute-only updates without changing the state value. Resetting
+                    # the H1 timer on duplicate "Charging" events would prevent promotion
+                    # from ever firing within a stuck-gate window.
+                    if new_val == "Charging":
+                        # Start (or restart after Complete) the uninterrupted-Charging timer.
+                        self._gate_charging_started_at = dt_util.utcnow()
+                    elif new_val == "Complete":
+                        # FR-002 H1 reset: H1 measures one UNINTERRUPTED Charging interval, not
+                        # accumulated time. Real BMS balancing pulses oscillate (≤119 s observed
+                        # in production); resetting on each Charging→Complete ensures short pulses
+                        # cannot promote, while a single sustained Charging period (≥5 min) can.
+                        # See spec 014 Clarifications 2026-04-28.
+                        self._gate_charging_started_at = None
 
         # Dispatch based on current state
         if self._state == SessionEngineState.IDLE:
@@ -565,7 +606,7 @@ class SessionEngine:
             self._handle_tracking_state(event)
 
     def _handle_idle_state(self) -> None:
-        """Evaluate IDLE → TRACKING transition."""
+        """Evaluate IDLE → TRACKING transition (with PR-019 promotion guard)."""
         if self._is_charging() and self._is_trx_active():
             # Block session start if a session recently ended and the car has not yet
             # transitioned to Idle or Wait for car (balancing cycle guard, PR-013).
@@ -573,12 +614,25 @@ class SessionEngine:
             # only on car_status → "Idle" or "Wait for car", making the guard
             # event-order-independent (spec FR-001/005).
             if self._awaiting_reset:
-                if self._debug_logger:
-                    self._debug_logger.log(
-                        "BALANCING_SKIP",
-                        "session start blocked — Complete → Charging (balancing cycle)",
-                    )
-                return
+                if self._evaluate_promotion():
+                    # Promotion fires: clear gate, log, fall through to session start.
+                    self._log_gate_promotion()
+                    self._gate_engaged_energy_kwh = None
+                    self._gate_charging_started_at = None
+                    self._gate_skipped_count = 0
+                    self._awaiting_reset = False
+                    # Fall through to session start below.
+                else:
+                    # Still in balancing cycle: coalesce BALANCING_SKIP log spam.
+                    # Log exactly once on the first skip per gate-engaged window.
+                    if self._gate_skipped_count == 0:
+                        if self._debug_logger:
+                            self._debug_logger.log(
+                                "BALANCING_SKIP",
+                                "session start blocked — Complete → Charging (balancing cycle)",
+                            )
+                    self._gate_skipped_count += 1
+                    return
             # Set state synchronously to prevent duplicate tasks from rapid events
             self._state = SessionEngineState.TRACKING
             self._hass.async_create_task(self._async_start_session())
@@ -1002,6 +1056,12 @@ class SessionEngine:
         # to Idle or Wait for car during the _session_store.add_session await,
         # _last_car_status will reflect that and the gate won't incorrectly engage.
         self._awaiting_reset = self._last_car_status == "Complete"
+        if self._awaiting_reset:
+            # PR-019: Snapshot promotion baselines when gate engages.
+            self._gate_engaged_energy_kwh = self._get_energy()
+            self._gate_charging_started_at = None
+            self._gate_skipped_count = 0
+            self._log_gate_engagement()
         self._dispatch_update()
 
     def _calculate_charge_price(self, session: Session) -> float | None:
@@ -1019,6 +1079,115 @@ class SessionEngine:
         if self._guest_pricing.method == "markup" and self._guest_pricing.markup_factor is not None:
             return round(session.cost_total_kr * self._guest_pricing.markup_factor, 2)
         return None
+
+    # ---------------------------------------------------------------------------
+    # PR-019: Promotion mechanism helpers
+    # ---------------------------------------------------------------------------
+
+    def _evaluate_promotion(self) -> bool:
+        """Return True if either H1 or H2 promotion threshold is met.
+
+        H1 — current uninterrupted Charging interval >= DEFAULT_PROMOTE_DURATION_S.
+             Resets on each Charging→Complete transition (FR-002).
+        H2 — cumulative kWh delta since gate engaged >= DEFAULT_PROMOTE_ENERGY_KWH.
+             Cumulative across pulses; does NOT reset on intermediate Complete (FR-002).
+
+        Defensively returns False when required signals are unavailable (FR-011).
+        """
+        # H1: current uninterrupted Charging interval
+        if self._gate_charging_started_at is not None:
+            elapsed = (dt_util.utcnow() - self._gate_charging_started_at).total_seconds()
+            promote_duration = self._entry.options.get(
+                "promote_duration_s", DEFAULT_PROMOTE_DURATION_S
+            )
+            if elapsed >= promote_duration:
+                return True
+
+        # H2: cumulative kWh delta since gate engaged (FR-011: short-circuit on None)
+        if self._gate_engaged_energy_kwh is not None:
+            current_wh = self._get_energy()
+            if current_wh is not None:
+                energy_delta = current_wh - self._gate_engaged_energy_kwh
+                promote_energy = self._entry.options.get(
+                    "promote_energy_kwh", DEFAULT_PROMOTE_ENERGY_KWH
+                )
+                if energy_delta >= promote_energy:
+                    return True
+
+        return False
+
+    def _log_gate_engagement(self) -> None:
+        """Emit GATE_ENGAGED debug log entry with the energy baseline snapshot."""
+        if self._debug_logger is None:
+            return
+        if self._gate_engaged_energy_kwh is not None:
+            energy_str = f"{self._gate_engaged_energy_kwh:.3f}"
+        else:
+            energy_str = "unavailable"
+        self._debug_logger.log(
+            "GATE_ENGAGED",
+            f"gate engaged — energy_baseline_kwh={energy_str}",
+        )
+
+    def _log_gate_promotion(self) -> None:
+        """Emit GATE_PROMOTE debug log entry with trigger, measured values, and suppressed count."""
+        if self._debug_logger is None:
+            return
+
+        # Determine which threshold(s) fired
+        h1_met = False
+        h2_met = False
+        duration_s = 0.0
+        energy_kwh = 0.0
+
+        if self._gate_charging_started_at is not None:
+            duration_s = (dt_util.utcnow() - self._gate_charging_started_at).total_seconds()
+            promote_duration = self._entry.options.get(
+                "promote_duration_s", DEFAULT_PROMOTE_DURATION_S
+            )
+            if duration_s >= promote_duration:
+                h1_met = True
+
+        if self._gate_engaged_energy_kwh is not None:
+            current_wh = self._get_energy()
+            if current_wh is not None:
+                energy_kwh = current_wh - self._gate_engaged_energy_kwh
+                promote_energy = self._entry.options.get(
+                    "promote_energy_kwh", DEFAULT_PROMOTE_ENERGY_KWH
+                )
+                if energy_kwh >= promote_energy:
+                    h2_met = True
+
+        if h1_met and h2_met:
+            trigger = "H1+H2"
+        elif h1_met:
+            trigger = "H1"
+        elif h2_met:
+            trigger = "H2"
+        else:
+            # Should not occur — _evaluate_promotion returned True, so re-checking
+            # thresholds here must agree. If "UNKNOWN" appears in production logs,
+            # _evaluate_promotion and _log_gate_promotion have drifted apart.
+            trigger = "UNKNOWN"
+
+        self._debug_logger.log(
+            "GATE_PROMOTE",
+            f"new session promoted from stuck gate — trigger={trigger} "
+            f"duration_s={duration_s:.1f} energy_kwh={energy_kwh:.3f} "
+            f"suppressed={self._gate_skipped_count}",
+        )
+
+    def _log_gate_clear(self, trigger_state: str) -> None:
+        """Emit GATE_CLEAR debug log entry summarising suppressed events on gate clear."""
+        if self._debug_logger is None:
+            return
+        self._debug_logger.log(
+            "GATE_CLEAR",
+            f"gate cleared after {self._gate_skipped_count} suppressed events "
+            f"— trigger={trigger_state}",
+        )
+
+    # ---------------------------------------------------------------------------
 
     def _dispatch_update(self) -> None:
         """Send dispatcher signal to notify sensor entities of state change."""

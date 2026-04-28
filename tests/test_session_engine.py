@@ -1162,8 +1162,15 @@ async def test_synthetic_20_balancing_cycles_persist_one_session(
         f"Expected 1 session (the real one), got {len(completed_sessions)}"
     )
 
-    # At least 20 BALANCING_SKIP entries must have been logged
-    assert skip_count >= 20, f"Expected at least 20 BALANCING_SKIP log entries, got {skip_count}"
+    # PR-019: BALANCING_SKIP is coalesced to exactly ONE log entry per gate-engaged window.
+    # The previous assertion (>= 20) no longer holds after coalescing (FR-010 / Decision 4).
+    assert skip_count == 1, (
+        f"Expected exactly 1 coalesced BALANCING_SKIP log entry, got {skip_count}"
+    )
+    # The skip counter must have accumulated all 20 cycles
+    assert engine._gate_skipped_count >= 20, (
+        f"_gate_skipped_count must be >= 20, got {engine._gate_skipped_count}"
+    )
 
     # Engine remains IDLE
     assert engine.state == SessionEngineState.IDLE
@@ -2155,3 +2162,949 @@ async def test_recovery_cold_start_leaves_gate_disengaged(hass: HomeAssistant):
         "Cold start must allow first Charging event to start a session"
     )
     assert engine.active_session is not None
+
+
+# ---------------------------------------------------------------------------
+# PR-019: BMS pause/resume promotion mechanism tests
+# (T002-T006: US1, T008-T009: US2, T010-T012: US3, T013-T014: US4)
+# ---------------------------------------------------------------------------
+
+# Import the new constants — imported here to keep the import near the tests
+from custom_components.ev_charging_manager.const import (  # noqa: E402
+    DEFAULT_PROMOTE_DURATION_S,
+    DEFAULT_PROMOTE_ENERGY_KWH,
+)
+
+
+def _setup_debug_spy(hass, entry_id: str) -> tuple:
+    """Set up debug logging + spy and return (debug_logger, logged_calls list)."""
+    debug_logger = hass.data[DOMAIN][entry_id]["debug_logger"]
+    assert debug_logger is not None
+    logged_calls: list[tuple[str, str]] = []
+    original_log = debug_logger.log
+
+    def spy_log(category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log(category, message)
+
+    debug_logger.log = spy_log  # type: ignore[method-assign]
+    return debug_logger, logged_calls
+
+
+async def _setup_engine_with_debug(hass, tmp_path) -> tuple:
+    """Set up engine with debug logging enabled. Returns (entry, engine, debug_logger)."""
+    hass.config.config_dir = str(tmp_path)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"debug_logging": True},
+        title="Test",
+    )
+    await setup_session_engine(hass, entry)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    return entry, engine
+
+
+# ---------------------------------------------------------------------------
+# T002: H1 promotion — 5 min sustained charging fires promotion
+# ---------------------------------------------------------------------------
+
+
+async def test_promotion_fires_on_h1_after_sustained_charging(hass: HomeAssistant, tmp_path):
+    """T002 [US1]: After gate engages, sustained Charging for >5 min triggers H1 promotion.
+
+    Sequence: complete real session (gate engages) → car_status=Charging → mock time +6min
+    → trigger energy update → assert new session started with correct energy_start_kwh
+    and GATE_PROMOTE log entry with 'H1'.
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    # Complete a real session so gate is engaged
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    # Set energy entity to a known value before promotion.
+    # The gate_engaged_wh is whatever _do_complete_real_session left (0.1 kWh).
+    # We use 0.25 kWh — the delta (0.25 - 0.1 = 0.15 kWh) is below H2 threshold (0.5 kWh),
+    # so H2 will NOT fire and only H1 can trigger promotion.
+    known_wh = 0.25
+    hass.states.async_set(MOCK_ENERGY_ENTITY, str(known_wh))
+    await hass.async_block_till_done()
+
+    # Drive car_status → Charging (sets _gate_charging_started_at)
+    t_charging_start = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t_charging_start
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        # Advance time beyond H1 threshold (5 min + 1 s = 301 s)
+        t_promote = t_charging_start + timedelta(seconds=DEFAULT_PROMOTE_DURATION_S + 1)
+        mock_dt.utcnow.return_value = t_promote
+
+        # Fire an energy update (value stays below H2 threshold, so only H1 triggers)
+        hass.states.async_set(MOCK_ENERGY_ENTITY, str(known_wh + 0.01))
+        await hass.async_block_till_done()
+
+    # A new session must have been started
+    assert engine._awaiting_reset is False, "Gate must be cleared after promotion"
+    assert engine.state == SessionEngineState.TRACKING, "Engine must be TRACKING after promotion"
+    assert engine.active_session is not None, "Active session must exist after promotion"
+
+    # New session's energy_start_kwh must match wh reading at promotion time
+    assert abs(engine.active_session.energy_start_kwh - (known_wh + 0.01)) < 0.001, (
+        f"energy_start_kwh must be {known_wh + 0.01}, got {engine.active_session.energy_start_kwh}"
+    )
+
+    # GATE_PROMOTE must have been logged with H1 trigger
+    promote_msgs = [msg for cat, msg in logged_calls if cat == "GATE_PROMOTE"]
+    assert promote_msgs, f"GATE_PROMOTE not logged; logged_calls={logged_calls}"
+    assert any("H1" in msg for msg in promote_msgs), (
+        f"GATE_PROMOTE message must contain 'H1'; got: {promote_msgs}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T003: H2 promotion — 0.5 kWh energy delta fires promotion
+# ---------------------------------------------------------------------------
+
+
+async def test_promotion_fires_on_h2_after_energy_delta(hass: HomeAssistant, tmp_path):
+    """T003 [US1]: After gate engages, 0.5+ kWh wh delta triggers H2 promotion.
+
+    No time advance — H1 must not be the trigger. Only H2 fires.
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    # Complete a real session so gate is engaged; snapshot wh at gate-engage time
+    # Set energy to 3.0 before session so gate_engaged_wh = 3.0 + 0.1 = 3.1 (after session)
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "3.0")
+    await hass.async_block_till_done()
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    # _gate_engaged_energy_kwh is set when gate engages (at the end of _do_complete_real_session)
+    gate_engaged_energy_kwh = engine._gate_engaged_energy_kwh
+    assert gate_engaged_energy_kwh is not None, (
+        "_gate_engaged_energy_kwh must be set when gate engages"
+    )
+
+    # Drive car_status → Charging (sets _gate_charging_started_at to now, no time advance)
+    t_charging_start = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t_charging_start
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        # H1 must NOT fire: time stays at t_charging_start (0 seconds elapsed)
+        # H2 fires: set energy to gate_engaged_energy_kwh + 0.6 kWh (exceeds 0.5 kWh threshold)
+        promotion_energy_kwh = gate_engaged_energy_kwh + DEFAULT_PROMOTE_ENERGY_KWH + 0.1
+        hass.states.async_set(MOCK_ENERGY_ENTITY, str(promotion_energy_kwh))
+        await hass.async_block_till_done()
+
+    # A new session must have been started
+    assert engine._awaiting_reset is False, "Gate must be cleared after H2 promotion"
+    assert engine.state == SessionEngineState.TRACKING, "Engine must be TRACKING after promotion"
+    assert engine.active_session is not None
+
+    # GATE_PROMOTE must contain H2
+    promote_msgs = [msg for cat, msg in logged_calls if cat == "GATE_PROMOTE"]
+    assert promote_msgs, f"GATE_PROMOTE not logged; logged_calls={logged_calls}"
+    assert any("H2" in msg for msg in promote_msgs), (
+        f"GATE_PROMOTE message must contain 'H2'; got: {promote_msgs}"
+    )
+
+    # energy_kwh field in the promotion log must reflect the >= 0.5 kWh delta
+    assert any("energy_kwh=" in msg for msg in promote_msgs), (
+        f"GATE_PROMOTE message must contain 'energy_kwh='; got: {promote_msgs}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T004: H1 resets on intermediate Charging → Complete transition
+# ---------------------------------------------------------------------------
+
+
+async def test_h1_resets_on_intermediate_charging_to_complete(hass: HomeAssistant, tmp_path):
+    """T004 [US1]: H1 timer resets on each Charging→Complete; accumulated time does NOT carry over.
+
+    Gate engaged → Charging (T0) → 4 min → Complete → 1 min → Charging (T0+5min) → event.
+    Second Charging interval = 1 min → no promotion (H1 not met, H2 energy too low).
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    t0 = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t0
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        # First Charging interval (T0): 4 min — not enough for H1
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        mock_dt.utcnow.return_value = t0 + timedelta(seconds=240)
+
+        # Complete → resets H1 timer (FR-002 reset semantics)
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+        await hass.async_block_till_done()
+
+        # Second Charging interval starts at T0+5min; elapsed from this point = 0 s
+        mock_dt.utcnow.return_value = t0 + timedelta(seconds=300)
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        # Trigger one more evaluation with 1 min elapsed (H1 not met, energy small)
+        mock_dt.utcnow.return_value = t0 + timedelta(seconds=360)
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.05")  # well below 0.5 kWh H2
+        await hass.async_block_till_done()
+
+    # No promotion must have fired: gate still engaged
+    assert engine._awaiting_reset is True, (
+        "Gate must remain engaged — H1 timer reset, only 60s in second interval"
+    )
+    assert engine.state == SessionEngineState.IDLE, "Engine must remain IDLE — no promotion"
+    assert engine.active_session is None
+
+    # No GATE_PROMOTE must have been logged
+    promote_msgs = [cat for cat, _ in logged_calls if cat == "GATE_PROMOTE"]
+    assert not promote_msgs, f"GATE_PROMOTE must not fire; got: {promote_msgs}"
+
+
+# ---------------------------------------------------------------------------
+# T004b: H1 baseline NOT reset on duplicate Charging state event (F-D regression guard)
+# ---------------------------------------------------------------------------
+
+
+async def test_h1_baseline_not_reset_on_duplicate_charging_event(hass: HomeAssistant, tmp_path):
+    """T004b [US1]: Duplicate car_status=Charging events must not reset the H1 timer.
+
+    HA can re-fire state_changed with the same state value on attribute-only updates.
+    Without the prev_status guard, H1 would keep resetting and never reach the threshold.
+
+    Scenario: gate engaged → Charging (T0) → 4 min → duplicate Charging (same value)
+    → 1 min → evaluation event. Total elapsed from T0 = 5 min >= threshold → promotion.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from homeassistant.const import EVENT_STATE_CHANGED
+    from homeassistant.core import State
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    t0 = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t0
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        # First real transition to Charging — sets H1 baseline at T0.
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        assert engine._gate_charging_started_at is not None, "H1 baseline must be set on Charging"
+        baseline_at = engine._gate_charging_started_at
+
+        # Advance 4 minutes — almost at H1 threshold (5 min default).
+        mock_dt.utcnow.return_value = t0 + timedelta(seconds=240)
+
+        # Fire a duplicate Charging event (same state value, simulating attribute-only update).
+        # Without the prev_status guard, this would reset _gate_charging_started_at to T0+4min,
+        # making elapsed only 1 min on the next evaluation.
+        hass.bus.async_fire(
+            EVENT_STATE_CHANGED,
+            {
+                "entity_id": MOCK_CAR_STATUS_ENTITY,
+                "old_state": State(MOCK_CAR_STATUS_ENTITY, "Charging"),
+                "new_state": State(MOCK_CAR_STATUS_ENTITY, "Charging"),
+            },
+        )
+        await hass.async_block_till_done()
+
+        # Baseline must NOT have moved — still pointing to T0.
+        assert engine._gate_charging_started_at == baseline_at, (
+            "Duplicate Charging event must not reset the H1 baseline"
+        )
+
+        # Advance to T0 + 5 min + 1 s: H1 threshold met from the ORIGINAL baseline.
+        mock_dt.utcnow.return_value = t0 + timedelta(seconds=DEFAULT_PROMOTE_DURATION_S + 1)
+
+        # Trigger evaluation via any watched entity event.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.05")  # well below H2 — only H1 fires
+        await hass.async_block_till_done()
+
+    # Promotion must have fired.
+    assert engine._awaiting_reset is False, (
+        "Gate must clear after H1 promotion — duplicate event must not have reset the timer"
+    )
+    promote_msgs = [msg for cat, msg in logged_calls if cat == "GATE_PROMOTE"]
+    assert promote_msgs, f"GATE_PROMOTE must be logged; got: {logged_calls}"
+    assert any("H1" in msg for msg in promote_msgs), (
+        f"GATE_PROMOTE trigger must be H1; got: {promote_msgs}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T005: Promoted session energy_start_kwh equals current wh reading
+# ---------------------------------------------------------------------------
+
+
+async def test_promoted_session_energy_baseline_equals_current_wh(hass: HomeAssistant, tmp_path):
+    """T005 [US1]: Promoted session energy_start_kwh equals wh at promotion time (FR-003)."""
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    # Set known energy value before promotion fires
+    known_wh = 7.5
+    hass.states.async_set(MOCK_ENERGY_ENTITY, str(known_wh))
+    await hass.async_block_till_done()
+
+    t_charging_start = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t_charging_start
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        # Advance time past H1 threshold
+        t_promote = t_charging_start + timedelta(seconds=DEFAULT_PROMOTE_DURATION_S + 1)
+        mock_dt.utcnow.return_value = t_promote
+
+        # Keep energy at known_wh — fire evaluation
+        hass.states.async_set(MOCK_ENERGY_ENTITY, str(known_wh))
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None
+    assert abs(engine.active_session.energy_start_kwh - known_wh) < 0.001, (
+        f"energy_start_kwh must equal wh={known_wh} at promotion; "
+        f"got {engine.active_session.energy_start_kwh}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T006: Defensive paths — no crash, no false positive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "unknown_car_status",
+        "complete_car_status",
+        "energy_unavailable_h1_fires",
+    ],
+)
+async def test_promotion_defensive_paths_no_crash_no_false_positive(
+    hass: HomeAssistant, tmp_path, scenario: str
+):
+    """T006 [US1]: FR-005 + FR-011 defensive paths — no crash, correct promotion behaviour.
+
+    (a) unknown_car_status: gate engaged, car_status=STATE_UNKNOWN → no promotion, no exception.
+    (b) complete_car_status: gate engaged, car_status=Complete → no promotion, no exception.
+    (c) energy_unavailable_h1_fires: gate engaged, car=Charging, energy unavailable, time +6min
+        → H1 fires (timer-based), H2 silently skipped, no exception.
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    if scenario == "unknown_car_status":
+        # (a) Set car_status to STATE_UNKNOWN — _is_charging() returns False
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, STATE_UNKNOWN)
+        await hass.async_block_till_done()
+
+        # Trigger _handle_idle_state via energy update
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "1.0")
+        await hass.async_block_till_done()
+
+        # Gate must remain engaged, no promotion, no exception
+        assert engine._awaiting_reset is True, "Gate must not clear on STATE_UNKNOWN car_status"
+        assert engine.state == SessionEngineState.IDLE
+        promote_msgs = [cat for cat, _ in logged_calls if cat == "GATE_PROMOTE"]
+        assert not promote_msgs, "No GATE_PROMOTE on STATE_UNKNOWN"
+
+    elif scenario == "complete_car_status":
+        # (b) car_status stays at Complete — _is_charging() returns False
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+        await hass.async_block_till_done()
+
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "1.0")
+        await hass.async_block_till_done()
+
+        assert engine._awaiting_reset is True, "Gate must not clear when car_status=Complete"
+        assert engine.state == SessionEngineState.IDLE
+        promote_msgs = [cat for cat, _ in logged_calls if cat == "GATE_PROMOTE"]
+        assert not promote_msgs, "No GATE_PROMOTE when car_status=Complete"
+
+    elif scenario == "energy_unavailable_h1_fires":
+        # (c) car_status=Charging, energy unavailable, time advance > H1 → H1 fires, no crash
+        t_charging_start = dt_util.utcnow()
+        mock_dt = MagicMock()
+        mock_dt.utcnow.return_value = t_charging_start
+
+        with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+            hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+            await hass.async_block_till_done()
+
+            # Energy becomes unavailable
+            hass.states.async_set(MOCK_ENERGY_ENTITY, STATE_UNAVAILABLE)
+            await hass.async_block_till_done()
+
+            # Advance time past H1 threshold
+            t_promote = t_charging_start + timedelta(seconds=DEFAULT_PROMOTE_DURATION_S + 1)
+            mock_dt.utcnow.return_value = t_promote
+
+            # Fire a trx state change to trigger _handle_idle_state with the new time.
+            # (Changing MOCK_ENERGY_ENTITY from STATE_UNAVAILABLE to STATE_UNAVAILABLE won't
+            # produce a state_changed event — state hasn't changed — so we use MOCK_TRX_ENTITY.)
+            hass.states.async_set(MOCK_TRX_ENTITY, "3")
+            await hass.async_block_till_done()
+            hass.states.async_set(MOCK_TRX_ENTITY, "2")
+            await hass.async_block_till_done()
+
+        # H1 must have fired (time elapsed > 300s), H2 silently skipped (energy None)
+        assert engine._awaiting_reset is False, "Gate must clear when H1 fires"
+        assert engine.state == SessionEngineState.TRACKING, "H1 promotion must start session"
+        assert engine.active_session is not None
+
+        # GATE_PROMOTE with H1
+        promote_msgs = [msg for cat, msg in logged_calls if cat == "GATE_PROMOTE"]
+        assert promote_msgs, "GATE_PROMOTE must be logged when H1 fires"
+        assert any("H1" in msg for msg in promote_msgs), (
+            f"GATE_PROMOTE must contain H1; got: {promote_msgs}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# T008 [US2]: Short balancing pulses do NOT promote
+# ---------------------------------------------------------------------------
+
+
+async def test_short_balancing_pulses_do_not_promote(hass: HomeAssistant, tmp_path):
+    """T008 [US2]: 5 short balancing pulses (≤119s each, total <0.5 kWh) → no promotion.
+
+    Verifies FR-006: true balancing cycle is still suppressed after PR-19 changes.
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    gate_engaged_wh = engine._gate_engaged_energy_kwh or 0.0
+
+    t0 = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t0
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        # Drive 5 short Charging pulses (each 119 s, 20 s Complete gap)
+        elapsed = 0
+        for i in range(5):
+            # Charging starts
+            mock_dt.utcnow.return_value = t0 + timedelta(seconds=elapsed)
+            hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+            await hass.async_block_till_done()
+
+            # 119 seconds into Charging
+            elapsed += 119
+            mock_dt.utcnow.return_value = t0 + timedelta(seconds=elapsed)
+
+            # Small energy increase: 0.05 kWh per pulse, total = 0.25 kWh after 5
+            pulse_energy = gate_engaged_wh + (i + 1) * 0.05
+            hass.states.async_set(MOCK_ENERGY_ENTITY, str(pulse_energy))
+            await hass.async_block_till_done()
+
+            # Complete (20 s gap)
+            hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+            await hass.async_block_till_done()
+            elapsed += 20
+            mock_dt.utcnow.return_value = t0 + timedelta(seconds=elapsed)
+
+    # No promotion must have fired
+    promote_msgs = [cat for cat, _ in logged_calls if cat == "GATE_PROMOTE"]
+    assert not promote_msgs, f"GATE_PROMOTE must not fire during short pulses; got: {promote_msgs}"
+
+    assert engine._awaiting_reset is True, "_awaiting_reset must remain True after balancing pulses"
+    assert engine.state == SessionEngineState.IDLE, "Engine must remain IDLE"
+    assert engine._gate_skipped_count >= 5, (
+        f"_gate_skipped_count must be >= 5; got {engine._gate_skipped_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T009 [US2]: Settling pulse promotes via H1 (FR-007 acceptance behaviour)
+# ---------------------------------------------------------------------------
+
+
+async def test_settling_pulse_does_promote_via_h1(hass: HomeAssistant, tmp_path):
+    """T009 [US2]: After short balancing pulses, 6-min settling pulse promotes via H1 (FR-007).
+
+    The settling pulse must produce a new session — it delivers real energy.
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    gate_engaged_wh = engine._gate_engaged_energy_kwh or 0.0
+
+    t0 = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t0
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        # Drive 5 short pulses (same as T008)
+        elapsed = 0
+        for i in range(5):
+            mock_dt.utcnow.return_value = t0 + timedelta(seconds=elapsed)
+            hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+            await hass.async_block_till_done()
+            elapsed += 119
+            mock_dt.utcnow.return_value = t0 + timedelta(seconds=elapsed)
+            pulse_energy = gate_engaged_wh + (i + 1) * 0.05
+            hass.states.async_set(MOCK_ENERGY_ENTITY, str(pulse_energy))
+            await hass.async_block_till_done()
+            hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+            await hass.async_block_till_done()
+            elapsed += 20
+            mock_dt.utcnow.return_value = t0 + timedelta(seconds=elapsed)
+
+        # Settling pulse: start Charging, advance 6 minutes
+        mock_dt.utcnow.return_value = t0 + timedelta(seconds=elapsed)
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        elapsed += DEFAULT_PROMOTE_DURATION_S + 60  # 6 minutes elapsed in settling pulse
+        mock_dt.utcnow.return_value = t0 + timedelta(seconds=elapsed)
+
+        # Small energy delta (0.2 kWh) — not enough for H2, so H1 must be the trigger
+        settling_energy = gate_engaged_wh + 0.25 + 0.2  # total pulses + settling partial
+        hass.states.async_set(MOCK_ENERGY_ENTITY, str(settling_energy))
+        await hass.async_block_till_done()
+
+    # Promotion must have fired via H1
+    assert engine._awaiting_reset is False, "Gate must clear after settling-pulse promotion"
+    assert engine.state == SessionEngineState.TRACKING, "Engine must be TRACKING after promotion"
+    assert engine.active_session is not None
+
+    promote_msgs = [msg for cat, msg in logged_calls if cat == "GATE_PROMOTE"]
+    assert promote_msgs, f"GATE_PROMOTE must be logged; logged_calls={logged_calls}"
+    assert any("H1" in msg for msg in promote_msgs), (
+        f"GATE_PROMOTE must contain H1 for settling pulse; got: {promote_msgs}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T010 [US3]: Idle transition clears gate AND new baseline fields
+# ---------------------------------------------------------------------------
+
+
+async def test_idle_transition_clears_gate_and_new_baselines(hass: HomeAssistant, tmp_path):
+    """T010 [US3]: Idle transition clears _awaiting_reset AND all three new baseline fields.
+
+    Also verifies existing PR-18 test semantics (gate clears on Idle).
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+    assert engine._gate_engaged_energy_kwh is not None
+
+    t0 = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t0
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        # Drive Charging (sets _gate_charging_started_at)
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        assert engine._gate_charging_started_at is not None, (
+            "_gate_charging_started_at must be set when Charging while gate engaged"
+        )
+
+        # Partial energy delta (below H2) so gate stays engaged
+        partial_energy = (engine._gate_engaged_energy_kwh or 0.0) + 0.1
+        hass.states.async_set(MOCK_ENERGY_ENTITY, str(partial_energy))
+        await hass.async_block_till_done()
+
+    # Drive car_status → Idle — must clear gate AND baselines
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    await hass.async_block_till_done()
+
+    assert engine._awaiting_reset is False, "Gate must clear on Idle"
+    assert engine._gate_engaged_energy_kwh is None, (
+        "_gate_engaged_energy_kwh must be None after Idle"
+    )
+    assert engine._gate_charging_started_at is None, (
+        "_gate_charging_started_at must be None after Idle"
+    )
+    assert engine._gate_skipped_count == 0, "_gate_skipped_count must be 0 after Idle"
+
+    # FR-010: GATE_CLEAR must be emitted when gate clears with suppressed events.
+    clear_msgs = [msg for cat, msg in logged_calls if cat == "GATE_CLEAR"]
+    assert len(clear_msgs) == 1, f"Exactly one GATE_CLEAR must be logged; got: {clear_msgs}"
+    assert "Idle" in clear_msgs[0], (
+        f"GATE_CLEAR must mention trigger state 'Idle'; got: {clear_msgs[0]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T011 [US3]: Wait for car transition clears gate AND new baseline fields
+# ---------------------------------------------------------------------------
+
+
+async def test_wait_for_car_transition_clears_gate_and_new_baselines(hass: HomeAssistant, tmp_path):
+    """T011 [US3]: Wait for car clears _awaiting_reset AND new baseline fields (FR-008)."""
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    _, logged_calls = _setup_debug_spy(hass, entry.entry_id)
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+    assert engine._gate_engaged_energy_kwh is not None
+
+    t0 = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t0
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        # Drive Charging to set _gate_charging_started_at
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        assert engine._gate_charging_started_at is not None
+
+    # Drive car_status → Wait for car
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Wait for car")
+    await hass.async_block_till_done()
+
+    assert engine._awaiting_reset is False, "Gate must clear on Wait for car"
+    assert engine._gate_engaged_energy_kwh is None, (
+        "_gate_engaged_energy_kwh must be None after Wait for car"
+    )
+    assert engine._gate_charging_started_at is None, (
+        "_gate_charging_started_at must be None after Wait for car"
+    )
+    assert engine._gate_skipped_count == 0, "_gate_skipped_count must be 0 after Wait for car"
+
+    # FR-010: GATE_CLEAR must be emitted when gate clears with suppressed events.
+    clear_msgs = [msg for cat, msg in logged_calls if cat == "GATE_CLEAR"]
+    assert len(clear_msgs) == 1, f"Exactly one GATE_CLEAR must be logged; got: {clear_msgs}"
+    assert "Wait for car" in clear_msgs[0], (
+        f"GATE_CLEAR must mention trigger state 'Wait for car'; got: {clear_msgs[0]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T012 [US3]: Recovery with Complete state snapshots wh baseline + post-recovery promotion
+# ---------------------------------------------------------------------------
+
+
+async def test_recovery_complete_snapshot_snapshots_wh_baseline_and_promotes(
+    hass: HomeAssistant, tmp_path
+):
+    """T012 [US3]: FR-013 — recovery with Complete snapshots wh AND post-recovery H1 fires.
+
+    Part A: Recovery + Complete → gate engaged, _gate_engaged_energy_kwh = 5.5 kWh.
+    Part B: Sustained Charging > 5 min → promotion fires via H1 with post-restart baseline.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    hass.config.config_dir = str(tmp_path)
+
+    snapshot = _make_recovery_snapshot(rfid_index=1, energy_start_kwh=5.0, energy_kwh=4.0)
+
+    # At recovery time: car=Complete, energy=5.5 kWh
+    recovery_wh = 5.5
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, str(recovery_wh))
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"debug_logging": True},
+        title="Test",
+    )
+
+    # Install spy BEFORE async_setup so the GATE_ENGAGED call during async_recover is captured.
+    # Patch at the class level since the DebugLogger instance doesn't exist yet.
+    from custom_components.ev_charging_manager.debug_logger import DebugLogger
+
+    logged_calls: list[tuple[str, str]] = []
+    original_log_method = DebugLogger.log
+
+    def spy_log_method(self_dl, category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log_method(self_dl, category, message)
+
+    with (
+        patch(
+            "homeassistant.helpers.storage.Store.async_load",
+            side_effect=_store_load_side_effect_for_recovery(snapshot),
+        ),
+        patch(
+            "homeassistant.helpers.storage.Store.async_save",
+            new_callable=AsyncMock,
+        ),
+        patch.object(DebugLogger, "log", spy_log_method),
+    ):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Part A: gate engaged + wh baseline snapshotted
+    assert engine._awaiting_reset is True, "Gate must engage at recovery with car_status=Complete"
+    assert engine._gate_engaged_energy_kwh is not None, (
+        "_gate_engaged_energy_kwh must be snapshotted at recovery"
+    )
+    assert abs(engine._gate_engaged_energy_kwh - recovery_wh) < 0.001, (
+        f"energy baseline must equal {recovery_wh}; got {engine._gate_engaged_energy_kwh}"
+    )
+
+    # Verify GATE_ENGAGED was logged during recovery with the expected energy_baseline_kwh value.
+    engaged_msgs = [msg for cat, msg in logged_calls if cat == "GATE_ENGAGED"]
+    assert engaged_msgs, f"GATE_ENGAGED must be logged during recovery; got: {logged_calls}"
+    assert any(f"{recovery_wh:.3f}" in msg for msg in engaged_msgs), (
+        f"GATE_ENGAGED must contain energy_baseline_kwh={recovery_wh:.3f}; got: {engaged_msgs}"
+    )
+
+    # Re-install instance-level spy for Part B (class-level patch is no longer active).
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert debug_logger is not None
+    original_log = debug_logger.log
+
+    def spy_log(category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log(category, message)
+
+    debug_logger.log = spy_log  # type: ignore[method-assign]
+
+    # Part B: post-recovery promotion via H1
+    t_charging_start = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t_charging_start
+
+    promotion_wh = recovery_wh + 0.3  # not enough for H2
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        # Advance time past H1 threshold
+        t_promote = t_charging_start + timedelta(seconds=DEFAULT_PROMOTE_DURATION_S + 1)
+        mock_dt.utcnow.return_value = t_promote
+
+        hass.states.async_set(MOCK_ENERGY_ENTITY, str(promotion_wh))
+        await hass.async_block_till_done()
+
+    # Promotion must have fired
+    assert engine._awaiting_reset is False, "Gate must clear after post-recovery H1 promotion"
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None
+    assert abs(engine.active_session.energy_start_kwh - promotion_wh) < 0.001, (
+        f"Promoted session energy_start_kwh must equal wh={promotion_wh} at promotion time"
+    )
+
+    promote_msgs = [msg for cat, msg in logged_calls if cat == "GATE_PROMOTE"]
+    assert promote_msgs, "GATE_PROMOTE must be logged after post-recovery promotion"
+    assert any("H1" in msg for msg in promote_msgs), (
+        f"GATE_PROMOTE must contain H1; got: {promote_msgs}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T013 [US4]: GATE_ENGAGED and GATE_PROMOTE log entries contain required fields
+# ---------------------------------------------------------------------------
+
+
+async def test_gate_promote_and_engaged_logs_contain_required_fields(hass: HomeAssistant, tmp_path):
+    """T013 [US4]: GATE_ENGAGED has energy_baseline_kwh; GATE_PROMOTE has required fields.
+
+    Verifies trigger+duration+energy+count are present (FR-009 + FR-010 observability contracts).
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert debug_logger is not None
+
+    # Capture ALL log calls including those during _do_complete_real_session
+    logged_calls: list[tuple[str, str]] = []
+    original_log = debug_logger.log
+
+    def spy_log(category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log(category, message)
+
+    debug_logger.log = spy_log  # type: ignore[method-assign]
+
+    # Set energy to known value so GATE_ENGAGED has a numeric baseline
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "4.2")
+    await hass.async_block_till_done()
+
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    # Part (a): GATE_ENGAGED must contain energy_baseline_kwh= followed by a numeric value
+    engaged_msgs = [msg for cat, msg in logged_calls if cat == "GATE_ENGAGED"]
+    assert engaged_msgs, f"GATE_ENGAGED must be logged at session end; got: {logged_calls}"
+    assert any("energy_baseline_kwh=" in msg for msg in engaged_msgs), (
+        f"GATE_ENGAGED must contain 'energy_baseline_kwh='; got: {engaged_msgs}"
+    )
+    # Verify it's a numeric value (not "unavailable")
+    import re
+
+    for msg in engaged_msgs:
+        m = re.search(r"energy_baseline_kwh=(\S+)", msg)
+        if m:
+            val = m.group(1)
+            # Must be a float or "unavailable"
+            try:
+                float(val)
+                found_numeric = True
+                break
+            except ValueError:
+                pass
+    else:
+        found_numeric = False
+    assert found_numeric, f"GATE_ENGAGED energy_baseline_kwh must be numeric; got: {engaged_msgs}"
+
+    # Part (b): trigger H1 promotion, verify GATE_PROMOTE fields
+    t_charging_start = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t_charging_start
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        t_promote = t_charging_start + timedelta(seconds=DEFAULT_PROMOTE_DURATION_S + 1)
+        mock_dt.utcnow.return_value = t_promote
+
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "4.2")
+        await hass.async_block_till_done()
+
+    promote_msgs = [msg for cat, msg in logged_calls if cat == "GATE_PROMOTE"]
+    assert promote_msgs, f"GATE_PROMOTE must be logged after H1 promotion; got: {logged_calls}"
+
+    for msg in promote_msgs:
+        # trigger must be present
+        assert any(t in msg for t in ("H1", "H2", "H1+H2")), (
+            f"GATE_PROMOTE must contain trigger H1/H2/H1+H2; got: {msg}"
+        )
+        # duration_s must be present and numeric
+        m_dur = re.search(r"duration_s=([\d.]+)", msg)
+        assert m_dur, f"GATE_PROMOTE must contain 'duration_s=<number>'; got: {msg}"
+        float(m_dur.group(1))  # must parse as float
+
+        # energy_kwh must be present and numeric
+        m_e = re.search(r"energy_kwh=([\d.]+)", msg)
+        assert m_e, f"GATE_PROMOTE must contain 'energy_kwh=<number>'; got: {msg}"
+        float(m_e.group(1))
+
+        # suppressed count must be present and numeric
+        m_sup = re.search(r"suppressed=([\d]+)", msg)
+        assert m_sup, f"GATE_PROMOTE must contain 'suppressed=<number>'; got: {msg}"
+        int(m_sup.group(1))
+
+
+# ---------------------------------------------------------------------------
+# T014 [US4]: BALANCING_SKIP coalesced to first event per gate-engaged window
+# ---------------------------------------------------------------------------
+
+
+async def test_balancing_skip_log_coalesced_to_first_event(hass: HomeAssistant, tmp_path):
+    """T014 [US4]: 50 events while gate is engaged produce exactly ONE BALANCING_SKIP log entry.
+
+    FR-010 + research.md Decision 4 coalescing. _gate_skipped_count must be 50.
+    """
+    from unittest.mock import MagicMock, patch
+
+    entry, engine = await _setup_engine_with_debug(hass, tmp_path)
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert debug_logger is not None
+
+    # Spy after session end so we only count during the gate-engaged window
+    await _do_complete_real_session(hass, entry.entry_id)
+    assert engine._awaiting_reset is True
+
+    logged_calls: list[tuple[str, str]] = []
+    original_log = debug_logger.log
+
+    def spy_log(category: str, message: str) -> None:
+        logged_calls.append((category, message))
+        original_log(category, message)
+
+    debug_logger.log = spy_log  # type: ignore[method-assign]
+
+    t0 = dt_util.utcnow()
+    mock_dt = MagicMock()
+    mock_dt.utcnow.return_value = t0  # time does NOT advance → H1 stays unmet
+
+    with patch("custom_components.ev_charging_manager.session_engine.dt_util", mock_dt):
+        # Drive car_status = Charging (gate is engaged, so this sets _gate_charging_started_at)
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
+
+        # Fire 49 more energy updates (trx still active, car_status=Charging, gate engaged)
+        # Each fires _handle_idle_state → gate blocks → BALANCING_SKIP coalescing
+        # Energy stays well below H2 threshold
+        for i in range(49):
+            hass.states.async_set(MOCK_ENERGY_ENTITY, f"0.0{i:02d}")
+            await hass.async_block_till_done()
+
+    # Exactly ONE BALANCING_SKIP must have been logged (the first)
+    skip_msgs = [msg for cat, msg in logged_calls if cat == "BALANCING_SKIP"]
+    assert len(skip_msgs) == 1, (
+        f"Expected exactly 1 BALANCING_SKIP log entry (coalesced); got {len(skip_msgs)}"
+    )
+
+    # _gate_skipped_count must be 50 (first Charging event + 49 energy updates)
+    assert engine._gate_skipped_count == 50, (
+        f"_gate_skipped_count must be 50; got {engine._gate_skipped_count}"
+    )

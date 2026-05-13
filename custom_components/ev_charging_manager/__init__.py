@@ -23,6 +23,7 @@ from .const import (
     PLATFORMS,
 )
 from .debug_logger import DebugLogger
+from .lifecycle import async_migrate_observation_slots
 from .session_engine import SessionEngine
 from .session_store import SessionStore
 from .stats_engine import StatsEngine
@@ -104,6 +105,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         manufacturer="EV Charging Manager",
         model=model,
     )
+
+    # Populate missing observation-slot options from charger profile (one-time migration).
+    # Runs before SessionEngine so it can read the resolved entity IDs from entry.options.
+    await async_migrate_observation_slots(hass, entry)
 
     # Set up debug logger (PR-010) — instantiated before session engine
     debug_logging_enabled = entry.options.get(CONF_DEBUG_LOGGING, False)

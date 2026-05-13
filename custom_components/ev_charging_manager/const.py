@@ -123,7 +123,7 @@ PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
 # Cross-validation: total energy counter entity (PR-07)
 CONF_ETO_ENTITY = "eto_entity"
 
-# Observation entity slots (PR-20): four optional charger-signal entities stored
+# Observation entity slots: four optional charger-signal entities stored
 # in entry.options.  Auto-populated for goe_gemini profile; None on generic.
 CONF_PLUG_ENTITY = "plug_entity"
 CONF_CABLE_LOCK_ENTITY = "cable_lock_entity"

@@ -110,7 +110,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Runs before SessionEngine so it can read the resolved entity IDs from entry.options.
     await async_migrate_observation_slots(hass, entry)
 
-    # Set up debug logger (PR-010) — instantiated before session engine
+    # Set up debug logger — instantiated before session engine
     debug_logging_enabled = entry.options.get(CONF_DEBUG_LOGGING, False)
     debug_logger = DebugLogger(hass.config.config_dir)
     if debug_logging_enabled:

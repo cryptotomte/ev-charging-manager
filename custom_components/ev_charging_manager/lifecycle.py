@@ -34,9 +34,10 @@ async def async_migrate_observation_slots(
 ) -> None:
     """Populate missing observation-slot options from the charger profile.
 
-    Runs at async_setup_entry time.  Only fills slots that are absent from
-    entry.options — a slot that was deliberately cleared by the user (value
-    None or empty string) is left untouched once it has been set.
+    Only fills slots that are absent from entry.options — a slot that was
+    deliberately cleared by the user (value None or empty string) is left
+    untouched once it has been set.  This makes the function idempotent:
+    calling it twice on the same entry produces the same result.
 
     For profiles without observation-entity patterns (e.g. 'generic') this
     function is a no-op.
@@ -45,11 +46,10 @@ async def async_migrate_observation_slots(
     profile = CHARGER_PROFILES.get(profile_key, {})
     serial = entry.data.get(CONF_CHARGER_SERIAL, "")
 
-    new_options: dict = {}
+    new_options: dict[str, str] = {}
     for conf_key, profile_key_name in _OBSERVATION_SLOT_MAP.items():
         pattern = profile.get(profile_key_name)
         if pattern is None:
-            # Profile has no value for this slot (e.g. generic) — skip
             continue
         if conf_key in entry.options:
             # Slot already set (including deliberate None/custom value) — skip

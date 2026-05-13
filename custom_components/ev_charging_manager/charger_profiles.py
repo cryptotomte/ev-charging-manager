@@ -16,10 +16,10 @@ from typing import Any
 # - rfid_last_uid_sensor: Entity pattern for last RFID UID (optional)
 # - rfid_discovery: Placeholder for PR-08 RFID discovery config
 # - requires_charger_host: Whether the charger host/IP field is required
-# - plug_sensor: Entity pattern for plug-connected binary sensor (PR-20, optional)
-# - cable_lock_sensor: Entity pattern for cable-lock status sensor (PR-20, optional)
-# - model_status_sensor: Entity pattern for charger model-status sensor (PR-20, optional)
-# - error_sensor: Entity pattern for charger error sensor (PR-20, optional)
+# - plug_sensor: Entity pattern for plug-connected binary sensor (optional)
+# - cable_lock_sensor: Entity pattern for cable-lock status sensor (optional)
+# - model_status_sensor: Entity pattern for charger model-status sensor (optional)
+# - error_sensor: Entity pattern for charger error sensor (optional)
 
 CHARGER_PROFILES: dict[str, dict[str, Any]] = {
     "goe_gemini": {
@@ -39,7 +39,7 @@ CHARGER_PROFILES: dict[str, dict[str, Any]] = {
             "flat_keys_format": True,
         },
         "requires_charger_host": True,
-        # PR-20 observation entity patterns
+        # Observation entity patterns (auto-populated into entry.options at setup)
         "plug_sensor": "binary_sensor.goe_{serial}_car_0",
         "cable_lock_sensor": "sensor.goe_{serial}_cus_value",
         "model_status_sensor": "sensor.goe_{serial}_modelstatus_value",
@@ -57,7 +57,7 @@ CHARGER_PROFILES: dict[str, dict[str, Any]] = {
         "rfid_last_uid_sensor": None,
         "rfid_discovery": None,
         "requires_charger_host": False,
-        # PR-20 observation entity patterns (None = not auto-populated for generic)
+        # Observation entity patterns (None = not auto-populated for generic)
         "plug_sensor": None,
         "cable_lock_sensor": None,
         "model_status_sensor": None,

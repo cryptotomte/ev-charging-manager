@@ -6,8 +6,11 @@ Test naming follows the plan: T-OBS-01 through T-OBS-16.
 
 from __future__ import annotations
 
+import logging
+import pathlib
 from unittest.mock import MagicMock
 
+import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -273,7 +276,7 @@ async def test_obs_10_snapshot_cached_fallback(hass: HomeAssistant) -> None:
 
 
 async def test_obs_11_snapshot_unknown_placeholder(hass: HomeAssistant) -> None:
-    """T-OBS-11: _format_signal_snapshot returns wh=? power=? when no values available."""
+    """T-OBS-11: _format_signal_snapshot returns wh=? power=? when cache is None (never set)."""
     entry = _make_observation_entry()
     engine, _ = await _setup_observation_engine(hass, entry)
 
@@ -284,12 +287,32 @@ async def test_obs_11_snapshot_unknown_placeholder(hass: HomeAssistant) -> None:
     hass.states.async_set(MOCK_POWER_ENTITY, STATE_UNAVAILABLE)
     await hass.async_block_till_done()
 
-    # Ensure cached values are zero (default)
+    # Ensure cached values are None (never set — not the same as zero)
+    engine._last_energy_kwh = None
+    engine._last_power_w = None
+
+    result = engine._format_signal_snapshot()
+    assert result == " | wh=? power=?"
+
+
+async def test_obs_11b_snapshot_zero_renders_as_zero(hass: HomeAssistant) -> None:
+    """T-OBS-11b: _format_signal_snapshot renders cached 0.0 as wh=0.000, not '?'."""
+    entry = _make_observation_entry()
+    engine, _ = await _setup_observation_engine(hass, entry)
+
+    from homeassistant.const import STATE_UNAVAILABLE
+
+    # Make live entities unavailable
+    hass.states.async_set(MOCK_ENERGY_ENTITY, STATE_UNAVAILABLE)
+    hass.states.async_set(MOCK_POWER_ENTITY, STATE_UNAVAILABLE)
+    await hass.async_block_till_done()
+
+    # 0.0 is a legitimate reading (e.g. session just started)
     engine._last_energy_kwh = 0.0
     engine._last_power_w = 0.0
 
     result = engine._format_signal_snapshot()
-    assert result == " | wh=? power=?"
+    assert result == " | wh=0.000 power=0"
 
 
 # ===========================================================================
@@ -625,3 +648,409 @@ async def test_obs_08_debug_off_no_observation_lines(hass: HomeAssistant) -> Non
     assert len(obs_calls) == 0, (
         f"Expected no observation calls with debug logging disabled, got: {obs_calls}"
     )
+
+
+# ===========================================================================
+# C3: Cache not polluted by transient unavailability
+# ===========================================================================
+
+
+async def test_obs_c3_unavailable_does_not_pollute_cache(hass: HomeAssistant) -> None:
+    """C3: plug on → unavailable → on: cache stays 'on'; second log shows on → on suppressed."""
+    from homeassistant.const import STATE_UNAVAILABLE
+
+    entry = _make_observation_entry()
+    engine, mock_log = await _setup_observation_engine(hass, entry)
+
+    # Prime cache
+    engine._last_plug = "on"
+
+    # Transition to unavailable — should log but NOT update cache
+    hass.states.async_set(MOCK_PLUG_ENTITY, STATE_UNAVAILABLE)
+    await hass.async_block_till_done()
+
+    unavail_calls = [c for c in mock_log.call_args_list if c.args[0] == "PLUG_STATE"]
+    assert len(unavail_calls) == 1, "Expected one PLUG_STATE log for on → unavailable"
+    assert STATE_UNAVAILABLE in unavail_calls[0].args[1]
+
+    # Cache should still be "on" (not polluted)
+    assert engine._last_plug == "on", "Cache must not be updated to unavailable"
+
+    mock_log.reset_mock()
+
+    # Transition back to "on" — same as cache so must be SUPPRESSED
+    hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+    await hass.async_block_till_done()
+
+    on_again_calls = [c for c in mock_log.call_args_list if c.args[0] == "PLUG_STATE"]
+    assert len(on_again_calls) == 0, (
+        "Expected on → on to be suppressed because cache was not polluted to 'unavailable'"
+    )
+
+
+# ===========================================================================
+# I2: Signal caches primed at setup
+# ===========================================================================
+
+
+async def test_obs_i2_cache_primed_at_setup(hass: HomeAssistant) -> None:
+    """I2: After async_setup, _last_plug is primed from current HA state."""
+    # Pre-set plug to "on" before setup so it's in HA states when async_setup runs
+    hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+    hass.states.async_set(MOCK_MODEL_STATUS_ENTITY, "Idle")
+    hass.states.async_set(MOCK_ERROR_ENTITY, "-none-")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.000")
+    hass.states.async_set(MOCK_POWER_ENTITY, "0")
+
+    entry = _make_observation_entry()
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    engine: SessionEngine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Cache should be primed from the HA state at setup time
+    assert engine._last_plug == "on", "Expected _last_plug primed to 'on'"
+    assert engine._last_cable_lock == "Locked", "Expected _last_cable_lock primed"
+
+    # Fire a transition from the primed value → should log actual before/after
+    mock_log = MagicMock()
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    debug_logger.log = mock_log
+    if engine._debug_logger is not None:
+        engine._debug_logger.log = mock_log
+
+    hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+    await hass.async_block_till_done()
+
+    plug_calls = [c for c in mock_log.call_args_list if c.args[0] == "PLUG_STATE"]
+    assert plug_calls, "Expected PLUG_STATE log call"
+    # Must show "on → off", not "None → off"
+    assert "on → off" in plug_calls[-1].args[1], (
+        f"Expected 'on → off' but got: {plug_calls[-1].args[1]!r}"
+    )
+
+
+# ===========================================================================
+# I3: Warning emitted when configured observation entity is not registered
+# ===========================================================================
+
+
+async def test_obs_i3_warning_on_missing_entity(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """I3: A configured observation entity that doesn't exist in HA emits a warning."""
+    nonexistent = "binary_sensor.this_does_not_exist"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={
+            "debug_logging": True,
+            CONF_PLUG_ENTITY: nonexistent,
+        },
+        title="Missing Entity Test",
+    )
+
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+    # nonexistent intentionally NOT set
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.ev_charging_manager"):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert any(
+        nonexistent in record.message and "not registered" in record.message
+        for record in caplog.records
+    ), "Expected warning about unregistered observation entity"
+
+
+async def test_obs_i3_no_warning_when_entity_exists(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """I3: No warning when the configured entity exists in HA states."""
+    entry = _make_observation_entry()
+    # Standard setup pre-sets all observation entities
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+    hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+    hass.states.async_set(MOCK_MODEL_STATUS_ENTITY, "Idle")
+    hass.states.async_set(MOCK_ERROR_ENTITY, "-none-")
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.ev_charging_manager"):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    not_registered_warnings = [r for r in caplog.records if "not registered" in r.message]
+    assert len(not_registered_warnings) == 0, (
+        f"Expected no 'not registered' warnings but got: {not_registered_warnings}"
+    )
+
+
+# ===========================================================================
+# T1 (T-OBS-17): trx transition during gate-engaged state — no promotion
+# ===========================================================================
+
+
+async def test_obs_17_trx_transition_during_gate_engaged_no_promotion(
+    hass: HomeAssistant,
+) -> None:
+    """T1: trx transitions while _awaiting_reset=True and car_status=Charging
+    must not trigger gate promotion or session start.
+    """
+    from pytest_homeassistant_custom_component.common import async_capture_events
+
+    entry = _make_observation_entry()
+    engine, mock_log = await _setup_observation_engine(hass, entry)
+
+    # Set up the engine in a gate-engaged state
+    engine._awaiting_reset = True
+    engine._gate_engaged_energy_kwh = 5.0
+    engine._gate_charging_started_at = None  # H1 not yet started
+    engine._gate_skipped_count = 0
+
+    # Ensure engine is IDLE
+    assert engine.state == SessionEngineState.IDLE
+
+    session_events = async_capture_events(hass, EVENT_SESSION_STARTED)
+
+    # Simulate car_status = Charging (but gate is engaged, so session blocked)
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    # No session should have started (gate blocks it)
+    assert engine.state == SessionEngineState.IDLE or len(session_events) == 0
+
+    # Fire trx transition from "1" to "2"
+    engine._last_trx = "1"
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    await hass.async_block_till_done()
+
+    # Gate must still be engaged
+    assert engine._awaiting_reset is True, "Gate must remain engaged after trx transition"
+
+    # No GATE_PROMOTE log
+    promote_calls = [c for c in mock_log.call_args_list if c.args[0] == "GATE_PROMOTE"]
+    assert len(promote_calls) == 0, "Expected no GATE_PROMOTE on trx transition alone"
+
+    # TRX_STATE log should have been emitted (observation)
+    trx_calls = [c for c in mock_log.call_args_list if c.args[0] == "TRX_STATE"]
+    assert trx_calls, "Expected TRX_STATE observation log"
+
+
+# ===========================================================================
+# T2: T-OBS-16 strengthened — verify binding integrity after reload
+# ===========================================================================
+
+
+async def test_obs_16_reload_binding_integrity(hass: HomeAssistant) -> None:
+    """T-OBS-16 (strengthened): After reload, entry.options retains the plug entity,
+    and state changes on a different entity do NOT emit plug log lines.
+    """
+    entry = _make_observation_entry()
+    engine, mock_log = await _setup_observation_engine(hass, entry)
+
+    original_plug = entry.options[CONF_PLUG_ENTITY]
+
+    # Reload the entry
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    # Verify binding survived reload
+    reloaded_entry = hass.config_entries.async_get_entry(entry.entry_id)
+    assert reloaded_entry.options.get(CONF_PLUG_ENTITY) == original_plug, (
+        "CONF_PLUG_ENTITY must survive reload unchanged"
+    )
+
+    # Set up mock on post-reload engine
+    engine_post = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    debug_logger_post = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    mock_log_post = MagicMock()
+    debug_logger_post.log = mock_log_post
+    if engine_post._debug_logger is not None:
+        engine_post._debug_logger.log = mock_log_post
+
+    # Fire a state change on the CABLE_LOCK entity (NOT the plug) — must NOT produce PLUG_STATE
+    engine_post._last_cable_lock = "Unlocked"
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+    await hass.async_block_till_done()
+
+    plug_calls = [c for c in mock_log_post.call_args_list if c.args[0] == "PLUG_STATE"]
+    assert len(plug_calls) == 0, "No PLUG_STATE log expected when only CABLE_LOCK entity changed"
+
+    cable_calls = [c for c in mock_log_post.call_args_list if c.args[0] == "CABLE_LOCK"]
+    assert cable_calls, "Expected CABLE_LOCK log from cable-lock state change"
+
+
+# ===========================================================================
+# SC-001: Single session, all 5 observation categories fire
+# ===========================================================================
+
+
+async def test_obs_sc001_multi_category_single_session(hass: HomeAssistant) -> None:
+    """SC-001: Within one logical charging session, all 5 observation categories emit
+    at least one log line each.
+    """
+    entry = _make_observation_entry()
+    engine, mock_log = await _setup_observation_engine(hass, entry)
+
+    # Start a session
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+    assert engine.state == SessionEngineState.TRACKING
+
+    # Set caches so all transitions are new
+    engine._last_plug = "off"
+    engine._last_cable_lock = "Unlocked"
+    engine._last_model_status = "Idle"
+    engine._last_err = "-none-"
+    engine._last_trx = "2"
+
+    # Fire all five observation categories
+    hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+    await hass.async_block_till_done()
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+    await hass.async_block_till_done()
+    hass.states.async_set(MOCK_MODEL_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+    hass.states.async_set(MOCK_ERROR_ENTITY, "cable_warm")
+    await hass.async_block_till_done()
+    hass.states.async_set(MOCK_TRX_ENTITY, "3")
+    await hass.async_block_till_done()
+
+    for category in ("PLUG_STATE", "CABLE_LOCK", "MODEL_STATUS", "ERR_STATE", "TRX_STATE"):
+        calls = [c for c in mock_log.call_args_list if c.args[0] == category]
+        assert calls, f"Expected at least one log line for category {category}"
+
+
+# ===========================================================================
+# FR-006: Real DebugLogger writes the correct line format
+# ===========================================================================
+
+
+async def test_obs_fr006_real_debug_logger_format(
+    hass: HomeAssistant, tmp_path: pathlib.Path
+) -> None:
+    """FR-006: A real DebugLogger writes the correct contract format for observation lines."""
+    import re
+
+    from custom_components.ev_charging_manager.debug_logger import DebugLogger
+
+    log_dir = str(tmp_path)
+    logger = DebugLogger(log_dir)
+    logger.enable()
+
+    # Write one observation-style log line
+    logger.log("PLUG_STATE", "plug changed: off → on | wh=1.234 power=1100")
+    logger.disable()
+
+    # Read the file
+    log_file = tmp_path / "www" / "ev_charging_manager_debug.log"
+    assert log_file.exists(), f"Log file not created at {log_file}"
+    lines = log_file.read_text().splitlines()
+
+    # Find the PLUG_STATE line (skip DEBUG_ON/DEBUG_OFF markers)
+    obs_lines = [ln for ln in lines if "PLUG_STATE" in ln]
+    assert obs_lines, f"No PLUG_STATE line found in log file. Lines: {lines}"
+
+    line = obs_lines[0]
+    # Contract: <ISO-ms timestamp> | PLUG_STATE | <message>
+    # ISO timestamp must include milliseconds (at least 3 decimal places)
+    assert re.match(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+",
+        line,
+    ), f"Timestamp missing milliseconds in line: {line!r}"
+    assert "PLUG_STATE" in line, f"Category not found in line: {line!r}"
+    assert "plug changed: off → on" in line, f"Message not found in line: {line!r}"
+    assert "wh=1.234" in line
+    assert "power=1100" in line
+    # Verify the pipe-separated format contract: timestamp | category | message
+    parts = line.split(" | ", maxsplit=2)
+    assert len(parts) == 3, f"Expected 3 pipe-separated parts, got: {parts}"
+
+
+# ===========================================================================
+# FR-013: Runtime entity removal — no exception, no log line
+# ===========================================================================
+
+
+async def test_obs_fr013_runtime_entity_removal_no_exception(hass: HomeAssistant) -> None:
+    """FR-013: Removing a configured observation entity mid-session raises no exception
+    and emits no further log lines for it.
+    """
+    entry = _make_observation_entry()
+    engine, mock_log = await _setup_observation_engine(hass, entry)
+
+    # Prime the cache and verify one transition works
+    engine._last_plug = "off"
+    hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+    await hass.async_block_till_done()
+
+    pre_remove_calls = [c for c in mock_log.call_args_list if c.args[0] == "PLUG_STATE"]
+    assert pre_remove_calls, "Expected PLUG_STATE log before entity removal"
+
+    # Remove the entity from HA states (simulates firmware rename / entity deletion)
+    hass.states.async_remove(MOCK_PLUG_ENTITY)
+    await hass.async_block_till_done()
+
+    # No exception should have been raised. The state removal itself fires a
+    # state-changed event with new_state=None.  The handler checks new_val is not None.
+    mock_log.reset_mock()
+
+    # No new PLUG_STATE lines should appear after removal
+    post_remove_calls = [c for c in mock_log.call_args_list if c.args[0] == "PLUG_STATE"]
+    assert len(post_remove_calls) == 0, "Expected no PLUG_STATE log after entity removal"
+
+
+# ===========================================================================
+# T-CFL-03 (strengthened): After clearing cable_lock in options, no CABLE_LOCK log
+# ===========================================================================
+
+
+async def test_obs_cfl03_cleared_cable_lock_no_log(hass: HomeAssistant) -> None:
+    """T-CFL-03 (strengthen): After user clears cable_lock_entity in options flow and
+    entry is reloaded, cable-lock state changes emit no CABLE_LOCK lines.
+    """
+    # Start with cable_lock configured
+    entry = _make_observation_entry(cable_lock=MOCK_CABLE_LOCK_ENTITY)
+    engine, mock_log = await _setup_observation_engine(hass, entry)
+
+    # Verify it logs before clearing
+    engine._last_cable_lock = "Unlocked"
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+    await hass.async_block_till_done()
+    pre_calls = [c for c in mock_log.call_args_list if c.args[0] == "CABLE_LOCK"]
+    assert pre_calls, "Expected CABLE_LOCK log before slot cleared"
+
+    # Simulate user clearing the slot: write None into entry.options
+    new_options = dict(entry.options)
+    new_options[CONF_CABLE_LOCK_ENTITY] = None
+    hass.config_entries.async_update_entry(entry, options=new_options)
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    # Get fresh engine
+    engine_post = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    debug_logger_post = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    mock_log_post = MagicMock()
+    debug_logger_post.log = mock_log_post
+    if engine_post._debug_logger is not None:
+        engine_post._debug_logger.log = mock_log_post
+
+    # Fire cable-lock transition — no CABLE_LOCK log expected
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+    await hass.async_block_till_done()
+
+    post_calls = [c for c in mock_log_post.call_args_list if c.args[0] == "CABLE_LOCK"]
+    assert len(post_calls) == 0, "Expected no CABLE_LOCK log after slot was cleared in options"

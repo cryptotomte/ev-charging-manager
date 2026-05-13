@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+
+import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -656,3 +659,71 @@ async def test_mig_04_generic_profile_no_observation_migration(
     assert loaded.options.get(CONF_CABLE_LOCK_ENTITY) is None
     assert loaded.options.get(CONF_MODEL_STATUS_ENTITY) is None
     assert loaded.options.get(CONF_ERROR_ENTITY) is None
+
+
+async def test_mig_05_migration_idempotent_on_second_setup(
+    hass: HomeAssistant,
+) -> None:
+    """T-MIG-05: Running migration twice (setup → unload → setup) leaves options unchanged."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_serial": "xyz99"},
+        options={"min_session_duration_s": 60},
+        title="Idempotency Test",
+    )
+    await setup_entry_with_subentries(hass, entry)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    options_after_first_setup = dict(loaded.options)
+
+    # Unload then reload (second migration run)
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    options_after_second_setup = dict(loaded.options)
+
+    assert options_after_second_setup == options_after_first_setup, (
+        "Migration must be idempotent: options must not change on second setup. "
+        f"First: {options_after_first_setup}, Second: {options_after_second_setup}"
+    )
+
+
+async def test_mig_06_missing_serial_slots_unset(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-MIG-06: go-e entry missing charger_serial skips observation slots and warns."""
+    # go-e gemini entry without serial
+    data_no_serial = {k: v for k, v in MOCK_CHARGER_DATA.items() if k != "charger_serial"}
+    data_no_serial["charger_profile"] = "goe_gemini"
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=data_no_serial,
+        options={},
+        title="No Serial Charger",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.ev_charging_manager"):
+        await setup_entry_with_subentries(hass, entry)
+
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+
+    # Slots must NOT be populated with placeholder strings
+    for key in (
+        CONF_PLUG_ENTITY,
+        CONF_CABLE_LOCK_ENTITY,
+        CONF_MODEL_STATUS_ENTITY,
+        CONF_ERROR_ENTITY,
+    ):
+        val = loaded.options.get(key)
+        assert val is None or "{serial}" not in str(val), (
+            f"Slot {key} must not contain literal '{{serial}}', got: {val!r}"
+        )
+
+    # Warning must have been emitted
+    assert any(
+        "charger serial missing" in r.message or "skipped" in r.message for r in caplog.records
+    ), "Expected warning about missing charger serial"

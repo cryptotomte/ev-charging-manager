@@ -1356,7 +1356,8 @@ class SessionEngine:
         if new_value == before:
             return
 
-        # Defense in depth: even if generic dedup loosens later, -none- → -none- must stay suppressed.
+        # Defense in depth: even if generic dedup loosens later, -none- → -none- must stay
+        # suppressed.
         if category == "ERR_STATE" and before == "-none-" and new_value == "-none-":
             return
 

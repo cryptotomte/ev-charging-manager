@@ -6,10 +6,14 @@ from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ev_charging_manager.const import (
+    CONF_CABLE_LOCK_ENTITY,
+    CONF_ERROR_ENTITY,
     CONF_MAX_STORED_SESSIONS,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
+    CONF_MODEL_STATUS_ENTITY,
     CONF_PERSISTENCE_INTERVAL_S,
+    CONF_PLUG_ENTITY,
     CONF_PRICING_MODE,
     CONF_SPOT_ADDITIONAL_COST_KWH,
     CONF_SPOT_FALLBACK_PRICE_KWH,
@@ -274,3 +278,127 @@ async def test_options_flow_spot_non_numeric_entity_shows_error(hass: HomeAssist
     assert result["type"] == "form"
     assert result["step_id"] == "pricing"
     assert result["errors"][CONF_SPOT_PRICE_ENTITY] == "entity_invalid"
+
+
+# ---------------------------------------------------------------------------
+# T-CFL-02 (PR-20): Options flow init step shows four observation entity fields
+# ---------------------------------------------------------------------------
+
+
+async def test_options_flow_shows_observation_entity_fields(hass: HomeAssistant) -> None:
+    """T-CFL-02: Options flow init step exposes four observation slots pre-filled."""
+    plug = "binary_sensor.goe_abc123_car_0"
+    cable_lock = "sensor.goe_abc123_cus_value"
+    model_status = "sensor.goe_abc123_modelstatus_value"
+    error = "sensor.goe_abc123_err_value"
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={
+            CONF_PLUG_ENTITY: plug,
+            CONF_CABLE_LOCK_ENTITY: cable_lock,
+            CONF_MODEL_STATUS_ENTITY: model_status,
+            CONF_ERROR_ENTITY: error,
+        },
+        title="Test Charger",
+    )
+    await setup_session_engine(hass, entry)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert result["type"] == "form"
+    assert result["step_id"] == "init"
+
+    # Verify the four observation fields are in the schema
+    schema_keys = [str(k) for k in result["data_schema"].schema]
+    assert CONF_PLUG_ENTITY in schema_keys, "Options init must contain plug_entity field"
+    assert CONF_CABLE_LOCK_ENTITY in schema_keys, (
+        "Options init must contain cable_lock_entity field"
+    )
+    assert CONF_MODEL_STATUS_ENTITY in schema_keys, (
+        "Options init must contain model_status_entity field"
+    )
+    assert CONF_ERROR_ENTITY in schema_keys, "Options init must contain error_entity field"
+
+    # Verify suggested values are pre-filled from current options
+    suggested = {
+        str(k): k.description.get("suggested_value")
+        for k in result["data_schema"].schema
+        if hasattr(k, "description") and isinstance(k.description, dict)
+    }
+    assert suggested.get(CONF_PLUG_ENTITY) == plug
+    assert suggested.get(CONF_CABLE_LOCK_ENTITY) == cable_lock
+    assert suggested.get(CONF_MODEL_STATUS_ENTITY) == model_status
+    assert suggested.get(CONF_ERROR_ENTITY) == error
+
+
+# ---------------------------------------------------------------------------
+# T-CFL-03 (PR-20): Clearing one observation slot persists None, engine skips it
+# ---------------------------------------------------------------------------
+
+
+async def test_options_flow_clearing_observation_slot_persists_none(
+    hass: HomeAssistant,
+) -> None:
+    """T-CFL-03: Clearing cable_lock_entity in options persists None; no listener registered."""
+
+    plug = "binary_sensor.goe_abc123_car_0"
+    cable_lock = "sensor.goe_abc123_cus_value"
+    model_status = "sensor.goe_abc123_modelstatus_value"
+    error = "sensor.goe_abc123_err_value"
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={
+            CONF_PLUG_ENTITY: plug,
+            CONF_CABLE_LOCK_ENTITY: cable_lock,
+            CONF_MODEL_STATUS_ENTITY: model_status,
+            CONF_ERROR_ENTITY: error,
+        },
+        title="Test Charger",
+    )
+    await setup_session_engine(hass, entry)
+
+    # Open options flow
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    # Submit init step with cable_lock cleared (empty string → should persist as None)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
+            CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
+            CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
+            CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
+            CONF_PLUG_ENTITY: plug,
+            # CONF_CABLE_LOCK_ENTITY not submitted (cleared)
+            CONF_MODEL_STATUS_ENTITY: model_status,
+            CONF_ERROR_ENTITY: error,
+        },
+    )
+    assert result["step_id"] == "pricing"
+
+    # Submit pricing step
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_PRICING_MODE: "static",
+            CONF_STATIC_PRICE_KWH: DEFAULT_STATIC_PRICE_KWH,
+        },
+    )
+    await hass.async_block_till_done()
+    assert result["type"] == "create_entry"
+
+    # Verify cable_lock_entity is None or absent in saved options
+    refreshed = hass.config_entries.async_get_entry(entry.entry_id)
+    cable_lock_val = refreshed.options.get(CONF_CABLE_LOCK_ENTITY)
+    assert cable_lock_val in (None, ""), (
+        f"cable_lock_entity should be None after clearing, got: {cable_lock_val!r}"
+    )
+
+    # Verify the other three are still present
+    assert refreshed.options.get(CONF_PLUG_ENTITY) == plug
+    assert refreshed.options.get(CONF_MODEL_STATUS_ENTITY) == model_status
+    assert refreshed.options.get(CONF_ERROR_ENTITY) == error

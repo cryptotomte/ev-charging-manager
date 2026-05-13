@@ -94,6 +94,10 @@
                     "persistence_interval_s": "Auto-save interval (seconds)",
                     "max_stored_sessions": "Maximum stored sessions",
                     "eto_entity": "Charger total energy counter sensor",
+                    "plug_entity": "Plug-connected binary sensor",
+                    "cable_lock_entity": "Cable lock sensor",
+                    "model_status_entity": "Charger model-status sensor",
+                    "error_entity": "Charger error sensor",
                     "debug_logging": "Enable debug logging"
                 },
                 "data_description": {
@@ -102,6 +106,10 @@
                     "persistence_interval_s": "How often an active session is saved to disk in case of HA restart (60–3600 s, default 300)",
                     "max_stored_sessions": "Oldest sessions are pruned when this limit is exceeded (100–10000, default 1000)",
                     "eto_entity": "Optional. Used to cross-validate tracked session energy against the charger''s cumulative energy counter at session start and end. A warning is logged if deviation exceeds 5%.",
+                    "plug_entity": "Optional. Binary sensor reporting plug-connected state (e.g. binary_sensor.goe_123456_car_0). Used for PLUG_STATE observation logging.",
+                    "cable_lock_entity": "Optional. Sensor reporting cable lock status (e.g. sensor.goe_123456_cus_value). Used for CABLE_LOCK observation logging.",
+                    "model_status_entity": "Optional. Sensor reporting charger model status (e.g. sensor.goe_123456_modelstatus_value). Used for MODEL_STATUS observation logging.",
+                    "error_entity": "Optional. Sensor reporting charger error code (e.g. sensor.goe_123456_err_value). Used for ERR_STATE observation logging.",
                     "debug_logging": "Write charging events to www/ev_charging_manager_debug.log for diagnostics. Disable when investigation is complete."
                 }
             },

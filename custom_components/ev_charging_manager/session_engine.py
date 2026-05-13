@@ -13,13 +13,17 @@ from homeassistant.helpers.event import async_track_state_change_event, async_tr
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_CABLE_LOCK_ENTITY,
     CONF_CAR_STATUS_CHARGING_VALUE,
     CONF_CAR_STATUS_ENTITY,
     CONF_CHARGER_NAME,
     CONF_ENERGY_ENTITY,
+    CONF_ERROR_ENTITY,
     CONF_ETO_ENTITY,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
+    CONF_MODEL_STATUS_ENTITY,
+    CONF_PLUG_ENTITY,
     CONF_POWER_ENTITY,
     CONF_RFID_ENTITY,
     CONF_RFID_UID_ENTITY,
@@ -97,18 +101,27 @@ class SessionEngine:
         self._state = SessionEngineState.IDLE
         self._active_session: Session | None = None
 
-        # Cached last valid values — kept during transient unavailability
-        self._last_energy_kwh: float = 0.0
-        self._last_power_w: float = 0.0
+        # Cached last valid values — kept during transient unavailability.
+        # None means "never set"; 0.0 is a legitimate reading and must render as 0.000.
+        self._last_energy_kwh: float | None = None
+        self._last_power_w: float | None = None
         self._last_trx: str | int | None = None
 
-        # Last known car_value — used for CAR_STATE change detection (PR-010)
+        # Last known car_value — used for CAR_STATE change detection
         self._last_car_status: str | None = None
+
+        # Last logged values for each observation category.
+        # Used for duplicate-transition suppression and as the "before" value
+        # in each emitted log line.  Primed in async_setup from current HA state.
+        self._last_plug: str | None = None
+        self._last_cable_lock: str | None = None
+        self._last_model_status: str | None = None
+        self._last_err: str | None = None
         # Gate flag: True when a session has just ended and a balancing cycle must be
         # blocked until car_status transitions to "Idle" or "Wait for car" (PR-013)
         self._awaiting_reset: bool = False
 
-        # PR-019: Promotion mechanism baseline fields.
+        # Promotion mechanism baseline fields.
         # _gate_charging_started_at: wall-clock time when car_status most recently
         #   transitioned to "Charging" while the gate was engaged (H1 baseline).
         # _gate_engaged_energy_kwh: energy reading (kWh) at gate engagement time (H2 baseline).
@@ -436,7 +449,9 @@ class SessionEngine:
     def async_setup(self) -> None:
         """Register state change listeners for all configured charger entities.
 
-        All listeners are unsubscribed on entry unload via entry.async_on_unload().
+        Includes the four optional observation entity slots read from
+        entry.options.  All listeners share a single callback and are
+        unsubscribed on entry unload via entry.async_on_unload().
         """
         entry = self._entry
         car_status_entity = entry.data.get(CONF_CAR_STATUS_ENTITY)
@@ -446,6 +461,19 @@ class SessionEngine:
 
         # Collect all entity IDs we need to watch
         watched = [e for e in [car_status_entity, rfid_entity, energy_entity, power_entity] if e]
+
+        # Add optional observation entities from entry.options.
+        # These are stored in options (not data) so users can edit them later.
+        # Do NOT add a duplicate listener for rfid_entity — it is already in watched.
+        for conf_key in (
+            CONF_PLUG_ENTITY,
+            CONF_CABLE_LOCK_ENTITY,
+            CONF_MODEL_STATUS_ENTITY,
+            CONF_ERROR_ENTITY,
+        ):
+            obs_entity = entry.options.get(conf_key)
+            if obs_entity:
+                watched.append(obs_entity)
 
         if not watched:
             _LOGGER.warning("SessionEngine: no charger entities configured, engine inactive")
@@ -458,6 +486,29 @@ class SessionEngine:
         )
         entry.async_on_unload(unsub)
         _LOGGER.debug("SessionEngine registered listeners for: %s", watched)
+
+        # Prime observation signal caches with the current HA state so the first
+        # real transition logs the actual before/after instead of None → <value>.
+        _obs_attr_map = {
+            entry.options.get(CONF_PLUG_ENTITY): "_last_plug",
+            entry.options.get(CONF_CABLE_LOCK_ENTITY): "_last_cable_lock",
+            entry.options.get(CONF_MODEL_STATUS_ENTITY): "_last_model_status",
+            entry.options.get(CONF_ERROR_ENTITY): "_last_err",
+            entry.data.get(CONF_RFID_ENTITY): "_last_trx",
+        }
+        for entity_id, attr_name in _obs_attr_map.items():
+            if not entity_id:
+                continue
+            state = self._hass.states.get(entity_id)
+            if state is None:
+                _LOGGER.warning(
+                    "Observation entity %s is not registered — "
+                    "observation logging for this slot is inactive",
+                    entity_id,
+                )
+                continue
+            if state.state not in _INVALID_STATES:
+                setattr(self, attr_name, state.state)
 
     def _is_valid_state(self, state_val: str | None) -> bool:
         """Return True if state value is a valid (non-unavailable) value."""
@@ -546,25 +597,68 @@ class SessionEngine:
     @callback
     def _async_on_state_change(self, event: Event) -> None:
         """Handle any state change on a watched entity."""
-        # Track car_value changes for diagnostics and gate management (PR-010/013)
+        entity_id = event.data.get("entity_id")
+        new_state = event.data.get("new_state")
+        new_val = new_state.state if new_state else None
+
+        # Observation-only branch: if the changed entity is one of the four optional
+        # observation slots or the RFID/trx entity, emit the debug log line and
+        # return BEFORE the session-lifecycle dispatch.  This early return is the
+        # safety net — observation events must never influence session-start,
+        # session-stop, or the balancing gate.
+        entry = self._entry
+        plug_entity = entry.options.get(CONF_PLUG_ENTITY)
+        cable_lock_entity = entry.options.get(CONF_CABLE_LOCK_ENTITY)
+        model_status_entity = entry.options.get(CONF_MODEL_STATUS_ENTITY)
+        error_entity = entry.options.get(CONF_ERROR_ENTITY)
+        rfid_entity = entry.data.get(CONF_RFID_ENTITY)
+
+        if entity_id == plug_entity and plug_entity:
+            if new_val is not None:
+                self._handle_observation_change("PLUG_STATE", "plug", "_last_plug", new_val)
+            return
+
+        if entity_id == cable_lock_entity and cable_lock_entity:
+            if new_val is not None:
+                self._handle_observation_change("CABLE_LOCK", "cus", "_last_cable_lock", new_val)
+            return
+
+        if entity_id == model_status_entity and model_status_entity:
+            if new_val is not None:
+                self._handle_observation_change(
+                    "MODEL_STATUS", "modelstatus", "_last_model_status", new_val
+                )
+            return
+
+        if entity_id == error_entity and error_entity:
+            if new_val is not None:
+                self._handle_observation_change("ERR_STATE", "err", "_last_err", new_val)
+            return
+
+        # TRX_STATE: the RFID/trx entity already has a listener for session lifecycle.
+        # Emit TRX_STATE log here (observation) but do NOT return — the existing
+        # session-lifecycle dispatch still runs below for this entity.
+        if entity_id == rfid_entity and rfid_entity and new_val is not None:
+            self._handle_observation_change(
+                "TRX_STATE",
+                "trx",
+                "_last_trx",
+                new_val,
+            )
+            # (Fall through to existing car-state + session-lifecycle handlers)
+
+        # Track car_value changes for diagnostics and gate management
         car_status_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
-        if event.data.get("entity_id") == car_status_entity:
-            new_state = event.data.get("new_state")
-            new_val = new_state.state if new_state else None
-            if new_val not in _INVALID_STATES and new_val != self._last_car_status:
-                if self._debug_logger:
-                    self._debug_logger.log(
-                        "CAR_STATE",
-                        f"car_value changed: {self._last_car_status} \u2192 {new_val}",
-                    )
-            elif new_val in _INVALID_STATES:
-                # Log transitions to invalid states (unknown/unavailable) for diagnostics.
-                # Do NOT update _last_car_status — keep the last known valid value.
-                if self._debug_logger:
-                    self._debug_logger.log(
-                        "CAR_STATE",
-                        f"car_value changed: {self._last_car_status} \u2192 {new_val}",
-                    )
+        if entity_id == car_status_entity:
+            # Emit on any change. _last_car_status is only ever updated to valid
+            # values (guard below), so transitions to invalid states (unknown /
+            # unavailable) still log without polluting the cached "before" value.
+            if new_val != self._last_car_status and self._debug_logger:
+                self._debug_logger.log(
+                    "CAR_STATE",
+                    f"car_value changed: {self._last_car_status} \u2192 {new_val}"
+                    f"{self._format_signal_snapshot()}",
+                )
             if new_val and new_val not in _INVALID_STATES:
                 prev_status = self._last_car_status
                 self._last_car_status = new_val
@@ -657,7 +751,8 @@ class SessionEngine:
             if self._debug_logger:
                 self._debug_logger.log(
                     "CAR_STATE_UNAVAIL",
-                    "car_status sensor unavailable during active session — keeping session alive",
+                    "car_status sensor unavailable during active session — keeping session alive"
+                    f"{self._format_signal_snapshot()}",
                 )
         else:
             charging_value = self._entry.data.get(
@@ -678,7 +773,7 @@ class SessionEngine:
                 _LOGGER.warning(
                     "Energy entity unavailable during active session — "
                     "keeping last value %.3f kWh, flagging data gap",
-                    self._last_energy_kwh,
+                    self._last_energy_kwh or 0.0,
                 )
         else:
             self._last_energy_kwh = energy
@@ -690,7 +785,7 @@ class SessionEngine:
         # Update active session metrics
         if self._active_session is not None:
             session = self._active_session
-            current_energy = self._last_energy_kwh - session.energy_start_kwh
+            current_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
             session.energy_kwh = max(0.0, current_energy)
 
             # Mode-aware cost calculation
@@ -704,7 +799,7 @@ class SessionEngine:
                 partial_detail = self._pricing.calculate_spot_hour(partial_kwh, spot_price)
                 session.cost_total_kr = round(completed_cost + partial_detail["cost_kr"], 4)
 
-            session.max_power_w = max(session.max_power_w, self._last_power_w)
+            session.max_power_w = max(session.max_power_w, self._last_power_w or 0.0)
 
             # Update real-time guest charge price (PR-06)
             if self._guest_pricing is not None:
@@ -718,7 +813,7 @@ class SessionEngine:
             _LOGGER.debug(
                 "Session update: energy=%.3f kWh, power=%.0f W, cost=%.2f kr",
                 session.energy_kwh,
-                self._last_power_w,
+                self._last_power_w or 0.0,
                 session.cost_total_kr,
             )
 
@@ -732,7 +827,7 @@ class SessionEngine:
             return
 
         session = self._active_session
-        current_relative_energy = self._last_energy_kwh - session.energy_start_kwh
+        current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
         kwh_this_hour = max(0.0, current_relative_energy - self._hour_energy_snapshot)
         spot_price = self._read_spot_price()
 
@@ -921,7 +1016,7 @@ class SessionEngine:
             self._hourly_unsub()
             self._hourly_unsub = None
 
-            current_relative_energy = self._last_energy_kwh - session.energy_start_kwh
+            current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
             kwh_final = max(0.0, current_relative_energy - self._hour_energy_snapshot)
             spot_price = self._read_spot_price()
 
@@ -1186,6 +1281,89 @@ class SessionEngine:
             f"gate cleared after {self._gate_skipped_count} suppressed events "
             f"— trigger={trigger_state}",
         )
+
+    # ---------------------------------------------------------------------------
+
+    # ---------------------------------------------------------------------------
+    # Observation logging helpers
+    # ---------------------------------------------------------------------------
+
+    def _format_signal_snapshot(self) -> str:
+        """Return ' | wh=<v> power=<v>' suffix for observation log lines.
+
+        Three-step fallback per value:
+          1. Live read from entity state.
+          2. Cached _last_energy_kwh / _last_power_w (when not None, including 0.0).
+          3. '?' placeholder when no value is available (cache is None).
+
+        Format: wh with 3 decimal places, power as integer.
+        """
+        # Energy value
+        live_energy = self._get_energy()
+        if live_energy is not None:
+            wh_str = f"{live_energy:.3f}"
+        elif self._last_energy_kwh is not None:
+            wh_str = f"{self._last_energy_kwh:.3f}"
+        else:
+            wh_str = "?"
+
+        # Power value
+        live_power = self._get_power()
+        if live_power is not None:
+            power_str = str(int(live_power))
+        elif self._last_power_w is not None:
+            power_str = str(int(self._last_power_w))
+        else:
+            power_str = "?"
+
+        return f" | wh={wh_str} power={power_str}"
+
+    def _handle_observation_change(
+        self,
+        category: str,
+        signal_token: str,
+        last_attr_name: str,
+        new_value: str | int | None,
+    ) -> None:
+        """Emit a debug log line for one observation-category signal transition.
+
+        Called from _async_on_state_change when the changed entity matches one
+        of the four optional observation slots or the RFID/trx entity.
+
+        Suppression rules:
+          - Skip emission when new_value == cached (same-value refresh).
+          - Additionally skip ERR_STATE when both old and new value are '-none-'.
+          - When new_value is in _INVALID_STATES: emit one diagnostic log line
+            but do NOT update the cache — keeps last-known-good as "before"
+            for the next real transition.
+
+        The cache field (last_attr_name) is updated ONLY on real, valid transitions.
+        """
+        # Guard: no debug logger or logging disabled
+        if self._debug_logger is None or not self._debug_logger.enabled:
+            return
+
+        before = getattr(self, last_attr_name)
+
+        # Suppress duplicate same-value transitions
+        if new_value == before:
+            return
+
+        # Defense in depth: even if generic dedup loosens later, -none- → -none- must stay
+        # suppressed.
+        if category == "ERR_STATE" and before == "-none-" and new_value == "-none-":
+            return
+
+        # Emit the log line — always, including transitions to invalid states (informative)
+        self._debug_logger.log(
+            category,
+            f"{signal_token} changed: {before} → {new_value}{self._format_signal_snapshot()}",
+        )
+
+        # Update cache ONLY on valid transitions — transient unavailability must not
+        # pollute the "before" value shown on the next real transition.
+        if new_value not in _INVALID_STATES:
+            setattr(self, last_attr_name, new_value)
 
     # ---------------------------------------------------------------------------
 

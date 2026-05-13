@@ -123,6 +123,13 @@ PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
 # Cross-validation: total energy counter entity (PR-07)
 CONF_ETO_ENTITY = "eto_entity"
 
+# Observation entity slots (PR-20): four optional charger-signal entities stored
+# in entry.options.  Auto-populated for goe_gemini profile; None on generic.
+CONF_PLUG_ENTITY = "plug_entity"
+CONF_CABLE_LOCK_ENTITY = "cable_lock_entity"
+CONF_MODEL_STATUS_ENTITY = "model_status_entity"
+CONF_ERROR_ENTITY = "error_entity"
+
 # Unknown session diagnostic reason codes (PR-07)
 UNKNOWN_REASON_TRX_NULL = "trx_was_null"
 UNKNOWN_REASON_TRX_ZERO = "trx_was_zero"

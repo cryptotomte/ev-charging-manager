@@ -489,6 +489,29 @@ class SessionEngine:
         entry.async_on_unload(unsub)
         _LOGGER.debug("SessionEngine registered listeners for: %s", watched)
 
+        # Prime observation signal caches with the current HA state so the first
+        # real transition logs the actual before/after instead of None → <value>.
+        _obs_attr_map = {
+            entry.options.get(CONF_PLUG_ENTITY): "_last_plug",
+            entry.options.get(CONF_CABLE_LOCK_ENTITY): "_last_cable_lock",
+            entry.options.get(CONF_MODEL_STATUS_ENTITY): "_last_model_status",
+            entry.options.get(CONF_ERROR_ENTITY): "_last_err",
+            entry.data.get(CONF_RFID_ENTITY): "_last_trx",
+        }
+        for entity_id, attr_name in _obs_attr_map.items():
+            if not entity_id:
+                continue
+            state = self._hass.states.get(entity_id)
+            if state is None:
+                _LOGGER.warning(
+                    "Observation entity %s is not registered — "
+                    "observation logging for this slot is inactive",
+                    entity_id,
+                )
+                continue
+            if state.state not in _INVALID_STATES:
+                setattr(self, attr_name, state.state)
+
     def _is_valid_state(self, state_val: str | None) -> bool:
         """Return True if state value is a valid (non-unavailable) value."""
         return state_val not in _INVALID_STATES

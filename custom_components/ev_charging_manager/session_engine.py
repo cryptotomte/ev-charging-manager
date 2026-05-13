@@ -15,11 +15,15 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_CAR_STATUS_CHARGING_VALUE,
     CONF_CAR_STATUS_ENTITY,
+    CONF_CABLE_LOCK_ENTITY,
     CONF_CHARGER_NAME,
     CONF_ENERGY_ENTITY,
+    CONF_ERROR_ENTITY,
     CONF_ETO_ENTITY,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
+    CONF_MODEL_STATUS_ENTITY,
+    CONF_PLUG_ENTITY,
     CONF_POWER_ENTITY,
     CONF_RFID_ENTITY,
     CONF_RFID_UID_ENTITY,
@@ -104,6 +108,16 @@ class SessionEngine:
 
         # Last known car_value — used for CAR_STATE change detection (PR-010)
         self._last_car_status: str | None = None
+
+        # PR-20: Last logged values for each observation category.
+        # Used for duplicate-transition suppression (FR-009) and as the
+        # "before" value in each emitted log line.  All reset to None on
+        # every SessionEngine.__init__ (first post-load transition is
+        # logged as None → <value>).
+        self._last_plug: str | None = None
+        self._last_cable_lock: str | None = None
+        self._last_model_status: str | None = None
+        self._last_err: str | None = None
         # Gate flag: True when a session has just ended and a balancing cycle must be
         # blocked until car_status transitions to "Idle" or "Wait for car" (PR-013)
         self._awaiting_reset: bool = False
@@ -436,7 +450,9 @@ class SessionEngine:
     def async_setup(self) -> None:
         """Register state change listeners for all configured charger entities.
 
-        All listeners are unsubscribed on entry unload via entry.async_on_unload().
+        Includes the four optional PR-20 observation entity slots read from
+        entry.options.  All listeners share a single callback and are
+        unsubscribed on entry unload via entry.async_on_unload().
         """
         entry = self._entry
         car_status_entity = entry.data.get(CONF_CAR_STATUS_ENTITY)
@@ -446,6 +462,19 @@ class SessionEngine:
 
         # Collect all entity IDs we need to watch
         watched = [e for e in [car_status_entity, rfid_entity, energy_entity, power_entity] if e]
+
+        # PR-20: Add optional observation entities from entry.options.
+        # These are stored in options (not data) so users can edit them later.
+        # Do NOT add a duplicate listener for rfid_entity — it is already in watched.
+        for conf_key in (
+            CONF_PLUG_ENTITY,
+            CONF_CABLE_LOCK_ENTITY,
+            CONF_MODEL_STATUS_ENTITY,
+            CONF_ERROR_ENTITY,
+        ):
+            obs_entity = entry.options.get(conf_key)
+            if obs_entity:
+                watched.append(obs_entity)
 
         if not watched:
             _LOGGER.warning("SessionEngine: no charger entities configured, engine inactive")
@@ -546,24 +575,75 @@ class SessionEngine:
     @callback
     def _async_on_state_change(self, event: Event) -> None:
         """Handle any state change on a watched entity."""
+        entity_id = event.data.get("entity_id")
+        new_state = event.data.get("new_state")
+        new_val = new_state.state if new_state else None
+
+        # PR-20: Observation-only branch.  If the changed entity is one of the
+        # four optional observation slots OR the RFID/trx entity (TRX_STATE),
+        # emit the debug log line and return BEFORE the session-lifecycle dispatch.
+        # This early return is the FR-011 safety net — observation events can
+        # never influence session-start, session-stop, or the balancing gate.
+        entry = self._entry
+        plug_entity = entry.options.get(CONF_PLUG_ENTITY)
+        cable_lock_entity = entry.options.get(CONF_CABLE_LOCK_ENTITY)
+        model_status_entity = entry.options.get(CONF_MODEL_STATUS_ENTITY)
+        error_entity = entry.options.get(CONF_ERROR_ENTITY)
+        rfid_entity = entry.data.get(CONF_RFID_ENTITY)
+
+        if entity_id == plug_entity and plug_entity:
+            if new_val is not None:
+                self._handle_observation_change("PLUG_STATE", "plug", "_last_plug", new_val)
+            return
+
+        if entity_id == cable_lock_entity and cable_lock_entity:
+            if new_val is not None:
+                self._handle_observation_change(
+                    "CABLE_LOCK", "cus", "_last_cable_lock", new_val
+                )
+            return
+
+        if entity_id == model_status_entity and model_status_entity:
+            if new_val is not None:
+                self._handle_observation_change(
+                    "MODEL_STATUS", "modelstatus", "_last_model_status", new_val
+                )
+            return
+
+        if entity_id == error_entity and error_entity:
+            if new_val is not None:
+                self._handle_observation_change("ERR_STATE", "err", "_last_err", new_val)
+            return
+
+        # TRX_STATE: the RFID/trx entity already has a listener for session lifecycle.
+        # Emit TRX_STATE log here (observation) but do NOT return — the existing
+        # session-lifecycle dispatch still runs below for this entity.
+        if entity_id == rfid_entity and rfid_entity and new_val is not None:
+            self._handle_observation_change(
+                "TRX_STATE", "trx", "_last_trx", new_val  # type: ignore[arg-type]
+            )
+            # (Fall through to existing car-state + session-lifecycle handlers)
+
         # Track car_value changes for diagnostics and gate management (PR-010/013)
         car_status_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
-        if event.data.get("entity_id") == car_status_entity:
-            new_state = event.data.get("new_state")
-            new_val = new_state.state if new_state else None
+        if entity_id == car_status_entity:
+            # new_val already extracted at top of method
             if new_val not in _INVALID_STATES and new_val != self._last_car_status:
                 if self._debug_logger:
+                    # FR-007 (PR-20): append energy+power snapshot suffix to CAR_STATE lines
                     self._debug_logger.log(
                         "CAR_STATE",
-                        f"car_value changed: {self._last_car_status} \u2192 {new_val}",
+                        f"car_value changed: {self._last_car_status} \u2192 {new_val}"
+                        f"{self._format_signal_snapshot()}",
                     )
             elif new_val in _INVALID_STATES:
                 # Log transitions to invalid states (unknown/unavailable) for diagnostics.
-                # Do NOT update _last_car_status — keep the last known valid value.
+                # Do NOT update _last_car_status -- keep the last known valid value.
                 if self._debug_logger:
                     self._debug_logger.log(
                         "CAR_STATE",
-                        f"car_value changed: {self._last_car_status} \u2192 {new_val}",
+                        f"car_value changed: {self._last_car_status} \u2192 {new_val}"
+                        f"{self._format_signal_snapshot()}",
                     )
             if new_val and new_val not in _INVALID_STATES:
                 prev_status = self._last_car_status
@@ -657,7 +737,8 @@ class SessionEngine:
             if self._debug_logger:
                 self._debug_logger.log(
                     "CAR_STATE_UNAVAIL",
-                    "car_status sensor unavailable during active session — keeping session alive",
+                    "car_status sensor unavailable during active session — keeping session alive"
+                    f"{self._format_signal_snapshot()}",
                 )
         else:
             charging_value = self._entry.data.get(
@@ -1186,6 +1267,85 @@ class SessionEngine:
             f"gate cleared after {self._gate_skipped_count} suppressed events "
             f"— trigger={trigger_state}",
         )
+
+    # ---------------------------------------------------------------------------
+
+    # ---------------------------------------------------------------------------
+    # PR-20: Observation logging helpers
+    # ---------------------------------------------------------------------------
+
+    def _format_signal_snapshot(self) -> str:
+        """Return ' | wh=<v> power=<v>' suffix for observation log lines.
+
+        Three-step fallback per value:
+          1. Live read from entity state.
+          2. Cached _last_energy_kwh / _last_power_w (when non-zero).
+          3. '?' placeholder when no value is available.
+
+        Format: wh with 3 decimal places, power as integer.
+        """
+        # Energy value
+        live_energy = self._get_energy()
+        if live_energy is not None:
+            wh_str = f"{live_energy:.3f}"
+        elif self._last_energy_kwh > 0:
+            wh_str = f"{self._last_energy_kwh:.3f}"
+        else:
+            wh_str = "?"
+
+        # Power value
+        live_power = self._get_power()
+        if live_power is not None:
+            power_str = str(int(live_power))
+        elif self._last_power_w > 0:
+            power_str = str(int(self._last_power_w))
+        else:
+            power_str = "?"
+
+        return f" | wh={wh_str} power={power_str}"
+
+    def _handle_observation_change(
+        self,
+        category: str,
+        signal_token: str,
+        last_attr_name: str,
+        new_value: str,
+    ) -> None:
+        """Emit a debug log line for one observation-category signal transition.
+
+        Called from _async_on_state_change when the changed entity matches one
+        of the four optional observation slots or the RFID/trx entity.
+
+        Suppression rules (FR-009, FR-010):
+          - Skip emission when new_value == cached (same-value refresh).
+          - Additionally skip ERR_STATE when both old and new value are '-none-'.
+
+        The cache field (last_attr_name) is updated ONLY on real transitions
+        (not on suppressed duplicates).
+        """
+        # Guard: no debug logger or logging disabled
+        if self._debug_logger is None or not self._debug_logger.enabled:
+            return
+
+        before = getattr(self, last_attr_name)
+
+        # FR-009: Suppress duplicate same-value transitions
+        if new_value == before:
+            return
+
+        # FR-010: Suppress -none- → -none- on error category (defensive; already
+        # covered by the generic guard above, but made explicit for clarity).
+        if category == "ERR_STATE" and before == "-none-" and new_value == "-none-":
+            return
+
+        # Emit the log line
+        self._debug_logger.log(
+            category,
+            f"{signal_token} changed: {before} → {new_value}{self._format_signal_snapshot()}",
+        )
+
+        # Update cache after emission
+        setattr(self, last_attr_name, new_value)
 
     # ---------------------------------------------------------------------------
 

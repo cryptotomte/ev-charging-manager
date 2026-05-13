@@ -8,6 +8,7 @@ from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.ev_charging_manager.charger_profiles import CHARGER_PROFILES
 from custom_components.ev_charging_manager.const import (
+    CONF_CABLE_LOCK_ENTITY,
     CONF_CAR_STATUS_CHARGING_VALUE,
     CONF_CAR_STATUS_ENTITY,
     CONF_CHARGER_HOST,
@@ -16,6 +17,9 @@ from custom_components.ev_charging_manager.const import (
     CONF_CHARGER_SERIAL,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
+    CONF_ERROR_ENTITY,
+    CONF_MODEL_STATUS_ENTITY,
+    CONF_PLUG_ENTITY,
     CONF_POWER_ENTITY,
     CONF_PRICING_MODE,
     CONF_RFID_ENTITY,
@@ -394,3 +398,89 @@ async def test_config_flow_spot_non_numeric_entity_shows_error(hass: HomeAssista
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "spot_config"
     assert result["errors"][CONF_SPOT_PRICE_ENTITY] == "entity_invalid"
+
+
+# ---------------------------------------------------------------------------
+# T-CFL-01 (PR-20): Fresh go-e install auto-populates observation slots
+# ---------------------------------------------------------------------------
+
+
+async def test_config_flow_goe_auto_populates_observation_slots(hass: HomeAssistant) -> None:
+    """T-CFL-01: Fresh go-e install pre-populates four observation slots in entry.options.
+
+    The charger_entities form step must NOT show new form fields for the four
+    observation slots; they are derived from profile + serial at async_create_entry
+    time and written to entry.options.
+    """
+    serial = "123456"
+    hass.states.async_set(f"sensor.goe_{serial}_car_value", "Idle")
+    hass.states.async_set(f"sensor.goe_{serial}_wh", "0.0")
+    hass.states.async_set(f"sensor.goe_{serial}_nrg_11", "0")
+    hass.states.async_set(f"select.goe_{serial}_trx", "null")
+
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_CHARGER_PROFILE: "goe_gemini"},
+    )
+    assert result["step_id"] == "serial"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_CHARGER_SERIAL: serial},
+    )
+    assert result["step_id"] == "charger_entities"
+
+    # Verify the charger_entities form does NOT contain observation entity fields
+    schema_keys = [str(k) for k in result["data_schema"].schema]
+    assert CONF_PLUG_ENTITY not in schema_keys, (
+        "charger_entities form must NOT contain plug_entity field"
+    )
+    assert CONF_CABLE_LOCK_ENTITY not in schema_keys, (
+        "charger_entities form must NOT contain cable_lock_entity field"
+    )
+    assert CONF_MODEL_STATUS_ENTITY not in schema_keys, (
+        "charger_entities form must NOT contain model_status_entity field"
+    )
+    assert CONF_ERROR_ENTITY not in schema_keys, (
+        "charger_entities form must NOT contain error_entity field"
+    )
+
+    # Submit charger entities step
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_CAR_STATUS_ENTITY: f"sensor.goe_{serial}_car_value",
+            CONF_CAR_STATUS_CHARGING_VALUE: "Charging",
+            CONF_ENERGY_ENTITY: f"sensor.goe_{serial}_wh",
+            CONF_ENERGY_UNIT: "kWh",
+            CONF_POWER_ENTITY: f"sensor.goe_{serial}_nrg_11",
+            CONF_RFID_ENTITY: f"select.goe_{serial}_trx",
+            CONF_CHARGER_NAME: "Test Charger",
+            CONF_CHARGER_HOST: "192.168.1.100",
+        },
+    )
+    assert result["step_id"] == "pricing"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50},
+    )
+    assert result["step_id"] == "confirm"
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+    # Verify the observation slots are in entry.options (not entry.data)
+    entry_options = result["options"]
+    assert entry_options.get(CONF_PLUG_ENTITY) == f"binary_sensor.goe_{serial}_car_0"
+    assert entry_options.get(CONF_CABLE_LOCK_ENTITY) == f"sensor.goe_{serial}_cus_value"
+    assert entry_options.get(CONF_MODEL_STATUS_ENTITY) == f"sensor.goe_{serial}_modelstatus_value"
+    assert entry_options.get(CONF_ERROR_ENTITY) == f"sensor.goe_{serial}_err_value"
+
+    # Verify they are NOT in entry.data
+    entry_data = result["data"]
+    assert CONF_PLUG_ENTITY not in entry_data
+    assert CONF_CABLE_LOCK_ENTITY not in entry_data
+    assert CONF_MODEL_STATUS_ENTITY not in entry_data
+    assert CONF_ERROR_ENTITY not in entry_data

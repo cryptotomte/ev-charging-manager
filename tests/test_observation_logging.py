@@ -6,15 +6,13 @@ Test naming follows the plan: T-OBS-01 through T-OBS-16.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ev_charging_manager.const import (
     CONF_CABLE_LOCK_ENTITY,
-    CONF_CAR_STATUS_ENTITY,
     CONF_ERROR_ENTITY,
     CONF_MODEL_STATUS_ENTITY,
     CONF_PLUG_ENTITY,
@@ -31,7 +29,6 @@ from .conftest import (
     MOCK_ENERGY_ENTITY,
     MOCK_POWER_ENTITY,
     MOCK_TRX_ENTITY,
-    setup_session_engine,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,7 +90,6 @@ async def _setup_observation_engine(
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    refreshed_entry = hass.config_entries.async_get_entry(entry.entry_id)
     engine: SessionEngine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
 
     # Mock the debug logger's log method
@@ -125,9 +121,7 @@ async def test_obs_01_plug_state_off_to_on(hass: HomeAssistant) -> None:
     await hass.async_block_till_done()
 
     # Assert PLUG_STATE was logged
-    plug_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"
-    ]
+    plug_calls = [call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"]
     assert plug_calls, "Expected PLUG_STATE log call"
     category, message = plug_calls[-1].args
     assert category == "PLUG_STATE"
@@ -156,9 +150,7 @@ async def test_obs_02_cable_lock_transition(hass: HomeAssistant) -> None:
     hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
     await hass.async_block_till_done()
 
-    cable_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "CABLE_LOCK"
-    ]
+    cable_calls = [call for call in mock_log.call_args_list if call.args[0] == "CABLE_LOCK"]
     assert cable_calls, "Expected CABLE_LOCK log call"
     category, message = cable_calls[-1].args
     assert category == "CABLE_LOCK"
@@ -181,9 +173,7 @@ async def test_obs_03_model_status_verbatim(hass: HomeAssistant) -> None:
     hass.states.async_set(MOCK_MODEL_STATUS_ENTITY, "Charging complete")
     await hass.async_block_till_done()
 
-    status_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "MODEL_STATUS"
-    ]
+    status_calls = [call for call in mock_log.call_args_list if call.args[0] == "MODEL_STATUS"]
     assert status_calls, "Expected MODEL_STATUS log call"
     category, message = status_calls[-1].args
     assert category == "MODEL_STATUS"
@@ -211,9 +201,7 @@ async def test_obs_05_err_state_real_transition(hass: HomeAssistant) -> None:
     hass.states.async_set(MOCK_ERROR_ENTITY, "cable_overheat")
     await hass.async_block_till_done()
 
-    err_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "ERR_STATE"
-    ]
+    err_calls = [call for call in mock_log.call_args_list if call.args[0] == "ERR_STATE"]
     assert err_calls, "Expected ERR_STATE log call"
     category, message = err_calls[-1].args
     assert category == "ERR_STATE"
@@ -237,9 +225,7 @@ async def test_obs_06_trx_state_transition(hass: HomeAssistant) -> None:
     hass.states.async_set(MOCK_TRX_ENTITY, "2")
     await hass.async_block_till_done()
 
-    trx_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "TRX_STATE"
-    ]
+    trx_calls = [call for call in mock_log.call_args_list if call.args[0] == "TRX_STATE"]
     assert trx_calls, "Expected TRX_STATE log call"
     category, message = trx_calls[-1].args
     assert category == "TRX_STATE"
@@ -321,9 +307,7 @@ async def test_obs_14_car_state_has_snapshot_suffix(hass: HomeAssistant) -> None
     hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
     await hass.async_block_till_done()
 
-    car_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "CAR_STATE"
-    ]
+    car_calls = [call for call in mock_log.call_args_list if call.args[0] == "CAR_STATE"]
     assert car_calls, "Expected CAR_STATE log call"
     category, message = car_calls[-1].args
     assert category == "CAR_STATE"
@@ -445,9 +429,7 @@ async def test_obs_13_listeners_unsubscribed_on_unload(hass: HomeAssistant) -> N
     hass.states.async_set(MOCK_PLUG_ENTITY, "on")
     await hass.async_block_till_done()
 
-    plug_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"
-    ]
+    plug_calls = [call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"]
     assert len(plug_calls) == 0, "Expected no PLUG_STATE calls after entry unload"
 
 
@@ -503,9 +485,7 @@ async def test_obs_16_reload_survival(hass: HomeAssistant) -> None:
     hass.states.async_set(MOCK_PLUG_ENTITY, "on")
     await hass.async_block_till_done()
 
-    pre_reload_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"
-    ]
+    pre_reload_calls = [call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"]
     assert len(pre_reload_calls) >= 1, "Expected at least one PLUG_STATE call before reload"
 
     # Reload the entry
@@ -534,7 +514,9 @@ async def test_obs_16_reload_survival(hass: HomeAssistant) -> None:
     post_reload_calls = [
         call for call in mock_log_post.call_args_list if call.args[0] == "PLUG_STATE"
     ]
-    assert len(post_reload_calls) >= 1, "Expected PLUG_STATE calls after reload (listeners re-registered)"
+    assert len(post_reload_calls) >= 1, (
+        "Expected PLUG_STATE calls after reload (listeners re-registered)"
+    )
 
 
 # ===========================================================================
@@ -554,9 +536,7 @@ async def test_obs_04_none_to_none_err_suppressed(hass: HomeAssistant) -> None:
     hass.states.async_set(MOCK_ERROR_ENTITY, "-none-")
     await hass.async_block_till_done()
 
-    err_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "ERR_STATE"
-    ]
+    err_calls = [call for call in mock_log.call_args_list if call.args[0] == "ERR_STATE"]
     assert len(err_calls) == 0, "Expected ERR_STATE to be suppressed for -none- → -none-"
 
 
@@ -577,9 +557,7 @@ async def test_obs_07_duplicate_transition_suppressed(hass: HomeAssistant) -> No
     hass.states.async_set(MOCK_PLUG_ENTITY, "on")
     await hass.async_block_till_done()
 
-    first_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"
-    ]
+    first_calls = [call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"]
     assert len(first_calls) == 1, "Expected exactly one PLUG_STATE call on first transition"
 
     # Second event: on → on (HA refresh, should be suppressed)
@@ -587,9 +565,7 @@ async def test_obs_07_duplicate_transition_suppressed(hass: HomeAssistant) -> No
     hass.states.async_set(MOCK_PLUG_ENTITY, "on")
     await hass.async_block_till_done()
 
-    second_calls = [
-        call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"
-    ]
+    second_calls = [call for call in mock_log.call_args_list if call.args[0] == "PLUG_STATE"]
     assert len(second_calls) == 0, "Expected PLUG_STATE to be suppressed for on → on refresh"
 
 
@@ -645,9 +621,7 @@ async def test_obs_08_debug_off_no_observation_lines(hass: HomeAssistant) -> Non
 
     # No observation calls expected (debug logging is off)
     observation_categories = {"PLUG_STATE", "CABLE_LOCK", "MODEL_STATUS", "ERR_STATE", "TRX_STATE"}
-    obs_calls = [
-        call for call in mock_log.call_args_list if call.args[0] in observation_categories
-    ]
+    obs_calls = [call for call in mock_log.call_args_list if call.args[0] in observation_categories]
     assert len(obs_calls) == 0, (
         f"Expected no observation calls with debug logging disabled, got: {obs_calls}"
     )

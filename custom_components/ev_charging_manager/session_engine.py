@@ -13,9 +13,9 @@ from homeassistant.helpers.event import async_track_state_change_event, async_tr
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_CABLE_LOCK_ENTITY,
     CONF_CAR_STATUS_CHARGING_VALUE,
     CONF_CAR_STATUS_ENTITY,
-    CONF_CABLE_LOCK_ENTITY,
     CONF_CHARGER_NAME,
     CONF_ENERGY_ENTITY,
     CONF_ERROR_ENTITY,
@@ -598,9 +598,7 @@ class SessionEngine:
 
         if entity_id == cable_lock_entity and cable_lock_entity:
             if new_val is not None:
-                self._handle_observation_change(
-                    "CABLE_LOCK", "cus", "_last_cable_lock", new_val
-                )
+                self._handle_observation_change("CABLE_LOCK", "cus", "_last_cable_lock", new_val)
             return
 
         if entity_id == model_status_entity and model_status_entity:
@@ -620,7 +618,10 @@ class SessionEngine:
         # session-lifecycle dispatch still runs below for this entity.
         if entity_id == rfid_entity and rfid_entity and new_val is not None:
             self._handle_observation_change(
-                "TRX_STATE", "trx", "_last_trx", new_val  # type: ignore[arg-type]
+                "TRX_STATE",
+                "trx",
+                "_last_trx",
+                new_val,  # type: ignore[arg-type]
             )
             # (Fall through to existing car-state + session-lifecycle handlers)
 

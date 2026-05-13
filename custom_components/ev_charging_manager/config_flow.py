@@ -19,6 +19,7 @@ from homeassistant.helpers import selector
 
 from .charger_profiles import CHARGER_PROFILES
 from .const import (
+    CONF_CABLE_LOCK_ENTITY,
     CONF_CAR_STATUS_CHARGING_VALUE,
     CONF_CAR_STATUS_ENTITY,
     CONF_CARD_UID,
@@ -29,11 +30,14 @@ from .const import (
     CONF_DEBUG_LOGGING,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
+    CONF_ERROR_ENTITY,
     CONF_ETO_ENTITY,
     CONF_MAX_STORED_SESSIONS,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
+    CONF_MODEL_STATUS_ENTITY,
     CONF_PERSISTENCE_INTERVAL_S,
+    CONF_PLUG_ENTITY,
     CONF_POWER_ENTITY,
     CONF_PRICING_MODE,
     CONF_RFID_ENTITY,
@@ -411,13 +415,41 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    def _build_derived_options(self) -> dict[str, Any]:
+        """Derive observation-slot options from charger profile + serial at install time.
+
+        Returns a dict with the four observation-entity keys pre-filled from the
+        charger profile pattern.  Keys whose profile value is None are omitted so
+        that entry.options.get() returns None by default (generic profile).
+        """
+        profile_key = self.data.get(CONF_CHARGER_PROFILE, "")
+        profile = CHARGER_PROFILES.get(profile_key, {})
+        serial = self.data.get(CONF_CHARGER_SERIAL, "")
+
+        slot_map = {
+            CONF_PLUG_ENTITY: "plug_sensor",
+            CONF_CABLE_LOCK_ENTITY: "cable_lock_sensor",
+            CONF_MODEL_STATUS_ENTITY: "model_status_sensor",
+            CONF_ERROR_ENTITY: "error_sensor",
+        }
+        options: dict[str, Any] = {}
+        for conf_key, profile_key_name in slot_map.items():
+            pattern = profile.get(profile_key_name)
+            if pattern is not None:
+                options[conf_key] = pattern.replace("{serial}", serial) if serial else pattern
+        return options
+
     async def async_step_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Step 3: Show summary and create config entry on confirmation."""
         if user_input is not None:
             charger_name = self.data.get(CONF_CHARGER_NAME, DEFAULT_CHARGER_NAME)
-            return self.async_create_entry(title=charger_name, data=self.data)
+            return self.async_create_entry(
+                title=charger_name,
+                data=self.data,
+                options=self._build_derived_options(),
+            )
 
         charger_name = self.data.get(CONF_CHARGER_NAME, DEFAULT_CHARGER_NAME)
         return self.async_show_form(
@@ -498,6 +530,24 @@ class OptionsFlowHandler(OptionsFlow):
                 vol.Optional(
                     CONF_ETO_ENTITY,
                     description={"suggested_value": opts.get(CONF_ETO_ENTITY)},
+                ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"])),
+                vol.Optional(
+                    CONF_PLUG_ENTITY,
+                    description={"suggested_value": opts.get(CONF_PLUG_ENTITY)},
+                ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain=["binary_sensor", "sensor"])
+                ),
+                vol.Optional(
+                    CONF_CABLE_LOCK_ENTITY,
+                    description={"suggested_value": opts.get(CONF_CABLE_LOCK_ENTITY)},
+                ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"])),
+                vol.Optional(
+                    CONF_MODEL_STATUS_ENTITY,
+                    description={"suggested_value": opts.get(CONF_MODEL_STATUS_ENTITY)},
+                ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"])),
+                vol.Optional(
+                    CONF_ERROR_ENTITY,
+                    description={"suggested_value": opts.get(CONF_ERROR_ENTITY)},
                 ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"])),
                 vol.Optional(
                     CONF_DEBUG_LOGGING,

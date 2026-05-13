@@ -6,7 +6,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.ev_charging_manager.const import DOMAIN
+from custom_components.ev_charging_manager.const import (
+    CONF_CABLE_LOCK_ENTITY,
+    CONF_ERROR_ENTITY,
+    CONF_MODEL_STATUS_ENTITY,
+    CONF_PLUG_ENTITY,
+    DOMAIN,
+)
 
 from .conftest import MOCK_CHARGER_DATA, setup_entry_with_subentries
 
@@ -557,3 +563,96 @@ async def test_vehicle_deletion_multi_user_mappings(hass: HomeAssistant) -> None
 
     assert paul_mapping.data["vehicle_id"] is None
     assert anna_mapping.data["vehicle_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# T-MIG-01 through T-MIG-04 (PR-20): Observation-slot migration
+# ---------------------------------------------------------------------------
+
+
+async def test_mig_01_fresh_goe_install_populates_observation_slots(
+    hass: HomeAssistant,
+) -> None:
+    """T-MIG-01: Fresh go-e install has observation slots in entry.options after setup."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_serial": "S"},
+        options={},
+        title="Test Charger",
+    )
+    await setup_entry_with_subentries(hass, entry)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+
+    # goe_gemini profile with serial "S" should yield these entity IDs
+    assert loaded.options.get(CONF_PLUG_ENTITY) == "binary_sensor.goe_S_car_0"
+    assert loaded.options.get(CONF_CABLE_LOCK_ENTITY) == "sensor.goe_S_cus_value"
+    assert loaded.options.get(CONF_MODEL_STATUS_ENTITY) == "sensor.goe_S_modelstatus_value"
+    assert loaded.options.get(CONF_ERROR_ENTITY) == "sensor.goe_S_err_value"
+
+
+async def test_mig_02_pre_pr20_entry_gets_observation_slots_on_setup(
+    hass: HomeAssistant,
+) -> None:
+    """T-MIG-02: Pre-PR-20 entry with go-e profile + serial migrates on async_setup_entry."""
+    # Simulate a pre-PR-20 entry: options has no observation keys
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_serial": "abc123"},
+        options={"min_session_duration_s": 60},
+        title="Test Charger",
+    )
+    await setup_entry_with_subentries(hass, entry)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+
+    # Migration must have populated all four slots
+    assert loaded.options.get(CONF_PLUG_ENTITY) == "binary_sensor.goe_abc123_car_0"
+    assert loaded.options.get(CONF_CABLE_LOCK_ENTITY) == "sensor.goe_abc123_cus_value"
+    assert loaded.options.get(CONF_MODEL_STATUS_ENTITY) == "sensor.goe_abc123_modelstatus_value"
+    assert loaded.options.get(CONF_ERROR_ENTITY) == "sensor.goe_abc123_err_value"
+
+    # Pre-existing options must be preserved
+    assert loaded.options.get("min_session_duration_s") == 60
+
+
+async def test_mig_03_pre_existing_observation_slot_not_overwritten(
+    hass: HomeAssistant,
+) -> None:
+    """T-MIG-03: A custom value set before migration must NOT be overwritten."""
+    custom_plug = "binary_sensor.my_custom_plug"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_serial": "abc123"},
+        options={CONF_PLUG_ENTITY: custom_plug},
+        title="Test Charger",
+    )
+    await setup_entry_with_subentries(hass, entry)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+
+    # Custom plug value must be preserved
+    assert loaded.options.get(CONF_PLUG_ENTITY) == custom_plug
+
+    # Other three must be populated from profile
+    assert loaded.options.get(CONF_CABLE_LOCK_ENTITY) == "sensor.goe_abc123_cus_value"
+    assert loaded.options.get(CONF_MODEL_STATUS_ENTITY) == "sensor.goe_abc123_modelstatus_value"
+    assert loaded.options.get(CONF_ERROR_ENTITY) == "sensor.goe_abc123_err_value"
+
+
+async def test_mig_04_generic_profile_no_observation_migration(
+    hass: HomeAssistant,
+) -> None:
+    """T-MIG-04: Generic profile entry must not have observation slots injected."""
+    generic_data = {**MOCK_CHARGER_DATA, "charger_profile": "generic"}
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=generic_data,
+        options={},
+        title="Generic Charger",
+    )
+    await setup_entry_with_subentries(hass, entry)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+
+    # Generic profile has no observation entity patterns — options must stay empty
+    assert loaded.options.get(CONF_PLUG_ENTITY) is None
+    assert loaded.options.get(CONF_CABLE_LOCK_ENTITY) is None
+    assert loaded.options.get(CONF_MODEL_STATUS_ENTITY) is None
+    assert loaded.options.get(CONF_ERROR_ENTITY) is None

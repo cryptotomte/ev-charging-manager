@@ -650,22 +650,15 @@ class SessionEngine:
         # Track car_value changes for diagnostics and gate management
         car_status_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
         if entity_id == car_status_entity:
-            if new_val not in _INVALID_STATES and new_val != self._last_car_status:
-                if self._debug_logger:
-                    self._debug_logger.log(
-                        "CAR_STATE",
-                        f"car_value changed: {self._last_car_status} \u2192 {new_val}"
-                        f"{self._format_signal_snapshot()}",
-                    )
-            elif new_val in _INVALID_STATES:
-                # Log transitions to invalid states (unknown/unavailable) for diagnostics.
-                # Do NOT update _last_car_status -- keep the last known valid value.
-                if self._debug_logger:
-                    self._debug_logger.log(
-                        "CAR_STATE",
-                        f"car_value changed: {self._last_car_status} \u2192 {new_val}"
-                        f"{self._format_signal_snapshot()}",
-                    )
+            # Emit on any change. _last_car_status is only ever updated to valid
+            # values (guard below), so transitions to invalid states (unknown /
+            # unavailable) still log without polluting the cached "before" value.
+            if new_val != self._last_car_status and self._debug_logger:
+                self._debug_logger.log(
+                    "CAR_STATE",
+                    f"car_value changed: {self._last_car_status} \u2192 {new_val}"
+                    f"{self._format_signal_snapshot()}",
+                )
             if new_val and new_val not in _INVALID_STATES:
                 prev_status = self._last_car_status
                 self._last_car_status = new_val

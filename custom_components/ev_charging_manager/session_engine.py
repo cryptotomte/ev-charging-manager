@@ -101,9 +101,10 @@ class SessionEngine:
         self._state = SessionEngineState.IDLE
         self._active_session: Session | None = None
 
-        # Cached last valid values — kept during transient unavailability
-        self._last_energy_kwh: float = 0.0
-        self._last_power_w: float = 0.0
+        # Cached last valid values — kept during transient unavailability.
+        # None means "never set"; 0.0 is a legitimate reading and must render as 0.000.
+        self._last_energy_kwh: float | None = None
+        self._last_power_w: float | None = None
         self._last_trx: str | int | None = None
 
         # Last known car_value — used for CAR_STATE change detection (PR-010)
@@ -760,7 +761,7 @@ class SessionEngine:
                 _LOGGER.warning(
                     "Energy entity unavailable during active session — "
                     "keeping last value %.3f kWh, flagging data gap",
-                    self._last_energy_kwh,
+                    self._last_energy_kwh or 0.0,
                 )
         else:
             self._last_energy_kwh = energy
@@ -772,7 +773,7 @@ class SessionEngine:
         # Update active session metrics
         if self._active_session is not None:
             session = self._active_session
-            current_energy = self._last_energy_kwh - session.energy_start_kwh
+            current_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
             session.energy_kwh = max(0.0, current_energy)
 
             # Mode-aware cost calculation
@@ -786,7 +787,7 @@ class SessionEngine:
                 partial_detail = self._pricing.calculate_spot_hour(partial_kwh, spot_price)
                 session.cost_total_kr = round(completed_cost + partial_detail["cost_kr"], 4)
 
-            session.max_power_w = max(session.max_power_w, self._last_power_w)
+            session.max_power_w = max(session.max_power_w, self._last_power_w or 0.0)
 
             # Update real-time guest charge price (PR-06)
             if self._guest_pricing is not None:
@@ -800,7 +801,7 @@ class SessionEngine:
             _LOGGER.debug(
                 "Session update: energy=%.3f kWh, power=%.0f W, cost=%.2f kr",
                 session.energy_kwh,
-                self._last_power_w,
+                self._last_power_w or 0.0,
                 session.cost_total_kr,
             )
 
@@ -814,7 +815,7 @@ class SessionEngine:
             return
 
         session = self._active_session
-        current_relative_energy = self._last_energy_kwh - session.energy_start_kwh
+        current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
         kwh_this_hour = max(0.0, current_relative_energy - self._hour_energy_snapshot)
         spot_price = self._read_spot_price()
 
@@ -1003,7 +1004,7 @@ class SessionEngine:
             self._hourly_unsub()
             self._hourly_unsub = None
 
-            current_relative_energy = self._last_energy_kwh - session.energy_start_kwh
+            current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
             kwh_final = max(0.0, current_relative_energy - self._hour_energy_snapshot)
             spot_price = self._read_spot_price()
 
@@ -1280,8 +1281,8 @@ class SessionEngine:
 
         Three-step fallback per value:
           1. Live read from entity state.
-          2. Cached _last_energy_kwh / _last_power_w (when non-zero).
-          3. '?' placeholder when no value is available.
+          2. Cached _last_energy_kwh / _last_power_w (when not None, including 0.0).
+          3. '?' placeholder when no value is available (cache is None).
 
         Format: wh with 3 decimal places, power as integer.
         """
@@ -1289,7 +1290,7 @@ class SessionEngine:
         live_energy = self._get_energy()
         if live_energy is not None:
             wh_str = f"{live_energy:.3f}"
-        elif self._last_energy_kwh > 0:
+        elif self._last_energy_kwh is not None:
             wh_str = f"{self._last_energy_kwh:.3f}"
         else:
             wh_str = "?"
@@ -1298,7 +1299,7 @@ class SessionEngine:
         live_power = self._get_power()
         if live_power is not None:
             power_str = str(int(live_power))
-        elif self._last_power_w > 0:
+        elif self._last_power_w is not None:
             power_str = str(int(self._last_power_w))
         else:
             power_str = "?"

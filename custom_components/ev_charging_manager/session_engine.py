@@ -621,7 +621,7 @@ class SessionEngine:
                 "TRX_STATE",
                 "trx",
                 "_last_trx",
-                new_val,  # type: ignore[arg-type]
+                new_val,
             )
             # (Fall through to existing car-state + session-lifecycle handlers)
 
@@ -1310,19 +1310,21 @@ class SessionEngine:
         category: str,
         signal_token: str,
         last_attr_name: str,
-        new_value: str,
+        new_value: str | int | None,
     ) -> None:
         """Emit a debug log line for one observation-category signal transition.
 
         Called from _async_on_state_change when the changed entity matches one
         of the four optional observation slots or the RFID/trx entity.
 
-        Suppression rules (FR-009, FR-010):
+        Suppression rules:
           - Skip emission when new_value == cached (same-value refresh).
           - Additionally skip ERR_STATE when both old and new value are '-none-'.
+          - When new_value is in _INVALID_STATES: emit one diagnostic log line
+            but do NOT update the cache — keeps last-known-good as "before"
+            for the next real transition.
 
-        The cache field (last_attr_name) is updated ONLY on real transitions
-        (not on suppressed duplicates).
+        The cache field (last_attr_name) is updated ONLY on real, valid transitions.
         """
         # Guard: no debug logger or logging disabled
         if self._debug_logger is None or not self._debug_logger.enabled:
@@ -1330,23 +1332,24 @@ class SessionEngine:
 
         before = getattr(self, last_attr_name)
 
-        # FR-009: Suppress duplicate same-value transitions
+        # Suppress duplicate same-value transitions
         if new_value == before:
             return
 
-        # FR-010: Suppress -none- → -none- on error category (defensive; already
-        # covered by the generic guard above, but made explicit for clarity).
+        # Defense in depth: even if generic dedup loosens later, -none- → -none- must stay suppressed.
         if category == "ERR_STATE" and before == "-none-" and new_value == "-none-":
             return
 
-        # Emit the log line
+        # Emit the log line — always, including transitions to invalid states (informative)
         self._debug_logger.log(
             category,
             f"{signal_token} changed: {before} → {new_value}{self._format_signal_snapshot()}",
         )
 
-        # Update cache after emission
-        setattr(self, last_attr_name, new_value)
+        # Update cache ONLY on valid transitions — transient unavailability must not
+        # pollute the "before" value shown on the next real transition.
+        if new_value not in _INVALID_STATES:
+            setattr(self, last_attr_name, new_value)
 
     # ---------------------------------------------------------------------------
 

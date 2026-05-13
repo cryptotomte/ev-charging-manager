@@ -435,8 +435,12 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
         options: dict[str, Any] = {}
         for conf_key, profile_key_name in slot_map.items():
             pattern = profile.get(profile_key_name)
-            if pattern is not None:
-                options[conf_key] = pattern.replace("{serial}", serial) if serial else pattern
+            if pattern is None:
+                continue
+            if "{serial}" in pattern and not serial:
+                # Cannot resolve pattern without a serial — omit slot
+                continue
+            options[conf_key] = pattern.replace("{serial}", serial)
         return options
 
     async def async_step_confirm(
@@ -476,8 +480,18 @@ class OptionsFlowHandler(OptionsFlow):
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Manage the options — session thresholds."""
         if user_input is not None:
-            # Store thresholds and proceed to pricing step
+            # Store thresholds and proceed to pricing step.
+            # Explicitly write None for absent observation-slot keys so that
+            # migration sees conf_key in entry.options and skips re-filling a
+            # slot the user deliberately cleared.
             self._new_options = dict(user_input)
+            for conf_key in (
+                CONF_PLUG_ENTITY,
+                CONF_CABLE_LOCK_ENTITY,
+                CONF_MODEL_STATUS_ENTITY,
+                CONF_ERROR_ENTITY,
+            ):
+                self._new_options[conf_key] = user_input.get(conf_key)
             return await self.async_step_pricing()
 
         opts = self.config_entry.options

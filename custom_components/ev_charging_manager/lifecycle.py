@@ -54,7 +54,15 @@ async def async_migrate_observation_slots(
         if conf_key in entry.options:
             # Slot already set (including deliberate None/custom value) — skip
             continue
-        resolved = pattern.replace("{serial}", serial) if serial else pattern
+        if "{serial}" in pattern and not serial:
+            # Serial is required to resolve this pattern but is missing — skip the
+            # slot rather than persisting the literal placeholder string.
+            _LOGGER.warning(
+                "Observation slot %s skipped — charger serial missing",
+                conf_key,
+            )
+            continue
+        resolved = pattern.replace("{serial}", serial)
         new_options[conf_key] = resolved
 
     if new_options:

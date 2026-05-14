@@ -616,6 +616,7 @@ async def test_spot_session_single_hour_price_details(hass: HomeAssistant):
     assert abs(event.data["cost_kr"] - 2.61) < 0.01
 
 
+@pytest.mark.freeze_time("2026-03-15T14:00:00+00:00")
 async def test_spot_session_multi_hour_price_details(hass: HomeAssistant):
     """Multi-hour session: 3 entries in price_details, total cost matches formula."""
     entry = MockConfigEntry(
@@ -710,6 +711,7 @@ async def test_spot_session_completed_event_has_cost_method(hass: HomeAssistant)
     assert completed_events[0].data["cost_method"] == "spot"
 
 
+@pytest.mark.freeze_time("2026-03-15T14:00:00+00:00")
 async def test_spot_session_price_details_have_required_keys(hass: HomeAssistant):
     """price_details entries contain all required keys."""
     entry = MockConfigEntry(
@@ -749,6 +751,7 @@ async def test_spot_session_price_details_have_required_keys(hass: HomeAssistant
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.freeze_time("2026-03-15T14:00:00+00:00")
 async def test_spot_session_fallback_when_sensor_unavailable(hass: HomeAssistant):
     """When spot sensor is unavailable at hour boundary, fallback price is used."""
     entry = MockConfigEntry(
@@ -809,6 +812,7 @@ async def test_spot_session_fallback_at_session_end_when_sensor_unavailable(hass
     assert abs(event_data["cost_kr"] - 3.75) < 0.01
 
 
+@pytest.mark.freeze_time("2026-03-15T14:00:00+00:00")
 async def test_spot_session_fallback_logs_warning(hass: HomeAssistant, caplog):
     """Unavailable spot sensor at hour boundary logs a WARNING."""
     import logging
@@ -833,6 +837,7 @@ async def test_spot_session_fallback_logs_warning(hass: HomeAssistant, caplog):
     assert any("fallback" in record.message.lower() for record in caplog.records)
 
 
+@pytest.mark.freeze_time("2026-03-15T14:00:00+00:00")
 async def test_spot_quickstart_scenario_4_fallback_with_recovery(hass: HomeAssistant):
     """Quickstart Scenario 4: hour 14 OK, hour 15 fallback, hour 16 OK again.
 

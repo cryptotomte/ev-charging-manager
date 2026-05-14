@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 dev = [
     "pytest-homeassistant-custom-component>=0.13.0",
     "pytest-asyncio",
+    "ruff",
 ]
 
 [tool.pytest.ini_options]

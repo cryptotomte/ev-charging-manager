@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -210,6 +211,7 @@ async def test_session_updates_current_month(hass: HomeAssistant) -> None:
     assert stats.current_month.sessions == 1
 
 
+@pytest.mark.freeze_time("2026-03-31T23:00:00+00:00")
 async def test_midnight_callback_on_day_1_rolls_over(hass: HomeAssistant) -> None:
     """Midnight callback on 1st of month copies current → previous and resets current."""
     engine, store, entry = await _setup_engine(hass)
@@ -244,6 +246,7 @@ async def test_midnight_callback_on_day_1_rolls_over(hass: HomeAssistant) -> Non
     assert stats.total_energy_kwh == 45.2
 
 
+@pytest.mark.freeze_time("2026-04-14T23:00:00+00:00")
 async def test_midnight_callback_on_non_first_day_does_nothing(hass: HomeAssistant) -> None:
     """Midnight callback on day != 1 does not roll over."""
     engine, store, entry = await _setup_engine(hass)
@@ -267,6 +270,7 @@ async def test_midnight_callback_on_non_first_day_does_nothing(hass: HomeAssista
     save_mock.assert_not_called()
 
 
+@pytest.mark.freeze_time("2026-03-31T23:00:00+00:00")
 async def test_rollover_is_idempotent(hass: HomeAssistant) -> None:
     """Month rollover is no-op if current_month already matches new month (FR-013)."""
     engine, store, entry = await _setup_engine(hass)

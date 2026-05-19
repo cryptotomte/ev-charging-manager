@@ -19,6 +19,7 @@ from homeassistant.helpers import selector
 
 from .charger_profiles import CHARGER_PROFILES
 from .const import (
+    CONF_BLOCK_UNMAPPED_RFID,
     CONF_CABLE_LOCK_ENTITY,
     CONF_CAR_STATUS_CHARGING_VALUE,
     CONF_CAR_STATUS_ENTITY,
@@ -27,7 +28,9 @@ from .const import (
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
     CONF_CHARGER_SERIAL,
+    CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DEBUG_LOGGING,
+    CONF_DISCONNECT_GRACE_MIN,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
     CONF_ERROR_ENTITY,
@@ -48,9 +51,12 @@ from .const import (
     CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
     CONF_TOTAL_ENERGY_ENTITY,
+    DEFAULT_BLOCK_UNMAPPED_RFID,
     DEFAULT_CHARGER_NAME,
     DEFAULT_CHARGING_EFFICIENCY,
+    DEFAULT_CHARGING_IDLE_TIMEOUT_MIN,
     DEFAULT_DEBUG_LOGGING,
+    DEFAULT_DISCONNECT_GRACE_MIN,
     DEFAULT_ENERGY_UNIT,
     DEFAULT_MAX_STORED_SESSIONS,
     DEFAULT_MIN_SESSION_DURATION_S,
@@ -492,6 +498,12 @@ class OptionsFlowHandler(OptionsFlow):
                 CONF_ERROR_ENTITY,
             ):
                 self._new_options[conf_key] = user_input.get(conf_key)
+            # Preserve timing options with their defaults when absent
+            self._new_options.setdefault(
+                CONF_CHARGING_IDLE_TIMEOUT_MIN, DEFAULT_CHARGING_IDLE_TIMEOUT_MIN
+            )
+            self._new_options.setdefault(CONF_DISCONNECT_GRACE_MIN, DEFAULT_DISCONNECT_GRACE_MIN)
+            self._new_options.setdefault(CONF_BLOCK_UNMAPPED_RFID, DEFAULT_BLOCK_UNMAPPED_RFID)
             return await self.async_step_pricing()
 
         opts = self.config_entry.options
@@ -541,6 +553,34 @@ class OptionsFlowHandler(OptionsFlow):
                     ),
                     vol.Coerce(int),
                 ),
+                vol.Optional(
+                    CONF_CHARGING_IDLE_TIMEOUT_MIN,
+                    default=opts.get(
+                        CONF_CHARGING_IDLE_TIMEOUT_MIN, DEFAULT_CHARGING_IDLE_TIMEOUT_MIN
+                    ),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=3, max=30, step=1, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_DISCONNECT_GRACE_MIN,
+                    default=opts.get(CONF_DISCONNECT_GRACE_MIN, DEFAULT_DISCONNECT_GRACE_MIN),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=5, max=30, step=1, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_BLOCK_UNMAPPED_RFID,
+                    default=opts.get(CONF_BLOCK_UNMAPPED_RFID, DEFAULT_BLOCK_UNMAPPED_RFID),
+                ): selector.BooleanSelector(),
                 vol.Optional(
                     CONF_ETO_ENTITY,
                     description={"suggested_value": opts.get(CONF_ETO_ENTITY)},

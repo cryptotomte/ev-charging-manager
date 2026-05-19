@@ -653,9 +653,18 @@ class PlugAnchoredSessionEngine:
             self._handle_plug_off()
 
     def _handle_plug_on(self) -> None:
-        """Plug transitioned off → on: start a new session (FR-001)."""
+        """Plug transitioned off → on: start a new session (FR-001).
+
+        If called while already TRACKING (transient disconnect resolved),
+        cancel the grace timer and log DISCONNECT_RESOLVED.
+        """
+        if self._state == SessionEngineState.TRACKING:
+            # Plug returned during a transient disconnect — cancel grace timer
+            self._handle_plug_on_during_tracking()
+            return
+
         if self._state != SessionEngineState.IDLE:
-            # Already tracking — ignore duplicate plug=on (defensive)
+            # Already completing — ignore
             return
 
         # Cancel any lingering grace timer (shouldn't exist in IDLE, but defensive)
@@ -688,6 +697,7 @@ class PlugAnchoredSessionEngine:
             self._hass.async_create_task(self._async_complete_session())
         else:
             # Transient disconnect (FR-003) — cable_lock is Locked / unknown / Lock failed
+            self._data_gap = True  # engine-level flag; transferred to session on completion
             if self._active_session is not None:
                 self._active_session.data_gap = True
             if self._debug_logger:

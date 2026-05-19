@@ -107,13 +107,4 @@ class ConfigStore:
                 # idx may be None if subentry data is malformed; pass through so
                 # the dismisser can also clear "trx-null" notifications when
                 # the user adds the first-ever mapping in response to one.
-                async_dispatcher_send(self._hass_for_signal(entry), signal, idx)
-
-    def _hass_for_signal(self, entry: ConfigEntry) -> HomeAssistant:
-        """Return the HomeAssistant instance used to dispatch signals.
-
-        ConfigStore stores `hass` as an attribute on the underlying Store; for
-        clarity we keep a direct reference set at init time.
-        """
-        # _hass is set in __init__; cast for the type checker.
-        return self._hass
+                async_dispatcher_send(self._hass, signal, idx)

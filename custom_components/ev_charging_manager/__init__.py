@@ -129,7 +129,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # goe_gemini → PlugAnchoredSessionEngine (PR-22 plug-anchored model).
     # All other profiles → legacy SessionEngine (unchanged behaviour).
     # Both engines expose the same coordinator-callable interface so all downstream
-    # platforms (sensor.py, switch.py, stats_sensor.py) remain profile-blind.
+    # platforms (sensor.py, binary_sensor.py, button.py, stats_sensor.py) remain profile-blind.
     uses_plug_anchored = profile.get("supports_plug_anchored_model", False)
     _dl = debug_logger if debug_logging_enabled else None
     if uses_plug_anchored:

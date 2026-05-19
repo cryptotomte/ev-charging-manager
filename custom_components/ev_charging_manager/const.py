@@ -192,6 +192,13 @@ MAX_CHARGING_IDLE_TIMEOUT_MIN = 30
 MIN_DISCONNECT_GRACE_MIN = 5
 MAX_DISCONNECT_GRACE_MIN = 30
 
+# Maximum time to wait for the plug entity to become available before giving up
+# on deferred restart recovery (HIGH-1 fix). If the plug entity never reports a
+# valid state within this window (e.g. user misconfigured the entity id, the
+# charger is permanently offline), the engine notifies the user via a persistent
+# notification and force-completes the snapshot as a reconstructed session.
+DEFERRED_RECOVERY_TIMEOUT_MIN = 60  # minutes
+
 # New debug log categories (FR-034) — used as the first argument to DebugLogger.log().
 # The DebugLogger accepts arbitrary category strings; these constants ensure
 # consistent spelling across session_engine_v2.py and tests.
@@ -210,6 +217,9 @@ DEBUG_CAT_TRX_MIDSESSION = "TRX_MIDSESSION"
 # with passive-notification categories — no HTTP control of the charger is performed.
 DEBUG_CAT_RFID_UNMAPPED_NOTIFIED = "RFID_UNMAPPED_NOTIFIED"
 DEBUG_CAT_RFID_UNMAPPED_NOTIFY_FAILED = "RFID_UNMAPPED_NOTIFY_FAILED"
+
+# HIGH-1: deferred restart recovery timed out (plug entity never appeared).
+DEBUG_CAT_RECOVERY_TIMEOUT = "RECOVERY_TIMEOUT"
 
 # New HA events (PR-22)
 EVENT_CHARGING_CHARGED = "ev_charging_charged"

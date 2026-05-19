@@ -9,6 +9,8 @@ re-introducing the bug can be detected quickly.
   - BUG-5: ChargingWindow uses tz-aware UTC and validates timestamps.
   - BUG-6: hourly tracker unsub does not accumulate stale handlers per session.
   - BUG-7: STATE_UNAVAILABLE on the plug entity is treated as offline, not on.
+  - HIGH-1: deferred recovery times out with a user-visible notification.
+  - HIGH-3: _check_charger_offline guards against empty configured-entity list.
 """
 
 from __future__ import annotations
@@ -21,7 +23,10 @@ import pytest
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.ev_charging_manager.charging_window import (
     ChargingWindow,
@@ -30,6 +35,7 @@ from custom_components.ev_charging_manager.charging_window import (
 from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
+    DEFERRED_RECOVERY_TIMEOUT_MIN,
     DOMAIN,
     SessionEngineState,
 )
@@ -479,4 +485,147 @@ async def test_bug6_hourly_unsub_not_registered_on_entry_unload_list(
     assert growth < 3, (
         f"entry._on_unload grew by {growth} across 3 sessions — "
         "per-session callbacks are leaking (BUG-6)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# HIGH-1: deferred recovery times out with a user-visible notification
+# ---------------------------------------------------------------------------
+
+
+async def test_high1_deferred_recovery_timeout_fires_notification(
+    hass: HomeAssistant, freezer
+) -> None:
+    """When the plug entity never reports a valid state within
+    DEFERRED_RECOVERY_TIMEOUT_MIN, the engine must:
+      1. Create a persistent_notification (so the user sees the problem).
+      2. Log RECOVERY_TIMEOUT to the debug logger.
+      3. Force-complete the snapshot as a reconstructed session.
+    """
+    snapshot = _make_snapshot(energy_start_kwh=10.0, energy_kwh=5.0)
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"},
+        options={
+            "plug_entity": MOCK_PLUG_ENTITY,
+            "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
+            CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
+            CONF_DISCONNECT_GRACE_MIN: 10,
+        },
+        title="Test go-e Charger",
+    )
+
+    # Plug entity stays UNAVAILABLE for the entire test.
+    hass.states.async_set(MOCK_PLUG_ENTITY, STATE_UNAVAILABLE)
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "15.5")
+    hass.states.async_set(MOCK_POWER_ENTITY, "7200.0")
+
+    raw_store_data = {
+        "version": 1,
+        "minor_version": 2,
+        "key": "ev_charging_manager_sessions",
+        "data": [snapshot],
+    }
+    with (
+        patch(
+            "homeassistant.helpers.storage.Store.async_load",
+            new_callable=AsyncMock,
+            return_value=raw_store_data,
+        ),
+        patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
+        patch(
+            "custom_components.ev_charging_manager.session_engine_v2."
+            "persistent_notification.async_create"
+        ) as mock_notify,
+    ):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+        session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+        # Sanity: recovery is deferred (BUG-3) and timeout is armed (HIGH-1).
+        assert engine._deferred_recovery_unsub is not None
+        assert engine._deferred_recovery_timeout_unsub is not None
+
+        # No notification yet, no force-completed session yet.
+        assert mock_notify.call_count == 0
+        assert len(session_store.sessions) == 0
+
+        # Advance time past the timeout window.
+        freezer.tick(timedelta(minutes=DEFERRED_RECOVERY_TIMEOUT_MIN + 1))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    # HIGH-1 assertions:
+    # 1. Notification was created.
+    assert mock_notify.call_count >= 1, (
+        "persistent_notification.async_create must be invoked on timeout (HIGH-1)"
+    )
+    # The notification_id must be the per-entry stable id so it is dismissable.
+    notify_kwargs = mock_notify.call_args.kwargs
+    assert "notification_id" in notify_kwargs
+    assert notify_kwargs["notification_id"].startswith("ev_charging_manager_recovery_timeout_")
+    # 2. Snapshot was force-completed as a reconstructed session with data_gap.
+    assert len(session_store.sessions) == 1, (
+        "snapshot must be force-completed after recovery timeout (HIGH-1)"
+    )
+    forced = session_store.sessions[0]
+    assert forced["data_gap"] is True, "force-completed session must have data_gap=True"
+    assert forced["reconstructed"] is True, "force-completed session must have reconstructed=True"
+    # 3. Engine cleared its timeout unsub (it has fired).
+    assert engine._deferred_recovery_timeout_unsub is None
+
+
+# ---------------------------------------------------------------------------
+# HIGH-3: _check_charger_offline guards against empty entity list
+# ---------------------------------------------------------------------------
+
+
+async def test_high3_check_charger_offline_handles_empty_entity_list(
+    hass: HomeAssistant,
+) -> None:
+    """If no plug/power/energy entities are configured, _check_charger_offline
+    must NOT flip _charger_offline to True (all([]) returns True trap).
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        # Deliberately set all three charger-state entities to None to exercise the guard.
+        data={
+            **MOCK_CHARGER_DATA,
+            "charger_profile": "goe_gemini",
+            "energy_entity": None,
+            "power_entity": None,
+        },
+        options={
+            # No plug_entity configured either.
+            "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
+            CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
+            CONF_DISCONNECT_GRACE_MIN: 10,
+        },
+        title="Test go-e Charger (no entities)",
+    )
+
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+
+    entry.add_to_hass(hass)
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine._charger_offline is False, "initial state must not be offline"
+
+    # Directly fire a plug-None event by invoking the handler the way the
+    # dispatch path does. With zero configured entities the guard must short-
+    # circuit and leave _charger_offline unchanged.
+    engine._handle_plug_change(None)
+
+    assert engine._charger_offline is False, (
+        "with zero configured entities, _check_charger_offline must NOT flip to True (HIGH-3)"
     )

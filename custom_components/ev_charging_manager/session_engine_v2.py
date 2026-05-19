@@ -56,6 +56,7 @@ from .const import (
     DEBUG_CAT_DISCONNECT_DETECTED,
     DEBUG_CAT_DISCONNECT_RESOLVED,
     DEBUG_CAT_HA_RESTART_DETECTED,
+    DEBUG_CAT_RECOVERY_TIMEOUT,
     DEBUG_CAT_RFID_UNMAPPED_NOTIFIED,
     DEBUG_CAT_RFID_UNMAPPED_NOTIFY_FAILED,
     DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT,
@@ -71,6 +72,7 @@ from .const import (
     DEFAULT_SPOT_FALLBACK_PRICE_KWH,
     DEFAULT_SPOT_VAT_MULTIPLIER,
     DEFAULT_STATIC_PRICE_KWH,
+    DEFERRED_RECOVERY_TIMEOUT_MIN,
     EVENT_CHARGING_CHARGED,
     EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
@@ -206,6 +208,10 @@ class PlugAnchoredSessionEngine:
         # Pending defer of restart recovery while plug entity is not yet available
         # (BUG-3): unsub for the wait listener if scheduled.
         self._deferred_recovery_unsub: Any = None
+        # HIGH-1: timeout cancel handle for the deferred-recovery wait. If the
+        # plug entity never reports a valid state within DEFERRED_RECOVERY_TIMEOUT_MIN,
+        # the engine fires a persistent notification and force-completes the snapshot.
+        self._deferred_recovery_timeout_unsub: Any = None
 
         # Build pricing engine from entry data (immutable at runtime)
         pricing_mode = entry.data.get("pricing_mode", "static")
@@ -314,6 +320,14 @@ class PlugAnchoredSessionEngine:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("deferred-recovery unsub failed: %s", err)
             self._deferred_recovery_unsub = None
+
+        # HIGH-1: cancel the deferred-recovery timeout if still in flight.
+        if self._deferred_recovery_timeout_unsub is not None:
+            try:
+                self._deferred_recovery_timeout_unsub()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("deferred-recovery-timeout unsub failed: %s", err)
+            self._deferred_recovery_timeout_unsub = None
 
         # Cancel and clear all engine-managed unsubs.
         for unsub in list(self._engine_unsubs):
@@ -428,6 +442,12 @@ class PlugAnchoredSessionEngine:
         BUG-3 fix: avoids the silent-corruption path where current_plug == None at
         boot causes the engine to assume plug is off and prematurely complete the
         session with the restart timestamp as disconnected_at.
+
+        HIGH-1 fix: also registers a timeout (DEFERRED_RECOVERY_TIMEOUT_MIN). If
+        the plug entity never reports a valid state within the window (e.g. user
+        has a typo in their plug entity ID, charger is permanently offline), the
+        engine fires a persistent notification and force-completes the snapshot
+        rather than staying deferred forever.
         """
 
         async def _on_plug_ready(event: Event) -> None:
@@ -436,10 +456,13 @@ class PlugAnchoredSessionEngine:
                 return
             if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                 return
-            # Plug entity now has a valid state — cancel listener and resume recovery.
+            # Plug entity now has a valid state — cancel listener + timeout and resume recovery.
             if self._deferred_recovery_unsub is not None:
                 self._deferred_recovery_unsub()
                 self._deferred_recovery_unsub = None
+            if self._deferred_recovery_timeout_unsub is not None:
+                self._deferred_recovery_timeout_unsub()
+                self._deferred_recovery_timeout_unsub = None
             if self._debug_logger:
                 self._debug_logger.log(
                     DEBUG_CAT_HA_RESTART_DETECTED,
@@ -456,10 +479,87 @@ class PlugAnchoredSessionEngine:
                 self._state = SessionEngineState.IDLE
                 self._active_session = None
 
+        async def _on_recovery_timeout(_now: datetime) -> None:
+            # Cancel the plug-state listener (it will no longer be needed).
+            if self._deferred_recovery_unsub is not None:
+                try:
+                    self._deferred_recovery_unsub()
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("deferred-recovery unsub failed at timeout: %s", err)
+                self._deferred_recovery_unsub = None
+            self._deferred_recovery_timeout_unsub = None
+
+            snap_id = snapshot.get("id", "?")
+            _LOGGER.error(
+                "PlugAnchoredSessionEngine: deferred recovery timed out after %d min "
+                "— plug entity %s never reported a valid state; force-completing "
+                "snapshot id=%s",
+                DEFERRED_RECOVERY_TIMEOUT_MIN,
+                plug_entity_id,
+                snap_id,
+            )
+
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_RECOVERY_TIMEOUT,
+                    f"deferred recovery timed out after {DEFERRED_RECOVERY_TIMEOUT_MIN} min "
+                    f"— plug entity {plug_entity_id} never valid; "
+                    f"force-completing snapshot id={snap_id}",
+                )
+
+            # User-visible notification (FR — HIGH-1).
+            try:
+                persistent_notification.async_create(
+                    self._hass,
+                    message=(
+                        f"The plug entity **{plug_entity_id}** did not report a valid "
+                        f"state within {DEFERRED_RECOVERY_TIMEOUT_MIN} minutes after Home "
+                        "Assistant restart. The previously active session has been "
+                        "force-completed with a data gap.\n\n"
+                        "Please verify that your plug entity is configured correctly "
+                        "(Integration → Configure → Observation entities) and that the "
+                        "charger is online."
+                    ),
+                    title="EV Charging Manager — session recovery timed out",
+                    notification_id=(
+                        f"ev_charging_manager_recovery_timeout_{self._entry.entry_id}"
+                    ),
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "PlugAnchoredSessionEngine: failed to create recovery-timeout notification: %s",
+                    err,
+                )
+
+            # Force-complete the snapshot as a reconstructed session (mirrors BUG-3
+            # path but with restart-time as disconnected_at).
+            try:
+                now = dt_util.utcnow()
+                current_energy = self._get_energy() or float(
+                    snapshot.get("energy_start_kwh", 0.0)
+                ) + float(snapshot.get("energy_kwh", 0.0))
+                await self._complete_snapshot_as_session(snapshot, current_energy, now)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error(
+                    "PlugAnchoredSessionEngine: force-complete after recovery timeout "
+                    "failed: %s id=%s",
+                    err,
+                    snap_id,
+                )
+                self._state = SessionEngineState.IDLE
+                self._active_session = None
+
         self._deferred_recovery_unsub = async_track_state_change_event(
             self._hass, [plug_entity_id], _on_plug_ready
         )
         self._engine_unsubs.append(self._deferred_recovery_unsub)
+
+        self._deferred_recovery_timeout_unsub = async_call_later(
+            self._hass,
+            DEFERRED_RECOVERY_TIMEOUT_MIN * 60,
+            _on_recovery_timeout,
+        )
+        self._engine_unsubs.append(self._deferred_recovery_timeout_unsub)
 
     async def _resume_session_from_snapshot(
         self,
@@ -809,15 +909,15 @@ class PlugAnchoredSessionEngine:
             self._check_charger_offline()
             return
 
-        if new_val not in _INVALID_STATES:
-            # Valid plug value arrived — charger may be back online
-            if self._charger_offline:
-                self._charger_offline = False
-                if self._debug_logger:
-                    self._debug_logger.log(
-                        DEBUG_CAT_CHARGER_BACK_ONLINE,
-                        f"plug entity back online (value={new_val})",
-                    )
+        # Valid plug value arrived (the early-return above already filtered out
+        # _INVALID_STATES) — charger may be back online.
+        if self._charger_offline:
+            self._charger_offline = False
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_CHARGER_BACK_ONLINE,
+                    f"plug entity back online (value={new_val})",
+                )
 
         if new_val == "on":
             self._handle_plug_on()
@@ -1203,7 +1303,7 @@ class PlugAnchoredSessionEngine:
             # the list. Manage lifecycle ourselves via async_unload() below.
             self._engine_unsubs.append(self._hourly_unsub)
 
-        # Story 07: check for unmapped RFID and trigger blocking if needed
+        # Story 07: check for unmapped RFID and trigger passive notification if needed
         if session_user_type == "unknown" and resolution is not None:
             if resolution.reason in ("unmapped", "rfid_inactive", "type_error"):
                 await self._async_handle_unknown_rfid(resolution.rfid_index, resolution.reason)
@@ -1630,7 +1730,14 @@ class PlugAnchoredSessionEngine:
             state = self._hass.states.get(entity_id)
             return state is not None and state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN)
 
-        all_offline = all(_is_unavail(e) for e in [plug_entity, power_entity, energy_entity] if e)
+        # HIGH-3 fix: guard against zero configured entities. all([]) returns True,
+        # which previously caused the engine to flip to offline state on any plug-
+        # None event when no charger entities were configured at all.
+        entities_to_check = [e for e in (plug_entity, power_entity, energy_entity) if e]
+        if not entities_to_check:
+            return
+
+        all_offline = all(_is_unavail(e) for e in entities_to_check)
 
         if all_offline and not self._charger_offline:
             self._charger_offline = True

@@ -64,9 +64,7 @@ def parse_log_file(
             if not m:
                 # Non-comment, non-blank line that does not match the expected format.
                 # Raise so test failures surface fixture corruption quickly.
-                raise ValueError(
-                    f"{path.name}:{line_no}: malformed log line: {line!r}"
-                )
+                raise ValueError(f"{path.name}:{line_no}: malformed log line: {line!r}")
             ts = datetime.fromisoformat(m.group("ts"))
             yield ts, m.group("cat"), m.group("msg")
 

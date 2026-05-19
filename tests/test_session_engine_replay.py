@@ -88,6 +88,7 @@ async def test_tc007_replay_petra_2026_05_16(hass: HomeAssistant, freezer) -> No
             # Advance frozen clock by the delta between log events and fire HA time callbacks
             if prev_ts is not None and ts > prev_ts:
                 from datetime import timezone
+
                 delta = ts.replace(tzinfo=timezone.utc) - prev_ts.replace(tzinfo=timezone.utc)
                 freezer.tick(delta)
                 async_fire_time_changed(hass, dt_util.utcnow())
@@ -98,9 +99,7 @@ async def test_tc007_replay_petra_2026_05_16(hass: HomeAssistant, freezer) -> No
 
     # One session
     sessions = session_store.sessions
-    assert len(sessions) == 1, (
-        f"TC-007: Expected 1 session but got {len(sessions)}: {sessions}"
-    )
+    assert len(sessions) == 1, f"TC-007: Expected 1 session but got {len(sessions)}: {sessions}"
 
     session = sessions[0]
 
@@ -134,6 +133,7 @@ async def test_tc008_replay_elvis_2026_05_18(hass: HomeAssistant, freezer) -> No
             # Advance frozen clock by the delta between log events and fire HA time callbacks
             if prev_ts is not None and ts > prev_ts:
                 from datetime import timezone
+
                 delta = ts.replace(tzinfo=timezone.utc) - prev_ts.replace(tzinfo=timezone.utc)
                 freezer.tick(delta)
                 async_fire_time_changed(hass, dt_util.utcnow())
@@ -143,9 +143,7 @@ async def test_tc008_replay_elvis_2026_05_18(hass: HomeAssistant, freezer) -> No
             await hass.async_block_till_done()
 
     sessions = session_store.sessions
-    assert len(sessions) == 1, (
-        f"TC-008: Expected 1 session but got {len(sessions)}: {sessions}"
-    )
+    assert len(sessions) == 1, f"TC-008: Expected 1 session but got {len(sessions)}: {sessions}"
 
     session = sessions[0]
 

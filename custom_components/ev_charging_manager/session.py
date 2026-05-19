@@ -44,9 +44,9 @@ class Session:
     charger_name: str = ""
 
     # Timing (legacy fields — preserved for backward compatibility)
-    started_at: str = ""     # alias for connected_at (backward compat)
+    started_at: str = ""  # alias for connected_at (backward compat)
     ended_at: str | None = None  # alias for disconnected_at (backward compat)
-    duration_seconds: int = 0    # alias for charging_duration_s (backward compat)
+    duration_seconds: int = 0  # alias for charging_duration_s (backward compat)
 
     # PR-22: Plug-anchored timing fields
     # connected_at replaces started_at as the canonical session-start timestamp
@@ -55,10 +55,10 @@ class Session:
     connection_duration_s: int = 0
 
     # PR-22: Charging-window timing fields
-    charging_started_at: str | None = None   # first power > 0 after session start; does NOT move
-    charging_ended_at: str | None = None     # end of most-recently-closed window; None while open
-    charging_duration_s: int = 0             # sum of all closed window durations
-    charging_window_count: int = 0           # number of windows opened during the session
+    charging_started_at: str | None = None  # first power > 0 after session start; does NOT move
+    charging_ended_at: str | None = None  # end of most-recently-closed window; None while open
+    charging_duration_s: int = 0  # sum of all closed window durations
+    charging_window_count: int = 0  # number of windows opened during the session
 
     # PR-22: Block flag for Story 07 (unmapped RFID force-off)
     blocked: bool = False

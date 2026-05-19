@@ -176,8 +176,8 @@ CONF_DISCONNECT_GRACE_MIN = "disconnect_grace_min"
 CONF_BLOCK_UNMAPPED_RFID = "block_unmapped_rfid"
 
 # Defaults and ranges for the new advanced options
-DEFAULT_CHARGING_IDLE_TIMEOUT_MIN = 5   # minutes; range 3–30
-DEFAULT_DISCONNECT_GRACE_MIN = 10       # minutes; range 5–30
+DEFAULT_CHARGING_IDLE_TIMEOUT_MIN = 5  # minutes; range 3–30
+DEFAULT_DISCONNECT_GRACE_MIN = 10  # minutes; range 5–30
 DEFAULT_BLOCK_UNMAPPED_RFID = True
 
 MIN_CHARGING_IDLE_TIMEOUT_MIN = 3

@@ -91,9 +91,7 @@ async def _plug_in_and_charge(hass: HomeAssistant, energy_kwh: float = 5.0) -> N
 # ---------------------------------------------------------------------------
 
 
-async def test_tc009_transient_plug_off_cable_locked(
-    hass: HomeAssistant, freezer
-) -> None:
+async def test_tc009_transient_plug_off_cable_locked(hass: HomeAssistant, freezer) -> None:
     """TC-009: plug=off + cable_lock=unknown/Locked → session survives, data_gap=True."""
     entry = await _make_engine_entry(hass)
     engine = _get_engine(hass, entry)
@@ -137,9 +135,7 @@ async def test_tc009_transient_plug_off_cable_locked(
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         await hass.async_block_till_done()
 
-        assert engine.active_session is not None, (
-            "TC-009: session must survive after plug returns"
-        )
+        assert engine.active_session is not None, "TC-009: session must survive after plug returns"
 
         # --- Normal unplug now ---
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
@@ -197,9 +193,7 @@ async def test_tc010_real_unplug_cable_unlocked(hass: HomeAssistant, freezer) ->
 # ---------------------------------------------------------------------------
 
 
-async def test_tc011_grace_timeout_force_ends_session(
-    hass: HomeAssistant, freezer
-) -> None:
+async def test_tc011_grace_timeout_force_ends_session(hass: HomeAssistant, freezer) -> None:
     """TC-011: plug=off persists for disconnect_grace_min → session force-ended."""
     entry = await _make_engine_entry(hass)
     engine = _get_engine(hass, entry)
@@ -238,11 +232,7 @@ async def test_tc011_grace_timeout_force_ends_session(
     assert len(session_store.sessions) == 1, (
         f"TC-011: Expected 1 session after grace timeout, got {len(session_store.sessions)}"
     )
-    assert engine.active_session is None, (
-        "TC-011: active_session should be None after force-end"
-    )
+    assert engine.active_session is None, "TC-011: active_session should be None after force-end"
     # data_gap must remain True
     session = session_store.sessions[0]
-    assert session["data_gap"] is True, (
-        "TC-011: data_gap must be True in the force-ended session"
-    )
+    assert session["data_gap"] is True, "TC-011: data_gap must be True in the force-ended session"

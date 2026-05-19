@@ -136,6 +136,7 @@ def test_tc006_engine_has_no_last_car_status_attribute(
     # Inspect __init__ to verify it is not set there (heuristic: attribute must not
     # appear as an instance attribute name in the __init__ source).
     import inspect
+
     source = inspect.getsource(PlugAnchoredSessionEngine.__init__)
     assert "_last_car_status" not in source, (
         "PlugAnchoredSessionEngine.__init__ must not set _last_car_status (FR-N02)"

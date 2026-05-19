@@ -101,7 +101,7 @@ _RFID_REASON_MAP: dict[str, str] = {
 # Sub-states within the TRACKING engine state, used by StatusSensor
 _SUB_STATE_WAITING = "waiting"
 _SUB_STATE_CHARGING = "charging"  # open window
-_SUB_STATE_CHARGED = "charged"    # all windows closed, cable still in
+_SUB_STATE_CHARGED = "charged"  # all windows closed, cable still in
 
 
 class PlugAnchoredSessionEngine:
@@ -316,7 +316,7 @@ class PlugAnchoredSessionEngine:
         energy_counter_reset = current_energy < energy_start
 
         # Determine whether plug is currently on
-        plug_on = (current_plug == "on")
+        plug_on = current_plug == "on"
 
         if plug_on and not energy_counter_reset:
             # Cable still in — resume the session (FR-026)
@@ -422,8 +422,8 @@ class PlugAnchoredSessionEngine:
             else saved_energy_kwh
         )
 
-        connected_at_str = (
-            snapshot.get("connected_at") or snapshot.get("started_at", now.isoformat())
+        connected_at_str = snapshot.get("connected_at") or snapshot.get(
+            "started_at", now.isoformat()
         )
         try:
             connected_at = datetime.fromisoformat(connected_at_str)
@@ -466,9 +466,7 @@ class PlugAnchoredSessionEngine:
         )
 
         if charging_duration_s > 0 and session.energy_kwh > 0:
-            session.avg_power_w = round(
-                (session.energy_kwh * 3_600_000) / charging_duration_s, 1
-            )
+            session.avg_power_w = round((session.energy_kwh * 3_600_000) / charging_duration_s, 1)
 
         min_duration = self._entry.options.get(
             CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
@@ -503,7 +501,8 @@ class PlugAnchoredSessionEngine:
 
         # All entities we subscribe to
         watched = [
-            e for e in [plug_entity, cable_lock_entity, energy_entity, power_entity, rfid_entity]
+            e
+            for e in [plug_entity, cable_lock_entity, energy_entity, power_entity, rfid_entity]
             if e
         ]
 
@@ -728,9 +727,7 @@ class PlugAnchoredSessionEngine:
             self._state = SessionEngineState.COMPLETING
             self._hass.async_create_task(self._async_complete_session())
 
-        self._disconnect_grace_cancel = async_call_later(
-            self._hass, grace_seconds, _grace_expired
-        )
+        self._disconnect_grace_cancel = async_call_later(self._hass, grace_seconds, _grace_expired)
 
     def _cancel_grace_timer(self) -> None:
         """Cancel the disconnect grace timer if active."""
@@ -772,7 +769,7 @@ class PlugAnchoredSessionEngine:
         # Update the active window's power reading
         tracker.on_power_change(now, power_w)
 
-        was_charging = (prev_power is not None and prev_power > 0)
+        was_charging = prev_power is not None and prev_power > 0
         is_charging = power_w > 0
 
         if is_charging and not tracker.is_open():
@@ -828,9 +825,7 @@ class PlugAnchoredSessionEngine:
             self._close_window(fire_time)
             self._dispatch_update()
 
-        self._idle_timer_cancel = async_call_later(
-            self._hass, idle_seconds, _idle_expired
-        )
+        self._idle_timer_cancel = async_call_later(self._hass, idle_seconds, _idle_expired)
 
     def _cancel_idle_timer(self) -> None:
         """Cancel the idle timer if active (power resumed before timeout)."""
@@ -1037,8 +1032,7 @@ class PlugAnchoredSessionEngine:
             )
             self._debug_logger.log(
                 "ENGINE_DECISION",
-                f"IDLE → TRACKING (trigger: plug=on + rfid_resolved) "
-                f"energy_start={energy:.3f}kWh",
+                f"IDLE → TRACKING (trigger: plug=on + rfid_resolved) energy_start={energy:.3f}kWh",
             )
 
         _LOGGER.info(
@@ -1070,14 +1064,14 @@ class PlugAnchoredSessionEngine:
             self._open_window(now)
             self._dispatch_update()
 
-    async def _async_handle_unknown_rfid(
-        self, rfid_index: int | None, reason: str
-    ) -> None:
+    async def _async_handle_unknown_rfid(self, rfid_index: int | None, reason: str) -> None:
         """Delegate unmapped-RFID handling to RfidBlocker (Story 07 / T056)."""
         try:
-            rfid_blocker = self._hass.data.get(
-                "ev_charging_manager", {}
-            ).get(self._entry.entry_id, {}).get("rfid_blocker")
+            rfid_blocker = (
+                self._hass.data.get("ev_charging_manager", {})
+                .get(self._entry.entry_id, {})
+                .get("rfid_blocker")
+            )
             if rfid_blocker is not None:
                 blocked = await rfid_blocker.async_on_unknown_rfid_detected(rfid_index, reason)
                 if self._active_session is not None:
@@ -1401,12 +1395,16 @@ class PlugAnchoredSessionEngine:
 
     def _format_signal_snapshot(self) -> str:
         live_energy = self._get_energy()
-        wh_str = f"{live_energy:.3f}" if live_energy is not None else (
-            f"{self._last_energy_kwh:.3f}" if self._last_energy_kwh is not None else "?"
+        wh_str = (
+            f"{live_energy:.3f}"
+            if live_energy is not None
+            else (f"{self._last_energy_kwh:.3f}" if self._last_energy_kwh is not None else "?")
         )
         live_power = self._get_power()
-        power_str = str(int(live_power)) if live_power is not None else (
-            str(int(self._last_power_w)) if self._last_power_w is not None else "?"
+        power_str = (
+            str(int(live_power))
+            if live_power is not None
+            else (str(int(self._last_power_w)) if self._last_power_w is not None else "?")
         )
         return f" | wh={wh_str} power={power_str}"
 

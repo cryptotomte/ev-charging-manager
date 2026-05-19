@@ -314,9 +314,7 @@ async def test_tc019_restart_window_state_power_on(
     engine = _get_engine(hass, entry)
 
     # Window must be open (power was >0 at restart)
-    assert engine.window_tracker.is_open(), (
-        "TC-019a: window must be open when power>0 at restart"
-    )
+    assert engine.window_tracker.is_open(), "TC-019a: window must be open when power>0 at restart"
     assert engine.get_status_sub_state() == "charging", (
         f"TC-019a: expected 'charging', got {engine.get_status_sub_state()!r}"
     )

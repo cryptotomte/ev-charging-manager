@@ -415,11 +415,7 @@ class _LastSessionDurationBase(_SessionSensorBase):
 
     def _session_store(self):
         """Return the SessionStore for this entry."""
-        return (
-            self._hass.data.get(DOMAIN, {})
-            .get(self._entry.entry_id, {})
-            .get("session_store")
-        )
+        return self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("session_store")
 
     def _last_completed_session(self) -> dict | None:
         """Return the most recently finalized session dict, or None."""
@@ -501,9 +497,7 @@ class LastSessionConnectionDurationSensor(_LastSessionDurationBase):
             return {}
         return {
             "connected_at": session.get("connected_at") or session.get("started_at"),
-            "disconnected_at": (
-                session.get("disconnected_at") or session.get("ended_at")
-            ),
+            "disconnected_at": (session.get("disconnected_at") or session.get("ended_at")),
             "user_name": session.get("user_name"),
             "session_id": session.get("id"),
         }

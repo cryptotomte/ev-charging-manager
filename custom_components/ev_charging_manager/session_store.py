@@ -148,10 +148,7 @@ class SessionStore:
         # A session is active (incomplete) when disconnected_at (preferred) or
         # ended_at (legacy) is None/missing.
         def _is_complete(s: dict[str, Any]) -> bool:
-            return (
-                s.get("disconnected_at") is not None
-                or s.get("ended_at") is not None
-            )
+            return s.get("disconnected_at") is not None or s.get("ended_at") is not None
 
         complete = [s for s in stored if _is_complete(s)]
         incomplete = [s for s in stored if not _is_complete(s)]
@@ -206,9 +203,7 @@ class SessionStore:
         Used by periodic save to survive HA restarts mid-session.
         """
         # Write all completed sessions + the active snapshot in the versioned envelope
-        await self._store.async_save(
-            self._make_envelope([*self._sessions, session_dict])
-        )
+        await self._store.async_save(self._make_envelope([*self._sessions, session_dict]))
 
     @callback
     def schedule_periodic_save(

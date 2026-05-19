@@ -52,8 +52,7 @@ def test_migration_adds_required_fields() -> None:
     for session in result["data"]:
         for field_name in required_new_fields:
             assert field_name in session, (
-                f"Session {session.get('id', '?')} is missing field {field_name!r} "
-                f"after migration"
+                f"Session {session.get('id', '?')} is missing field {field_name!r} after migration"
             )
 
 
@@ -98,9 +97,7 @@ def test_migration_maps_duration_seconds_to_charging_duration() -> None:
     data = load_fixture_data()
 
     # Capture original duration_seconds before migration
-    original_durations = {
-        s["id"]: s.get("duration_seconds", 0) for s in data["data"]
-    }
+    original_durations = {s["id"]: s.get("duration_seconds", 0) for s in data["data"]}
 
     result = _migrate_sessions_v1_1_to_v1_2(data)
 
@@ -178,6 +175,7 @@ def test_migration_is_idempotent() -> None:
 
     # Deep-copy via JSON round-trip
     import copy
+
     data_copy = copy.deepcopy(result_once)
 
     # Run again — must be a no-op

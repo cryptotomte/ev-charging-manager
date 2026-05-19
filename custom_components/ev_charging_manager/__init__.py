@@ -137,9 +137,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass, entry, config_store, session_store, _dl
         )
     else:
-        session_engine = SessionEngine(
-            hass, entry, config_store, session_store, _dl
-        )
+        session_engine = SessionEngine(hass, entry, config_store, session_store, _dl)
     if active_snapshot is not None:
         await session_engine.async_recover(active_snapshot)
     session_engine.async_setup()

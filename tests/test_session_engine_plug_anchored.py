@@ -72,9 +72,7 @@ async def _make_engine_entry(hass: HomeAssistant, options: dict | None = None) -
 
     entry.add_to_hass(hass)
 
-    with patch(
-        "homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock
-    ):
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -110,9 +108,7 @@ async def test_tc001_one_session_per_plug_cycle_bms_pulsing(
 
     session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
 
-    with patch(
-        "homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock
-    ):
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
         # Step 1: Plug in cable
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
@@ -194,9 +190,7 @@ async def test_tc002_charging_started_at_set_once(
     entry = await _make_engine_entry(hass)
     engine = _get_engine(hass, entry)
 
-    with patch(
-        "homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock
-    ):
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
         # Plug in
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
@@ -250,9 +244,7 @@ async def test_tc003_charging_ended_at_set_and_cleared(
     entry = await _make_engine_entry(hass, options={CONF_CHARGING_IDLE_TIMEOUT_MIN: 1})
     engine = _get_engine(hass, entry)
 
-    with patch(
-        "homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock
-    ):
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
         hass.states.async_set(MOCK_TRX_ENTITY, "2")
@@ -311,9 +303,7 @@ async def test_tc005_multi_window_session(
 
     hass.bus.async_listen(EVENT_CHARGING_CHARGED, capture_charged)
 
-    with patch(
-        "homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock
-    ):
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
         hass.states.async_set(MOCK_TRX_ENTITY, "2")

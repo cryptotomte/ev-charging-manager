@@ -163,9 +163,7 @@ async def test_tc022_overnight_charging_session(hass: HomeAssistant, freezer) ->
 
     # ---- Assertions ----
     sessions = session_store.sessions
-    assert len(sessions) == 1, (
-        f"TC-022: Expected 1 session, got {len(sessions)}: {sessions}"
-    )
+    assert len(sessions) == 1, f"TC-022: Expected 1 session, got {len(sessions)}: {sessions}"
 
     session = sessions[0]
 
@@ -260,9 +258,7 @@ async def test_tc004_avg_power_uses_charging_duration(hass: HomeAssistant, freez
         await hass.async_block_till_done()
 
     sessions = session_store.sessions
-    assert len(sessions) == 1, (
-        f"TC-004: Expected 1 session, got {len(sessions)}: {sessions}"
-    )
+    assert len(sessions) == 1, f"TC-004: Expected 1 session, got {len(sessions)}: {sessions}"
 
     session = sessions[0]
 

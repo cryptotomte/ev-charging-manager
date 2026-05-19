@@ -60,8 +60,10 @@ class Session:
     charging_duration_s: int = 0  # sum of all closed window durations
     charging_window_count: int = 0  # number of windows opened during the session
 
-    # PR-22: Block flag for Story 07 (unmapped RFID force-off)
-    blocked: bool = False
+    # PR-22 revision 2026-05-19: the originally-planned `blocked` field has been
+    # removed. Story 07 no longer force-stops sessions (passive notification model),
+    # so unmapped-RFID sessions are signalled solely via user_name="Unknown" /
+    # user_type="unknown" (the existing attribution). See FR-032 (REVISED).
 
     # Energy tracking
     energy_kwh: float = 0.0
@@ -124,7 +126,7 @@ class Session:
             "charging_ended_at": self.charging_ended_at,
             "charging_duration_s": self.charging_duration_s or self.duration_seconds,
             "charging_window_count": self.charging_window_count,
-            "blocked": self.blocked,
+            # PR-22 revision 2026-05-19: `blocked` field removed (FR-032 REVISED).
             # Energy
             "energy_kwh": self.energy_kwh,
             "energy_start_kwh": self.energy_start_kwh,
@@ -183,7 +185,8 @@ class Session:
             charging_ended_at=d.get("charging_ended_at"),
             charging_duration_s=int(charging_duration_s),
             charging_window_count=int(d.get("charging_window_count", 0)),
-            blocked=bool(d.get("blocked", False)),
+            # PR-22 revision 2026-05-19: `blocked` field removed (FR-032 REVISED).
+            # Any legacy stored `blocked: true` value is intentionally ignored.
             # Energy
             energy_kwh=float(d.get("energy_kwh", 0.0)),
             energy_start_kwh=float(d.get("energy_start_kwh", 0.0)),

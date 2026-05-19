@@ -18,9 +18,10 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from homeassistant.components import persistent_notification
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
@@ -38,6 +39,7 @@ from .const import (
     CONF_ETO_ENTITY,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
+    CONF_NOTIFY_UNMAPPED_RFID,
     CONF_PLUG_ENTITY,
     CONF_POWER_ENTITY,
     CONF_RFID_ENTITY,
@@ -54,6 +56,8 @@ from .const import (
     DEBUG_CAT_DISCONNECT_DETECTED,
     DEBUG_CAT_DISCONNECT_RESOLVED,
     DEBUG_CAT_HA_RESTART_DETECTED,
+    DEBUG_CAT_RFID_UNMAPPED_NOTIFIED,
+    DEBUG_CAT_RFID_UNMAPPED_NOTIFY_FAILED,
     DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT,
     DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
     DEBUG_CAT_SESSION_RESUMED,
@@ -62,6 +66,7 @@ from .const import (
     DEFAULT_DISCONNECT_GRACE_MIN,
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
+    DEFAULT_NOTIFY_UNMAPPED_RFID,
     DEFAULT_SPOT_ADDITIONAL_COST_KWH,
     DEFAULT_SPOT_FALLBACK_PRICE_KWH,
     DEFAULT_SPOT_VAT_MULTIPLIER,
@@ -69,6 +74,9 @@ from .const import (
     EVENT_CHARGING_CHARGED,
     EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
+    EVENT_UNKNOWN_RFID_DETECTED,
+    NOTIFICATION_ID_UNKNOWN_RFID,
+    SIGNAL_RFID_MAPPING_ADDED,
     SIGNAL_SESSION_UPDATE,
     UNKNOWN_REASON_RFID_INACTIVE,
     UNKNOWN_REASON_RFID_TYPE_ERROR,
@@ -185,6 +193,20 @@ class PlugAnchoredSessionEngine:
         self._hour_start_time: str = ""
         self._hourly_unsub: Any = None
 
+        # Story 07 (passive notification): set of notification IDs currently visible,
+        # keyed for auto-dismiss when the corresponding mapping is added (FR-022).
+        # Each entry pairs notification_id with the rfid_index (or None for trx-null).
+        self._active_unmapped_notifications: dict[str, int | None] = {}
+
+        # Engine-managed unsubs for listeners we register from inside the engine.
+        # Cleared on async_unload (FR-029 spirit — leaks were the root cause of
+        # BUG-6 where per-session async_on_unload accumulated stale handlers).
+        self._engine_unsubs: list[Any] = []
+
+        # Pending defer of restart recovery while plug entity is not yet available
+        # (BUG-3): unsub for the wait listener if scheduled.
+        self._deferred_recovery_unsub: Any = None
+
         # Build pricing engine from entry data (immutable at runtime)
         pricing_mode = entry.data.get("pricing_mode", "static")
         spot_config: SpotConfig | None = None
@@ -271,6 +293,43 @@ class PlugAnchoredSessionEngine:
             return None
         return self._active_session.to_dict()
 
+    async def async_unload(self) -> None:
+        """Tear down engine-managed listeners (BUG-6 fix).
+
+        Cancels any per-session callbacks (e.g. spot-pricing hourly tracker,
+        deferred-recovery wait listener) that we register from inside the
+        engine. Idempotent — safe to call multiple times.
+
+        Called from __init__.async_unload_entry. Listeners registered via
+        entry.async_on_unload are torn down by HA itself.
+        """
+        # Cancel idle/grace timers if still pending.
+        self._cancel_idle_timer()
+        self._cancel_grace_timer()
+
+        # Cancel deferred recovery wait if still in flight.
+        if self._deferred_recovery_unsub is not None:
+            try:
+                self._deferred_recovery_unsub()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("deferred-recovery unsub failed: %s", err)
+            self._deferred_recovery_unsub = None
+
+        # Cancel and clear all engine-managed unsubs.
+        for unsub in list(self._engine_unsubs):
+            try:
+                unsub()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("engine unsub failed: %s", err)
+        self._engine_unsubs.clear()
+
+        if self._hourly_unsub is not None:
+            try:
+                self._hourly_unsub()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("hourly_unsub failed: %s", err)
+            self._hourly_unsub = None
+
     # -----------------------------------------------------------------------
     # Recovery (called before async_setup by async_setup_entry)
     # -----------------------------------------------------------------------
@@ -295,11 +354,36 @@ class PlugAnchoredSessionEngine:
             self._active_session = None
 
     async def _async_do_recover(self, snapshot: dict) -> None:
-        """Execute the plug-anchored restart recovery logic."""
+        """Execute the plug-anchored restart recovery logic.
+
+        BUG-3 fix: when the plug entity is not yet available (None — unavailable /
+        unknown / entity not loaded at boot), DO NOT silently treat the plug as
+        off. That would prematurely complete the session with the wrong disconnect
+        time. Instead, defer recovery until a valid plug state arrives.
+        """
         now = dt_util.utcnow()
 
-        # Read current charger state
+        # Read current charger state — plug may be None if entity not yet loaded.
         current_plug = self._get_plug()
+        plug_entity_id = self._entry.options.get(CONF_PLUG_ENTITY)
+
+        if current_plug is None and plug_entity_id:
+            # Plug entity not yet reporting a usable value — defer recovery (BUG-3).
+            if self._debug_logger:
+                snap_id = snapshot.get("id", "?")
+                self._debug_logger.log(
+                    DEBUG_CAT_HA_RESTART_DETECTED,
+                    "RECOVERY_DEFERRED_WAITING_FOR_PLUG — plug entity unavailable at "
+                    f"recovery time (entity_id={plug_entity_id} snapshot_id={snap_id})",
+                )
+            _LOGGER.info(
+                "PlugAnchoredSessionEngine recovery: deferring — plug entity %s "
+                "not yet available; will retry on first valid state",
+                plug_entity_id,
+            )
+            await self._defer_recovery_until_plug_ready(snapshot, plug_entity_id)
+            return
+
         current_cable_lock = self._get_cable_lock()
         current_energy = self._get_energy() or 0.0
         current_power = self._get_power() or 0.0
@@ -315,7 +399,8 @@ class PlugAnchoredSessionEngine:
         energy_start = float(snapshot.get("energy_start_kwh", 0.0))
         energy_counter_reset = current_energy < energy_start
 
-        # Determine whether plug is currently on
+        # Determine whether plug is currently on (explicit string compare;
+        # None was handled by the early return above).
         plug_on = current_plug == "on"
 
         if plug_on and not energy_counter_reset:
@@ -336,6 +421,45 @@ class PlugAnchoredSessionEngine:
                     DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
                     f"session ended at restart — reason={reason} id={snapshot.get('id', '?')}",
                 )
+
+    async def _defer_recovery_until_plug_ready(self, snapshot: dict, plug_entity_id: str) -> None:
+        """Register a one-shot listener that re-runs recovery when plug entity is valid.
+
+        BUG-3 fix: avoids the silent-corruption path where current_plug == None at
+        boot causes the engine to assume plug is off and prematurely complete the
+        session with the restart timestamp as disconnected_at.
+        """
+
+        async def _on_plug_ready(event: Event) -> None:
+            new_state = event.data.get("new_state")
+            if new_state is None:
+                return
+            if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                return
+            # Plug entity now has a valid state — cancel listener and resume recovery.
+            if self._deferred_recovery_unsub is not None:
+                self._deferred_recovery_unsub()
+                self._deferred_recovery_unsub = None
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_HA_RESTART_DETECTED,
+                    f"plug entity now valid ({new_state.state!r}) — running deferred recovery",
+                )
+            try:
+                await self._async_do_recover(snapshot)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error(
+                    "PlugAnchoredSessionEngine deferred recovery failed: %s id=%s",
+                    err,
+                    snapshot.get("id", "?"),
+                )
+                self._state = SessionEngineState.IDLE
+                self._active_session = None
+
+        self._deferred_recovery_unsub = async_track_state_change_event(
+            self._hass, [plug_entity_id], _on_plug_ready
+        )
+        self._engine_unsubs.append(self._deferred_recovery_unsub)
 
     async def _resume_session_from_snapshot(
         self,
@@ -379,6 +503,26 @@ class PlugAnchoredSessionEngine:
         self._last_energy_kwh = current_energy
         self._last_power_w = current_power
         self._state = SessionEngineState.TRACKING
+
+        # BUG-2 fix: re-arm the spot-pricing hourly snapshot callback after restart.
+        # Without this, _hourly_unsub stays None, the hourly callback never fires,
+        # and post-restart energy is bundled incorrectly into the "current hour".
+        # Seed hour-state from the current wall clock and energy reading so the
+        # next hourly boundary correctly accounts for energy delivered since restart.
+        if self._pricing.mode == "spot" and self._hourly_unsub is None:
+            self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+            self._hour_energy_snapshot = max(0.0, current_energy - session.energy_start_kwh)
+            self._hourly_unsub = async_track_utc_time_change(
+                self._hass, self._async_hourly_snapshot, minute=0, second=0
+            )
+            self._engine_unsubs.append(self._hourly_unsub)
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_SESSION_RESUMED,
+                    "spot-pricing hourly snapshot callback re-armed at restart"
+                    f" (hour_start={self._hour_start_time}"
+                    f" hour_energy_snapshot={self._hour_energy_snapshot:.3f}kWh)",
+                )
 
         # Reconcile window state: if power > 0, continue/open a window; else keep closed
         if current_power > 0:
@@ -523,7 +667,22 @@ class PlugAnchoredSessionEngine:
             watched,
             self._async_on_state_change,
         )
+        # State-change listener stays for the lifetime of the entry; entry.async_on_unload
+        # is appropriate here (single registration). BUG-6 only applies to per-session
+        # registrations like the spot-pricing hourly callback.
         entry.async_on_unload(unsub)
+
+        # FR-022 (passive notification dismiss): subscribe to the
+        # SIGNAL_RFID_MAPPING_ADDED dispatcher signal so we can dismiss stale
+        # unmapped-RFID notifications when the user creates a mapping.
+        signal = SIGNAL_RFID_MAPPING_ADDED.format(entry.entry_id)
+        signal_unsub = async_dispatcher_connect(
+            self._hass,
+            signal,
+            self._on_rfid_mapping_added,
+        )
+        entry.async_on_unload(signal_unsub)
+
         _LOGGER.debug("PlugAnchoredSessionEngine registered listeners for: %s", watched)
 
         # Prime observation caches
@@ -630,9 +789,23 @@ class PlugAnchoredSessionEngine:
     # -----------------------------------------------------------------------
 
     def _handle_plug_change(self, new_val: str | None) -> None:
-        """Handle plug entity state change — the primary session boundary signal."""
-        if new_val is None:
-            # plug entity went unavailable — check for all-offline condition
+        """Handle plug entity state change — the primary session boundary signal.
+
+        BUG-7 fix: STATE_UNAVAILABLE / STATE_UNKNOWN (the literal strings, not
+        Python None) used to silently no-op. The go-e WebSocket emits these
+        strings when the integration loses contact with the device, and the old
+        code kept accumulating energy as if the plug were still on. Treat any
+        non-"on"/"off" plug value the same way the None branch does: surface
+        the transition to the offline-detector and log it for diagnostics.
+        """
+        if new_val is None or new_val in _INVALID_STATES:
+            # plug entity went unavailable / unknown / null — check for all-offline.
+            if self._debug_logger:
+                self._debug_logger.log(
+                    "PLUG_STATE",
+                    f"plug entity reports non-binary value: {new_val!r} — "
+                    "treating as offline (BUG-7 fix)",
+                )
             self._check_charger_offline()
             return
 
@@ -650,6 +823,13 @@ class PlugAnchoredSessionEngine:
             self._handle_plug_on()
         elif new_val == "off":
             self._handle_plug_off()
+        else:
+            # Defensive: any other non-on/off string we don't recognise. Log it.
+            if self._debug_logger:
+                self._debug_logger.log(
+                    "PLUG_STATE",
+                    f"plug entity reports unrecognised value {new_val!r}; ignored",
+                )
 
     def _handle_plug_on(self) -> None:
         """Plug transitioned off → on: start a new session (FR-001).
@@ -1017,7 +1197,11 @@ class PlugAnchoredSessionEngine:
             self._hourly_unsub = async_track_utc_time_change(
                 self._hass, self._async_hourly_snapshot, minute=0, second=0
             )
-            self._entry.async_on_unload(self._hourly_unsub)
+            # BUG-6 fix: do NOT call entry.async_on_unload here. Each session would
+            # leak a stale callback into the entry's unload list because
+            # _async_complete_session cancels the handle but cannot remove it from
+            # the list. Manage lifecycle ourselves via async_unload() below.
+            self._engine_unsubs.append(self._hourly_unsub)
 
         # Story 07: check for unmapped RFID and trigger blocking if needed
         if session_user_type == "unknown" and resolution is not None:
@@ -1065,19 +1249,118 @@ class PlugAnchoredSessionEngine:
             self._dispatch_update()
 
     async def _async_handle_unknown_rfid(self, rfid_index: int | None, reason: str) -> None:
-        """Delegate unmapped-RFID handling to RfidBlocker (Story 07 / T056)."""
+        """Passive-notification handler for unmapped RFID at session start.
+
+        PR-22 revision 2026-05-19 (Story 07 — REVISED):
+          1. Fire EVENT_UNKNOWN_RFID_DETECTED so user automations can react,
+             regardless of the notify_unmapped_rfid option (FR-024).
+          2. If notify_unmapped_rfid is True, create a persistent_notification
+             with a deterministic ID so the same RFID does not produce
+             duplicates and so the dismisser can later clear it (FR-021).
+          3. NEVER make an HTTP call to the charger (FR-023, Constitution §I).
+          4. NEVER raise — the session lifecycle must not be affected by a
+             notification failure (FR-025).
+        """
+        charger_name = self._entry.data.get(CONF_CHARGER_NAME, "")
+        now_iso = dt_util.utcnow().isoformat()
+
+        # FR-019 / FR-024: always fire the event (even when notifications disabled).
+        event_payload: dict[str, Any] = {
+            "rfid_index": rfid_index,
+            "reason": reason,
+            "charger_name": charger_name,
+            "detected_at": now_iso,
+        }
         try:
-            rfid_blocker = (
-                self._hass.data.get("ev_charging_manager", {})
-                .get(self._entry.entry_id, {})
-                .get("rfid_blocker")
-            )
-            if rfid_blocker is not None:
-                blocked = await rfid_blocker.async_on_unknown_rfid_detected(rfid_index, reason)
-                if self._active_session is not None:
-                    self._active_session.blocked = blocked
+            self._hass.bus.async_fire(EVENT_UNKNOWN_RFID_DETECTED, event_payload)
         except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("PlugAnchoredSessionEngine: RFID blocker failed: %s", err)
+            # Bus errors should not affect session lifecycle.
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: failed to fire EVENT_UNKNOWN_RFID_DETECTED: %s",
+                err,
+            )
+
+        notify_enabled = self._entry.options.get(
+            CONF_NOTIFY_UNMAPPED_RFID, DEFAULT_NOTIFY_UNMAPPED_RFID
+        )
+        if not notify_enabled:
+            return
+
+        # FR-021: deterministic notification ID.
+        notif_id_key = str(rfid_index) if rfid_index is not None else "null"
+        notification_id = NOTIFICATION_ID_UNKNOWN_RFID.format(notif_id_key)
+
+        # FR-020: notification text MUST be unambiguous about the consequence.
+        title = "EV Charging Manager: unmapped RFID tag"
+        rfid_label = f"RFID slot {rfid_index}" if rfid_index is not None else "the active RFID slot"
+        message = (
+            f"The charger **{charger_name}** accepted **{rfid_label}** "
+            f"({reason}), but no user mapping exists for it in this integration.\n\n"
+            "Energy from this session is being attributed to the **Unknown** "
+            "bucket in statistics and per-user totals.\n\n"
+            "To fix this, open the integration's **Configure → Add RFID mapping** "
+            "flow and assign the tag to a user. This notification will dismiss "
+            "automatically once the mapping is created."
+        )
+
+        try:
+            persistent_notification.async_create(
+                self._hass,
+                message=message,
+                title=title,
+                notification_id=notification_id,
+            )
+            self._active_unmapped_notifications[notification_id] = rfid_index
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_RFID_UNMAPPED_NOTIFIED,
+                    f"created persistent notification id={notification_id} "
+                    f"rfid_index={rfid_index} reason={reason}",
+                )
+        except Exception as err:  # noqa: BLE001
+            # FR-025: notification failure MUST NOT affect session lifecycle.
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_RFID_UNMAPPED_NOTIFY_FAILED,
+                    f"persistent_notification.async_create failed: {err!r} "
+                    f"id={notification_id} rfid_index={rfid_index}",
+                )
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: failed to create unmapped-RFID notification: %s",
+                err,
+            )
+
+    @callback
+    def _on_rfid_mapping_added(self, rfid_index: int | None) -> None:
+        """Auto-dismiss any active unmapped-RFID notification for this index.
+
+        Called via dispatcher signal SIGNAL_RFID_MAPPING_ADDED when ConfigStore
+        records a new RFID mapping (FR-022).
+        """
+        if not self._active_unmapped_notifications:
+            return
+
+        # Find any notification IDs whose rfid_index matches.
+        to_dismiss = [
+            nid for nid, idx in self._active_unmapped_notifications.items() if idx == rfid_index
+        ]
+        for notification_id in to_dismiss:
+            try:
+                persistent_notification.async_dismiss(self._hass, notification_id)
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        DEBUG_CAT_RFID_UNMAPPED_NOTIFIED,
+                        f"dismissed notification id={notification_id} "
+                        f"(mapping added for rfid_index={rfid_index})",
+                    )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "PlugAnchoredSessionEngine: dismiss failed for %s: %s",
+                    notification_id,
+                    err,
+                )
+            finally:
+                self._active_unmapped_notifications.pop(notification_id, None)
 
     # -----------------------------------------------------------------------
     # Session completion (T027)
@@ -1132,6 +1415,12 @@ class PlugAnchoredSessionEngine:
 
         # Spot mode: finalize last partial hour
         if self._pricing.mode == "spot" and self._hourly_unsub is not None:
+            # Remove the unsub from the engine-managed list before calling it so
+            # async_unload() doesn't double-cancel a stale handle (BUG-6).
+            try:
+                self._engine_unsubs.remove(self._hourly_unsub)
+            except ValueError:
+                pass
             self._hourly_unsub()
             self._hourly_unsub = None
             current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
@@ -1179,47 +1468,91 @@ class PlugAnchoredSessionEngine:
                 f"windows={session.charging_window_count} micro={is_micro}",
             )
 
-        if not is_micro:
-            await self._session_store.add_session(session.to_dict())
-            self._hass.bus.async_fire(
-                EVENT_SESSION_COMPLETED,
-                self._build_completed_event_data(session),
-            )
-            _LOGGER.info(
-                "PlugAnchoredSessionEngine: session completed id=%s energy=%.3f kWh "
-                "connection=%ds charging=%ds windows=%d",
-                session.id,
-                session.energy_kwh,
-                connection_s,
-                session.charging_duration_s,
-                session.charging_window_count,
-            )
-        else:
-            _LOGGER.info(
-                "PlugAnchoredSessionEngine: micro-session discarded id=%s "
-                "duration=%ds energy=%.3f kWh",
-                session.id,
-                connection_s,
-                session.energy_kwh,
-            )
+        # BUG-4 fix: wrap persist + event-fire in try/finally so a disk-full or JSON
+        # error cannot leave the engine stuck in COMPLETING with no event fired.
+        # The IDLE-reset block at the bottom MUST always run, and the SESSION_COMPLETED
+        # event MUST still fire so downstream stats consumers can recover.
+        persist_error: Exception | None = None
+        try:
+            if not is_micro:
+                try:
+                    await self._session_store.add_session(session.to_dict())
+                except Exception as err:  # noqa: BLE001
+                    persist_error = err
+                    _LOGGER.error(
+                        "PlugAnchoredSessionEngine: failed to persist session id=%s: %s",
+                        session.id,
+                        err,
+                        exc_info=True,
+                    )
+                    # Surface the failure to the user — without this they would
+                    # silently see "charging stopped working" with no diagnostic.
+                    try:
+                        persistent_notification.async_create(
+                            self._hass,
+                            message=(
+                                "Failed to persist a completed charging session. "
+                                f"session_id={session.id} error={err!r}.\n\n"
+                                "Check Home Assistant logs and available disk space."
+                            ),
+                            title="EV Charging Manager: session persist failed",
+                            notification_id=(f"ev_charging_manager_persist_failed_{session.id}"),
+                        )
+                    except Exception as notif_err:  # noqa: BLE001
+                        _LOGGER.debug(
+                            "PlugAnchoredSessionEngine: persist-failure notification "
+                            "also failed: %s",
+                            notif_err,
+                        )
+                # Always fire EVENT_SESSION_COMPLETED — even on persist failure —
+                # so downstream consumers (stats engine, automations) can react.
+                try:
+                    self._hass.bus.async_fire(
+                        EVENT_SESSION_COMPLETED,
+                        self._build_completed_event_data(session),
+                    )
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "PlugAnchoredSessionEngine: failed to fire SESSION_COMPLETED: %s",
+                        err,
+                    )
+                _LOGGER.info(
+                    "PlugAnchoredSessionEngine: session completed id=%s energy=%.3f kWh "
+                    "connection=%ds charging=%ds windows=%d persist_error=%s",
+                    session.id,
+                    session.energy_kwh,
+                    connection_s,
+                    session.charging_duration_s,
+                    session.charging_window_count,
+                    persist_error,
+                )
+            else:
+                _LOGGER.info(
+                    "PlugAnchoredSessionEngine: micro-session discarded id=%s "
+                    "duration=%ds energy=%.3f kWh",
+                    session.id,
+                    connection_s,
+                    session.energy_kwh,
+                )
+        finally:
+            # Record last session info for StatusSensor
+            self._last_session_user = session.user_name
+            self._last_session_rfid_index = session.rfid_index
 
-        # Record last session info for StatusSensor
-        self._last_session_user = session.user_name
-        self._last_session_rfid_index = session.rfid_index
+            # Reset to IDLE — must always happen so the engine does not get
+            # stuck in COMPLETING after a persist failure (BUG-4).
+            self._active_session = None
+            self._window_tracker = ChargingWindowTracker()
+            self._guest_pricing = None
+            self._last_energy_kwh = 0.0
+            self._last_power_w = 0.0
+            self._hour_energy_snapshot = 0.0
+            self._hour_start_time = ""
+            self._data_gap = False
+            self._eto_start = None
+            self._state = SessionEngineState.IDLE
 
-        # Reset to IDLE
-        self._active_session = None
-        self._window_tracker = ChargingWindowTracker()
-        self._guest_pricing = None
-        self._last_energy_kwh = 0.0
-        self._last_power_w = 0.0
-        self._hour_energy_snapshot = 0.0
-        self._hour_start_time = ""
-        self._data_gap = False
-        self._eto_start = None
-        self._state = SessionEngineState.IDLE
-
-        self._dispatch_update()
+            self._dispatch_update()
 
     def _build_completed_event_data(self, session: Session) -> dict[str, Any]:
         """Build the EVENT_SESSION_COMPLETED payload."""
@@ -1250,11 +1583,10 @@ class PlugAnchoredSessionEngine:
             "data_gap": session.data_gap,
             "rfid_index": session.rfid_index,
             "charger_name": self._entry.data.get("charger_name", "unknown"),
-            # PR-22 new fields
+            # PR-22 new fields (revision 2026-05-19: `blocked` removed per FR-032).
             "connection_duration_s": session.connection_duration_s,
             "charging_duration_s": session.charging_duration_s,
             "charging_window_count": session.charging_window_count,
-            "blocked": session.blocked,
         }
 
     # -----------------------------------------------------------------------

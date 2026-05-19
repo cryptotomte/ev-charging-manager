@@ -41,8 +41,12 @@ def _migrate_sessions_v1_1_to_v1_2(data: dict[str, Any]) -> dict[str, Any]:
     - Compute connection_duration_s from timestamps when both available
     - Map duration_seconds → charging_duration_s
     - Set new nullable fields (charging_started_at, charging_ended_at) to None
-    - Set new count/flag defaults (charging_window_count=0, blocked=False)
+    - Set new count default (charging_window_count=0)
     - Bump minor_version to 2
+
+    Note (PR-22 revision 2026-05-19): the originally-planned `blocked` field has
+    been removed (FR-032 REVISED). Story 07 no longer force-stops sessions, so
+    migrated records do not gain a `blocked` field.
     """
     if data.get("minor_version", 0) >= 2:
         return data  # already migrated — idempotent no-op
@@ -78,9 +82,9 @@ def _migrate_sessions_v1_1_to_v1_2(data: dict[str, Any]) -> dict[str, Any]:
         session.setdefault("charging_started_at", None)
         session.setdefault("charging_ended_at", None)
 
-        # New count/flag defaults
+        # New count default
+        # PR-22 revision 2026-05-19: do NOT add a `blocked` field (FR-032 REVISED).
         session.setdefault("charging_window_count", 0)
-        session.setdefault("blocked", False)
 
     data["minor_version"] = 2
     return data

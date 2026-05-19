@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from homeassistant.util import dt as dt_util
+
 
 @dataclass
 class ChargingWindow:
@@ -28,14 +30,45 @@ class ChargingWindow:
         last_power_change_at: Updated when power transitions between 0 and > 0.
                               Used to detect the idle threshold expiry.
         last_power_value:    Most recent power reading. Used to detect 0 → > 0 transitions.
+
+    All datetime fields are tz-aware UTC, matching the rest of the codebase
+    which uses ``homeassistant.util.dt.utcnow()``. BUG-5 fix: previously used
+    the deprecated naive ``datetime.utcnow()`` which produced TypeErrors when
+    subtracted from tz-aware datetimes elsewhere in the engine.
     """
 
     start_at: datetime
     end_at: datetime | None = None
     energy_start_kwh: float = 0.0
     energy_end_kwh: float | None = None
-    last_power_change_at: datetime = field(default_factory=datetime.utcnow)
+    last_power_change_at: datetime = field(default_factory=dt_util.utcnow)
     last_power_value: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Validate timestamps per data-model.md validation rules.
+
+        Raises RuntimeError on inconsistency:
+          - end_at must be ≥ start_at if set
+          - last_power_change_at must be ≥ start_at if end_at is set
+            (we only validate against the window's lifetime — pre-open updates
+            are not meaningful)
+
+        Use RuntimeError rather than assert (CLAUDE.md project rule: never use
+        assert in production — python -O strips them).
+        """
+        if self.end_at is not None and self.end_at < self.start_at:
+            raise RuntimeError(
+                f"ChargingWindow.end_at ({self.end_at!r}) must be >= start_at ({self.start_at!r})"
+            )
+        if (
+            self.end_at is not None
+            and self.last_power_change_at is not None
+            and self.last_power_change_at < self.start_at
+        ):
+            raise RuntimeError(
+                f"ChargingWindow.last_power_change_at ({self.last_power_change_at!r}) "
+                f"must be >= start_at ({self.start_at!r}) once the window is closed"
+            )
 
     @property
     def is_open(self) -> bool:
@@ -46,11 +79,12 @@ class ChargingWindow:
         """Return duration of this window in seconds.
 
         For closed windows returns the fixed duration. For an open window
-        returns the elapsed time up to `now` (or utcnow() if not provided).
+        returns the elapsed time up to `now` (or dt_util.utcnow() if not
+        provided — tz-aware UTC).
         """
         if self.end_at is not None:
             return int((self.end_at - self.start_at).total_seconds())
-        reference = now if now is not None else datetime.utcnow()
+        reference = now if now is not None else dt_util.utcnow()
         return int((reference - self.start_at).total_seconds())
 
     def energy_kwh(self) -> float:

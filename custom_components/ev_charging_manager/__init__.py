@@ -172,5 +172,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        # BUG-6: tear down engine-managed listeners (per-session unsubs) that we
+        # cannot register via entry.async_on_unload because they were created
+        # mid-session, not at setup. PlugAnchoredSessionEngine exposes async_unload;
+        # the legacy SessionEngine does not, so we duck-type the call.
+        domain_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        session_engine = domain_data.get("session_engine")
+        if session_engine is not None and hasattr(session_engine, "async_unload"):
+            try:
+                await session_engine.async_unload()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("session_engine.async_unload failed: %s", err)
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok

@@ -19,7 +19,6 @@ from homeassistant.helpers import selector
 
 from .charger_profiles import CHARGER_PROFILES
 from .const import (
-    CONF_BLOCK_UNMAPPED_RFID,
     CONF_CABLE_LOCK_ENTITY,
     CONF_CAR_STATUS_CHARGING_VALUE,
     CONF_CAR_STATUS_ENTITY,
@@ -39,6 +38,7 @@ from .const import (
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
     CONF_MODEL_STATUS_ENTITY,
+    CONF_NOTIFY_UNMAPPED_RFID,
     CONF_PERSISTENCE_INTERVAL_S,
     CONF_PLUG_ENTITY,
     CONF_POWER_ENTITY,
@@ -51,7 +51,6 @@ from .const import (
     CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
     CONF_TOTAL_ENERGY_ENTITY,
-    DEFAULT_BLOCK_UNMAPPED_RFID,
     DEFAULT_CHARGER_NAME,
     DEFAULT_CHARGING_EFFICIENCY,
     DEFAULT_CHARGING_IDLE_TIMEOUT_MIN,
@@ -61,6 +60,7 @@ from .const import (
     DEFAULT_MAX_STORED_SESSIONS,
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
+    DEFAULT_NOTIFY_UNMAPPED_RFID,
     DEFAULT_PERSISTENCE_INTERVAL_S,
     DEFAULT_PRICING_MODE,
     DEFAULT_SPOT_ADDITIONAL_COST_KWH,
@@ -503,7 +503,7 @@ class OptionsFlowHandler(OptionsFlow):
                 CONF_CHARGING_IDLE_TIMEOUT_MIN, DEFAULT_CHARGING_IDLE_TIMEOUT_MIN
             )
             self._new_options.setdefault(CONF_DISCONNECT_GRACE_MIN, DEFAULT_DISCONNECT_GRACE_MIN)
-            self._new_options.setdefault(CONF_BLOCK_UNMAPPED_RFID, DEFAULT_BLOCK_UNMAPPED_RFID)
+            self._new_options.setdefault(CONF_NOTIFY_UNMAPPED_RFID, DEFAULT_NOTIFY_UNMAPPED_RFID)
             return await self.async_step_pricing()
 
         opts = self.config_entry.options
@@ -578,8 +578,8 @@ class OptionsFlowHandler(OptionsFlow):
                     vol.Coerce(int),
                 ),
                 vol.Optional(
-                    CONF_BLOCK_UNMAPPED_RFID,
-                    default=opts.get(CONF_BLOCK_UNMAPPED_RFID, DEFAULT_BLOCK_UNMAPPED_RFID),
+                    CONF_NOTIFY_UNMAPPED_RFID,
+                    default=opts.get(CONF_NOTIFY_UNMAPPED_RFID, DEFAULT_NOTIFY_UNMAPPED_RFID),
                 ): selector.BooleanSelector(),
                 vol.Optional(
                     CONF_ETO_ENTITY,

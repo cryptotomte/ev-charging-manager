@@ -38,6 +38,7 @@ def test_migration_adds_required_fields() -> None:
 
     assert result["minor_version"] == 2
 
+    # PR-22 revision 2026-05-19: `blocked` field removed (FR-032 REVISED).
     required_new_fields = [
         "connected_at",
         "disconnected_at",
@@ -46,7 +47,6 @@ def test_migration_adds_required_fields() -> None:
         "charging_ended_at",
         "charging_duration_s",
         "charging_window_count",
-        "blocked",
     ]
 
     for session in result["data"]:
@@ -54,6 +54,10 @@ def test_migration_adds_required_fields() -> None:
             assert field_name in session, (
                 f"Session {session.get('id', '?')} is missing field {field_name!r} after migration"
             )
+        # FR-032 REVISED: migrated records must NOT have a `blocked` field.
+        assert "blocked" not in session, (
+            f"Session {session.get('id', '?')} unexpectedly contains 'blocked' field"
+        )
 
 
 def test_migration_maps_timestamps_correctly() -> None:
@@ -122,8 +126,13 @@ def test_migration_sets_nullable_fields_to_none() -> None:
         )
 
 
-def test_migration_sets_count_and_flag_defaults() -> None:
-    """charging_window_count must be 0 and blocked must be False for migrated records."""
+def test_migration_sets_count_default() -> None:
+    """charging_window_count must be 0 for migrated records.
+
+    PR-22 revision 2026-05-19 (FR-032 REVISED): the previously-planned `blocked`
+    field has been removed from the schema, so we no longer assert anything
+    about it here.
+    """
     data = load_fixture_data()
     result = _migrate_sessions_v1_1_to_v1_2(data)
 
@@ -131,8 +140,9 @@ def test_migration_sets_count_and_flag_defaults() -> None:
         assert session["charging_window_count"] == 0, (
             f"charging_window_count should be 0 for migrated session {session['id']}"
         )
-        assert session["blocked"] is False, (
-            f"blocked should be False for migrated session {session['id']}"
+        # Negative assertion: the `blocked` field must NOT be added.
+        assert "blocked" not in session, (
+            f"`blocked` field unexpectedly present for migrated session {session['id']}"
         )
 
 
@@ -214,8 +224,9 @@ async def test_session_store_runs_migration_on_load(hass: HomeAssistant) -> None
     migrated_saved = saved_data[-1]
     assert migrated_saved["minor_version"] == 2
 
-    # All loaded sessions must have v1.2 fields
+    # All loaded sessions must have v1.2 fields. PR-22 revision 2026-05-19
+    # (FR-032 REVISED): `blocked` field is NOT present.
     for s in sessions:
         assert "connected_at" in s
         assert "charging_duration_s" in s
-        assert "blocked" in s
+        assert "blocked" not in s

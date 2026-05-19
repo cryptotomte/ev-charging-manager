@@ -100,7 +100,7 @@
                     "error_entity": "Charger error sensor",
                     "charging_idle_timeout_min": "Charging idle timeout (minutes)",
                     "disconnect_grace_min": "Disconnect grace period (minutes)",
-                    "block_unmapped_rfid": "Block unmapped RFID tags",
+                    "notify_unmapped_rfid": "Notify on unmapped RFID tags",
                     "debug_logging": "Enable debug logging"
                 },
                 "data_description": {
@@ -115,7 +115,7 @@
                     "error_entity": "Optional. Sensor reporting charger error code (e.g. sensor.goe_123456_err_value). Used for ERR_STATE observation logging.",
                     "charging_idle_timeout_min": "How long power must stay at 0 W before a charging window is closed (3–30 min, default 5). Increase for vehicles with frequent BMS micro-pauses.",
                     "disconnect_grace_min": "How long to wait after a transient plug-off before force-ending the session (5–30 min, default 10). Only applies when cable lock is not Unlocked.",
-                    "block_unmapped_rfid": "When enabled and an unmapped RFID tag is detected, the integration will send a force-off command to the charger and create a persistent notification.",
+                    "notify_unmapped_rfid": "Notify when an RFID tag is detected by the charger but not mapped to a user in this integration. Energy from such sessions is attributed to the ''Unknown'' user. Disable only if you want to handle attribution gaps via automations.",
                     "debug_logging": "Write charging events to www/ev_charging_manager_debug.log for diagnostics. Disable when investigation is complete."
                 }
             },
@@ -172,11 +172,6 @@
         "button": {
             "clear_debug_log": {
                 "name": "Clear debug log"
-            }
-        },
-        "switch": {
-            "unknown_rfid_block": {
-                "name": "Block unmapped RFID"
             }
         }
     },

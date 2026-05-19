@@ -22,7 +22,7 @@ def _goe_entry() -> MockConfigEntry:
     """Return a go-e config entry (rfid_discovery enabled profile)."""
     return MockConfigEntry(
         domain=DOMAIN,
-        data=MOCK_CHARGER_DATA,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"},
         title="My go-e Charger",
     )
 

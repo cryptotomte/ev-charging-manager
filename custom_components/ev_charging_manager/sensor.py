@@ -11,7 +11,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory, UnitOfPower
+from homeassistant.const import EntityCategory, UnitOfPower, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
@@ -40,6 +40,9 @@ async def async_setup_entry(
         SessionPowerSensor(hass, entry),
         SessionSocAddedSensor(hass, entry),
         StatusSensor(hass, entry),
+        # PR-22: last-session duration sensors (US2 / T034)
+        LastSessionChargingDurationSensor(hass, entry),
+        LastSessionConnectionDurationSensor(hass, entry),
     ]
 
     # Per-user statistics sensors (PR-04, T011)
@@ -319,15 +322,28 @@ class StatusSensor(_SessionSensorBase):
 
     @property
     def native_value(self) -> str:
-        """Return current engine state. Falls back to 'idle' if engine missing."""
+        """Return current engine state.
+
+        For PlugAnchoredSessionEngine (goe_gemini profile), returns the fine-grained
+        sub-state: idle / waiting / charging / charged (per FR-013–FR-017, T041).
+        For the legacy SessionEngine, returns the raw state machine value.
+        Falls back to 'idle' if engine is missing.
+        """
         engine = self._engine()
         if engine is None:
             return SessionEngineState.IDLE
+        # PlugAnchoredSessionEngine exposes get_status_sub_state() (PR-22 / T041)
+        if hasattr(engine, "get_status_sub_state"):
+            return engine.get_status_sub_state()
         return engine.state
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return diagnostic attributes: last unknown reason, timestamp, charger connectivity."""
+        """Return diagnostic attributes: last unknown reason, timestamp, charger connectivity.
+
+        PR-22 (T035): adds current_session_id, current_charging_window_count,
+        current_charging_duration_s, current_connection_duration_s for active sessions.
+        """
         engine = self._engine()
         # charger_connected: True when car_status entity is reachable (not unavailable/unknown)
         car_entity = self._entry.data.get(CONF_CAR_STATUS_ENTITY)
@@ -338,10 +354,150 @@ class StatusSensor(_SessionSensorBase):
                 "unavailable",
                 "unknown",
             )
+
+        # PR-22: live active session attributes (read from PlugAnchoredSessionEngine only)
+        current_session_id: str | None = None
+        current_charging_window_count: int = 0
+        current_charging_duration_s: int = 0
+        current_connection_duration_s: int = 0
+        if engine is not None:
+            active = engine.active_session
+            if active is not None:
+                current_session_id = active.id
+                current_charging_window_count = active.charging_window_count or 0
+                current_charging_duration_s = active.charging_duration_s or 0
+                # Live connection duration from connected_at
+                if active.connected_at or active.started_at:
+                    from datetime import datetime
+
+                    from homeassistant.util import dt as dt_util
+
+                    ts_str = active.connected_at or active.started_at
+                    try:
+                        connected = datetime.fromisoformat(ts_str)
+                        current_connection_duration_s = int(
+                            (dt_util.utcnow() - connected).total_seconds()
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
         return {
             "last_unknown_reason": engine.last_unknown_reason if engine else None,
             "last_unknown_at": engine.last_unknown_at if engine else None,
             "charger_connected": charger_connected,
             "last_session_user": engine.last_session_user if engine else None,
             "last_session_rfid_index": engine.last_session_rfid_index if engine else None,
+            # PR-22 live active-session attributes (T035)
+            "current_session_id": current_session_id,
+            "current_charging_window_count": current_charging_window_count,
+            "current_charging_duration_s": current_charging_duration_s,
+            "current_connection_duration_s": current_connection_duration_s,
+        }
+
+
+# ---------------------------------------------------------------------------
+# PR-22 (T034): Last-session duration sensors
+# ---------------------------------------------------------------------------
+
+
+class _LastSessionDurationBase(_SessionSensorBase):
+    """Base for last-session duration sensors.
+
+    Reports the duration from the most-recently finalized session.
+    Availability: unavailable until at least one session has been completed.
+    Subscribes to SIGNAL_SESSION_UPDATE (same dispatcher as all other sensors).
+    """
+
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def _session_store(self):
+        """Return the SessionStore for this entry."""
+        return self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("session_store")
+
+    def _last_completed_session(self) -> dict | None:
+        """Return the most recently finalized session dict, or None."""
+        store = self._session_store()
+        if store is None:
+            return None
+        sessions = store.sessions
+        return sessions[-1] if sessions else None
+
+    @property
+    def available(self) -> bool:
+        """Unavailable until at least one session has been completed."""
+        return self._last_completed_session() is not None
+
+
+class LastSessionChargingDurationSensor(_LastSessionDurationBase):
+    """Reports the charging duration of the last completed session (seconds).
+
+    Per contracts/ha-entities.md: state = charging_duration_s from last session.
+    Attributes: started_at (= charging_started_at), ended_at (= charging_ended_at),
+    window_count, user_name, session_id.
+    """
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        """Initialize the sensor."""
+        super().__init__(hass, entry)
+        self._attr_unique_id = f"{entry.entry_id}_last_session_charging_duration"
+        self._attr_translation_key = "last_session_charging_duration"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return charging_duration_s of the last completed session."""
+        session = self._last_completed_session()
+        if session is None:
+            return None
+        return session.get("charging_duration_s") or 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return charging-window details from the last session."""
+        session = self._last_completed_session()
+        if session is None:
+            return {}
+        return {
+            "started_at": session.get("charging_started_at"),
+            "ended_at": session.get("charging_ended_at"),
+            "window_count": session.get("charging_window_count", 0),
+            "user_name": session.get("user_name"),
+            "session_id": session.get("id"),
+        }
+
+
+class LastSessionConnectionDurationSensor(_LastSessionDurationBase):
+    """Reports the total connection duration of the last completed session (seconds).
+
+    Per contracts/ha-entities.md: state = connection_duration_s from last session.
+    Attributes: connected_at, disconnected_at, user_name, session_id.
+    """
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        """Initialize the sensor."""
+        super().__init__(hass, entry)
+        self._attr_unique_id = f"{entry.entry_id}_last_session_connection_duration"
+        self._attr_translation_key = "last_session_connection_duration"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return connection_duration_s of the last completed session."""
+        session = self._last_completed_session()
+        if session is None:
+            return None
+        return session.get("connection_duration_s") or 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return connection-window details from the last session."""
+        session = self._last_completed_session()
+        if session is None:
+            return {}
+        return {
+            "connected_at": session.get("connected_at") or session.get("started_at"),
+            "disconnected_at": (session.get("disconnected_at") or session.get("ended_at")),
+            "user_name": session.get("user_name"),
+            "session_id": session.get("id"),
         }

@@ -117,7 +117,10 @@ EVENT_SESSION_COMPLETED = "ev_charging_manager_session_completed"
 # Dispatcher signal for sensor updates (format with entry_id)
 SIGNAL_SESSION_UPDATE = "ev_charging_manager_session_update_{}"
 
-# Platforms to forward to
+# Platforms to forward to.
+# Note (PR-22 revision 2026-05-19): Platform.SWITCH was previously included for the
+# unknown-RFID active-blocking switch, but Story 07 has been reworked into a passive
+# notification model (Constitution §I observer-only). No Switch entity is exposed.
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
 
 # Cross-validation: total energy counter entity (PR-07)
@@ -165,3 +168,68 @@ GOE_FLAT_KEY_SUFFIX_INSTALLED = "i"
 
 # Firmware version threshold for flat key format
 GOE_FLAT_KEYS_FW_THRESHOLD = 60
+
+# ---------------------------------------------------------------------------
+# PR-22: Session boundary redesign — new configuration keys and debug categories
+# ---------------------------------------------------------------------------
+
+# New advanced options for the plug-anchored session model (OptionsFlowHandler)
+CONF_CHARGING_IDLE_TIMEOUT_MIN = "charging_idle_timeout_min"
+CONF_DISCONNECT_GRACE_MIN = "disconnect_grace_min"
+
+# PR-22 revision 2026-05-19: passive notification replaces active blocking for Story 07.
+# Default to True so existing installs surface attribution gaps; users may disable to
+# rely solely on the EVENT_UNKNOWN_RFID_DETECTED event for their own automations.
+CONF_NOTIFY_UNMAPPED_RFID = "notify_unmapped_rfid"
+
+# Defaults and ranges for the new advanced options
+DEFAULT_CHARGING_IDLE_TIMEOUT_MIN = 5  # minutes; range 3–30
+DEFAULT_DISCONNECT_GRACE_MIN = 10  # minutes; range 5–30
+DEFAULT_NOTIFY_UNMAPPED_RFID = True
+
+MIN_CHARGING_IDLE_TIMEOUT_MIN = 3
+MAX_CHARGING_IDLE_TIMEOUT_MIN = 30
+MIN_DISCONNECT_GRACE_MIN = 5
+MAX_DISCONNECT_GRACE_MIN = 30
+
+# Maximum time to wait for the plug entity to become available before giving up
+# on deferred restart recovery (HIGH-1 fix). If the plug entity never reports a
+# valid state within this window (e.g. user misconfigured the entity id, the
+# charger is permanently offline), the engine notifies the user via a persistent
+# notification and force-completes the snapshot as a reconstructed session.
+DEFERRED_RECOVERY_TIMEOUT_MIN = 60  # minutes
+
+# New debug log categories (FR-034) — used as the first argument to DebugLogger.log().
+# The DebugLogger accepts arbitrary category strings; these constants ensure
+# consistent spelling across session_engine_v2.py and tests.
+DEBUG_CAT_CHARGING_WINDOW_OPEN = "CHARGING_WINDOW_OPEN"
+DEBUG_CAT_CHARGING_WINDOW_CLOSE = "CHARGING_WINDOW_CLOSE"
+DEBUG_CAT_DISCONNECT_DETECTED = "DISCONNECT_DETECTED"
+DEBUG_CAT_DISCONNECT_RESOLVED = "DISCONNECT_RESOLVED"
+DEBUG_CAT_HA_RESTART_DETECTED = "HA_RESTART_DETECTED"
+DEBUG_CAT_SESSION_RESUMED = "SESSION_RESUMED"
+DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART = "SESSION_FORCE_ENDED_BY_RESTART"
+DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT = "SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT"
+DEBUG_CAT_CHARGER_OFFLINE = "CHARGER_OFFLINE"
+DEBUG_CAT_CHARGER_BACK_ONLINE = "CHARGER_BACK_ONLINE"
+DEBUG_CAT_TRX_MIDSESSION = "TRX_MIDSESSION"
+# PR-22 revision 2026-05-19: replaced RFID_BLOCKED / RFID_BLOCK_FAILED / RFID_BLOCK_RELEASED
+# with passive-notification categories — no HTTP control of the charger is performed.
+DEBUG_CAT_RFID_UNMAPPED_NOTIFIED = "RFID_UNMAPPED_NOTIFIED"
+DEBUG_CAT_RFID_UNMAPPED_NOTIFY_FAILED = "RFID_UNMAPPED_NOTIFY_FAILED"
+
+# HIGH-1: deferred restart recovery timed out (plug entity never appeared).
+DEBUG_CAT_RECOVERY_TIMEOUT = "RECOVERY_TIMEOUT"
+
+# New HA events (PR-22)
+EVENT_CHARGING_CHARGED = "ev_charging_charged"
+EVENT_UNKNOWN_RFID_DETECTED = "ev_charging_unknown_rfid_detected"
+
+# Dispatcher signal fired by ConfigStore when an RFID mapping is added so the
+# unmapped-RFID notification dismisser can clear stale notifications (FR-022).
+# Formatted with entry_id at registration time.
+SIGNAL_RFID_MAPPING_ADDED = "ev_charging_manager_rfid_mapping_added_{}"
+
+# Persistent notification ID prefix for unmapped RFID.
+# Use as: NOTIFICATION_ID_UNKNOWN_RFID.format(rfid_index_or_null_str)
+NOTIFICATION_ID_UNKNOWN_RFID = "ev_charging_manager_unmapped_rfid_{}"

@@ -27,7 +27,9 @@ from .const import (
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
     CONF_CHARGER_SERIAL,
+    CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DEBUG_LOGGING,
+    CONF_DISCONNECT_GRACE_MIN,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
     CONF_ERROR_ENTITY,
@@ -36,6 +38,7 @@ from .const import (
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
     CONF_MODEL_STATUS_ENTITY,
+    CONF_NOTIFY_UNMAPPED_RFID,
     CONF_PERSISTENCE_INTERVAL_S,
     CONF_PLUG_ENTITY,
     CONF_POWER_ENTITY,
@@ -50,11 +53,14 @@ from .const import (
     CONF_TOTAL_ENERGY_ENTITY,
     DEFAULT_CHARGER_NAME,
     DEFAULT_CHARGING_EFFICIENCY,
+    DEFAULT_CHARGING_IDLE_TIMEOUT_MIN,
     DEFAULT_DEBUG_LOGGING,
+    DEFAULT_DISCONNECT_GRACE_MIN,
     DEFAULT_ENERGY_UNIT,
     DEFAULT_MAX_STORED_SESSIONS,
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
+    DEFAULT_NOTIFY_UNMAPPED_RFID,
     DEFAULT_PERSISTENCE_INTERVAL_S,
     DEFAULT_PRICING_MODE,
     DEFAULT_SPOT_ADDITIONAL_COST_KWH,
@@ -492,6 +498,12 @@ class OptionsFlowHandler(OptionsFlow):
                 CONF_ERROR_ENTITY,
             ):
                 self._new_options[conf_key] = user_input.get(conf_key)
+            # Preserve timing options with their defaults when absent
+            self._new_options.setdefault(
+                CONF_CHARGING_IDLE_TIMEOUT_MIN, DEFAULT_CHARGING_IDLE_TIMEOUT_MIN
+            )
+            self._new_options.setdefault(CONF_DISCONNECT_GRACE_MIN, DEFAULT_DISCONNECT_GRACE_MIN)
+            self._new_options.setdefault(CONF_NOTIFY_UNMAPPED_RFID, DEFAULT_NOTIFY_UNMAPPED_RFID)
             return await self.async_step_pricing()
 
         opts = self.config_entry.options
@@ -541,6 +553,34 @@ class OptionsFlowHandler(OptionsFlow):
                     ),
                     vol.Coerce(int),
                 ),
+                vol.Optional(
+                    CONF_CHARGING_IDLE_TIMEOUT_MIN,
+                    default=opts.get(
+                        CONF_CHARGING_IDLE_TIMEOUT_MIN, DEFAULT_CHARGING_IDLE_TIMEOUT_MIN
+                    ),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=3, max=30, step=1, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_DISCONNECT_GRACE_MIN,
+                    default=opts.get(CONF_DISCONNECT_GRACE_MIN, DEFAULT_DISCONNECT_GRACE_MIN),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=5, max=30, step=1, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_NOTIFY_UNMAPPED_RFID,
+                    default=opts.get(CONF_NOTIFY_UNMAPPED_RFID, DEFAULT_NOTIFY_UNMAPPED_RFID),
+                ): selector.BooleanSelector(),
                 vol.Optional(
                     CONF_ETO_ENTITY,
                     description={"suggested_value": opts.get(CONF_ETO_ENTITY)},

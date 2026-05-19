@@ -579,7 +579,7 @@ async def test_mig_01_fresh_goe_install_populates_observation_slots(
     """T-MIG-01: Fresh go-e install has observation slots in entry.options after setup."""
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={**MOCK_CHARGER_DATA, "charger_serial": "S"},
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini", "charger_serial": "S"},
         options={},
         title="Test Charger",
     )
@@ -600,7 +600,7 @@ async def test_mig_02_pre_pr20_entry_gets_observation_slots_on_setup(
     # Simulate a pre-PR-20 entry: options has no observation keys
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={**MOCK_CHARGER_DATA, "charger_serial": "abc123"},
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini", "charger_serial": "abc123"},
         options={"min_session_duration_s": 60},
         title="Test Charger",
     )
@@ -624,7 +624,7 @@ async def test_mig_03_pre_existing_observation_slot_not_overwritten(
     custom_plug = "binary_sensor.my_custom_plug"
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={**MOCK_CHARGER_DATA, "charger_serial": "abc123"},
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini", "charger_serial": "abc123"},
         options={CONF_PLUG_ENTITY: custom_plug},
         title="Test Charger",
     )

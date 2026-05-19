@@ -1,0 +1,96 @@
+# Replay fixture: Petra's Peugeot 3008 PHEV — 2026-05-16
+# Sanitized: RFID UIDs anonymized (card indices preserved), no PII.
+# Pattern: one cable insertion, BMS balancing cycles cause car_status to oscillate
+# Charging↔Complete at 60–119 s intervals throughout.
+# Result expected by TC-007: exactly 1 session, energy_kwh ≈ 11.078 kWh,
+# charging_window_count ≥ 2, no GATE_PROMOTE/BALANCING_SKIP.
+#
+# Format: ISO8601 timestamp | category        | message
+# The _log_parser.py helper reads this format.
+
+2026-05-16T11:45:09.123 | PLUG_STATE      | plug changed: off → on | wh=0.000 power=0
+2026-05-16T11:45:10.234 | CABLE_LOCK      | cus changed: Unlocked → Locked | wh=0.000 power=0
+2026-05-16T11:45:11.012 | TRX_STATE       | trx changed: null → 2 | wh=0.000 power=0
+2026-05-16T11:45:15.001 | CAR_STATE       | car_value changed: Idle → Wait for car | wh=0.000 power=0
+2026-05-16T11:45:18.500 | CAR_STATE       | car_value changed: Wait for car → Charging | wh=0.000 power=0
+2026-05-16T11:45:21.300 | POWER           | power changed: 0 → 3456 | wh=0.000 power=3456
+2026-05-16T11:45:21.301 | SESSION_START   | session_id=petra-session-001 user=Petra charger=My go-e Charger
+2026-05-16T11:45:21.302 | ENGINE_DECISION | IDLE → TRACKING (trigger: plug=on + rfid=known)
+2026-05-16T11:45:21.303 | CHARGING_WINDOW_OPEN | window=1 energy_start=0.000 kWh
+2026-05-16T11:47:05.100 | CAR_STATE       | car_value changed: Charging → Complete | wh=0.158 power=0
+2026-05-16T11:47:05.101 | POWER           | power changed: 3456 → 0 | wh=0.158 power=0
+# BMS pause < 5 min — window stays open
+2026-05-16T11:48:03.200 | CAR_STATE       | car_value changed: Complete → Charging | wh=0.165 power=3412
+2026-05-16T11:48:03.201 | POWER           | power changed: 0 → 3412 | wh=0.165 power=3412
+2026-05-16T11:49:55.300 | CAR_STATE       | car_value changed: Charging → Complete | wh=0.354 power=0
+2026-05-16T11:49:55.301 | POWER           | power changed: 3412 → 0 | wh=0.354 power=0
+2026-05-16T11:50:48.400 | CAR_STATE       | car_value changed: Complete → Charging | wh=0.358 power=3398
+2026-05-16T11:50:48.401 | POWER           | power changed: 0 → 3398 | wh=0.358 power=3398
+2026-05-16T11:52:40.500 | CAR_STATE       | car_value changed: Charging → Complete | wh=0.552 power=0
+2026-05-16T11:52:40.501 | POWER           | power changed: 3398 → 0 | wh=0.552 power=0
+2026-05-16T11:53:35.600 | CAR_STATE       | car_value changed: Complete → Charging | wh=0.556 power=3445
+2026-05-16T11:53:35.601 | POWER           | power changed: 0 → 3445 | wh=0.556 power=3445
+2026-05-16T11:55:22.700 | CAR_STATE       | car_value changed: Charging → Complete | wh=0.746 power=0
+2026-05-16T11:55:22.701 | POWER           | power changed: 3445 → 0 | wh=0.746 power=0
+2026-05-16T11:56:18.800 | CAR_STATE       | car_value changed: Complete → Charging | wh=0.751 power=3421
+2026-05-16T11:56:18.801 | POWER           | power changed: 0 → 3421 | wh=0.751 power=3421
+2026-05-16T11:58:10.900 | CAR_STATE       | car_value changed: Charging → Complete | wh=0.942 power=0
+2026-05-16T11:58:10.901 | POWER           | power changed: 3421 → 0 | wh=0.942 power=0
+2026-05-16T11:59:05.000 | CAR_STATE       | car_value changed: Complete → Charging | wh=0.947 power=3467
+2026-05-16T11:59:05.001 | POWER           | power changed: 0 → 3467 | wh=0.947 power=3467
+2026-05-16T12:01:00.100 | CAR_STATE       | car_value changed: Charging → Complete | wh=1.143 power=0
+2026-05-16T12:01:00.101 | POWER           | power changed: 3467 → 0 | wh=1.143 power=0
+2026-05-16T12:01:58.200 | CAR_STATE       | car_value changed: Complete → Charging | wh=1.148 power=3412
+2026-05-16T12:01:58.201 | POWER           | power changed: 0 → 3412 | wh=1.148 power=3412
+2026-05-16T12:03:52.300 | CAR_STATE       | car_value changed: Charging → Complete | wh=1.342 power=0
+2026-05-16T12:03:52.301 | POWER           | power changed: 3412 → 0 | wh=1.342 power=0
+2026-05-16T12:04:47.400 | CAR_STATE       | car_value changed: Complete → Charging | wh=1.347 power=3434
+2026-05-16T12:04:47.401 | POWER           | power changed: 0 → 3434 | wh=1.347 power=3434
+2026-05-16T12:06:40.500 | CAR_STATE       | car_value changed: Charging → Complete | wh=1.540 power=0
+2026-05-16T12:06:40.501 | POWER           | power changed: 3434 → 0 | wh=1.540 power=0
+2026-05-16T12:07:35.600 | CAR_STATE       | car_value changed: Complete → Charging | wh=1.545 power=3451
+2026-05-16T12:07:35.601 | POWER           | power changed: 0 → 3451 | wh=1.545 power=3451
+2026-05-16T12:09:28.700 | CAR_STATE       | car_value changed: Charging → Complete | wh=1.739 power=0
+2026-05-16T12:09:28.701 | POWER           | power changed: 3451 → 0 | wh=1.739 power=0
+2026-05-16T12:10:24.800 | CAR_STATE       | car_value changed: Complete → Charging | wh=1.744 power=3423
+2026-05-16T12:10:24.801 | POWER           | power changed: 0 → 3423 | wh=1.744 power=3423
+# Continuing BMS pulse pattern... (abbreviated for fixture size)
+# The key invariant: plug stays ON throughout; energy accumulates monotonically to 11.078 kWh
+# Long period of charging with BMS pulses continues until ~12:28
+2026-05-16T12:12:20.900 | CAR_STATE       | car_value changed: Charging → Complete | wh=1.941 power=0
+2026-05-16T12:12:20.901 | POWER           | power changed: 3423 → 0 | wh=1.941 power=0
+2026-05-16T12:13:16.000 | CAR_STATE       | car_value changed: Complete → Charging | wh=1.946 power=3389
+2026-05-16T12:13:16.001 | POWER           | power changed: 0 → 3389 | wh=1.946 power=3389
+2026-05-16T12:15:09.100 | CAR_STATE       | car_value changed: Charging → Complete | wh=2.139 power=0
+2026-05-16T12:15:09.101 | POWER           | power changed: 3389 → 0 | wh=2.139 power=0
+2026-05-16T12:16:04.200 | CAR_STATE       | car_value changed: Complete → Charging | wh=2.144 power=3412
+2026-05-16T12:16:04.201 | POWER           | power changed: 0 → 3412 | wh=2.144 power=3412
+2026-05-16T12:17:58.300 | CAR_STATE       | car_value changed: Charging → Complete | wh=2.340 power=0
+2026-05-16T12:17:58.301 | POWER           | power changed: 3412 → 0 | wh=2.340 power=0
+2026-05-16T12:18:52.400 | CAR_STATE       | car_value changed: Complete → Charging | wh=2.345 power=3398
+2026-05-16T12:18:52.401 | POWER           | power changed: 0 → 3398 | wh=2.345 power=3398
+2026-05-16T12:20:46.500 | CAR_STATE       | car_value changed: Charging → Complete | wh=2.540 power=0
+2026-05-16T12:20:46.501 | POWER           | power changed: 3398 → 0 | wh=2.540 power=0
+2026-05-16T12:21:41.600 | CAR_STATE       | car_value changed: Complete → Charging | wh=2.545 power=3401
+2026-05-16T12:21:41.601 | POWER           | power changed: 0 → 3401 | wh=2.545 power=3401
+# ... more BMS cycles ... energy accumulates ...
+# Window 1 closes (power=0 sustained > 5 min after a final real "done" period)
+# Then at some point car does post-window balancing burst → window 2 opens
+# For test simplicity we simulate a 5+ min idle then resume
+2026-05-16T12:23:35.700 | CAR_STATE       | car_value changed: Charging → Complete | wh=2.742 power=0
+2026-05-16T12:23:35.701 | POWER           | power changed: 3401 → 0 | wh=2.742 power=0
+# 5+ minute idle period — window 1 closes here
+2026-05-16T12:29:00.000 | CHARGING_WINDOW_CLOSE | window=1 energy_end=5.500 kWh duration=2618s
+# Post-completion balancing burst (window 2)
+2026-05-16T12:29:01.000 | CAR_STATE       | car_value changed: Complete → Charging | wh=5.500 power=3456
+2026-05-16T12:29:01.001 | POWER           | power changed: 0 → 3456 | wh=5.500 power=3456
+2026-05-16T12:29:01.002 | CHARGING_WINDOW_OPEN | window=2 energy_start=5.500 kWh
+# Balancing burst continues until full charge
+2026-05-16T12:35:00.000 | CAR_STATE       | car_value changed: Charging → Complete | wh=11.078 power=0
+2026-05-16T12:35:00.001 | POWER           | power changed: 3456 → 0 | wh=11.078 power=0
+# Another 5+ min idle — window 2 closes
+2026-05-16T12:40:30.000 | CHARGING_WINDOW_CLOSE | window=2 energy_end=11.078 kWh duration=329s
+# User unplugs cable
+2026-05-16T12:42:15.500 | CABLE_LOCK      | cus changed: Locked → Unlocked | wh=11.078 power=0
+2026-05-16T12:42:16.200 | PLUG_STATE      | plug changed: on → off | wh=11.078 power=0
+2026-05-16T12:42:16.201 | SESSION_STOP    | session_id=petra-session-001 energy=11.078kWh duration=0:57:07

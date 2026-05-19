@@ -7,9 +7,11 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
 from .const import (
+    SIGNAL_RFID_MAPPING_ADDED,
     STORE_KEY,
     STORE_VERSION,
     SUBENTRY_TYPE_RFID_MAPPING,
@@ -32,6 +34,7 @@ class ConfigStore:
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize the config store."""
+        self._hass = hass
         self._store: Store[dict[str, Any]] = Store(hass, STORE_VERSION, STORE_KEY)
         self._data: dict[str, Any] = {**EMPTY_CONFIG}
 
@@ -59,7 +62,16 @@ class ConfigStore:
         return self._data
 
     async def async_sync_from_subentries(self, entry: ConfigEntry) -> None:
-        """Rebuild JSON config from subentries (source of truth) and persist."""
+        """Rebuild JSON config from subentries (source of truth) and persist.
+
+        Emits SIGNAL_RFID_MAPPING_ADDED for each newly-added RFID mapping
+        (compared to the previous in-memory snapshot) so that
+        PlugAnchoredSessionEngine can auto-dismiss any pending unmapped-RFID
+        persistent notification (FR-022, PR-22 revision 2026-05-19).
+        """
+        # Capture previous RFID-mapping set for diffing before we overwrite _data.
+        previous_indices = {m.get("card_index") for m in self._data.get("rfid_mappings", []) if m}
+
         vehicles: list[dict[str, Any]] = []
         users: list[dict[str, Any]] = []
         rfid_mappings: list[dict[str, Any]] = []
@@ -82,3 +94,17 @@ class ConfigStore:
             "rfid_mappings": rfid_mappings,
         }
         await self.async_save()
+
+        # Diff and emit dispatcher signal for any newly-added mapping.
+        # `card_index` is the integer slot 0–9; matches Session.rfid_index used by
+        # the notification dismisser. We deliberately fire one signal per newly-
+        # added index so the dismisser receives the exact value(s) it should
+        # match against active notifications.
+        new_indices = {m.get("card_index") for m in rfid_mappings if m} - previous_indices
+        if new_indices:
+            signal = SIGNAL_RFID_MAPPING_ADDED.format(entry.entry_id)
+            for idx in new_indices:
+                # idx may be None if subentry data is malformed; pass through so
+                # the dismisser can also clear "trx-null" notifications when
+                # the user adds the first-ever mapping in response to one.
+                async_dispatcher_send(self._hass, signal, idx)

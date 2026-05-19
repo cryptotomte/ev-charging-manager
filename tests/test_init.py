@@ -45,7 +45,8 @@ async def test_device_created(hass: HomeAssistant, mock_config_entry: MockConfig
     assert device is not None
     assert device.name == "My go-e Charger"
     assert device.manufacturer == "EV Charging Manager"
-    assert device.model == "go-e Charger (Gemini / Gemini flex)"
+    # Model name is derived from charger profile; mock_config_entry uses "generic"
+    assert device.model == "Other / Manual configuration"
 
 
 async def test_multiple_instances(hass: HomeAssistant) -> None:

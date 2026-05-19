@@ -1,0 +1,47 @@
+# Replay fixture: Elvis's Mercedes GLB 350 e — 2026-05-18/19
+# Sanitized: RFID UIDs anonymized (card indices preserved), no PII.
+# Pattern: one cable insertion, bulk charge completes, then post-completion
+# cell-balancing burst the next morning.
+# Result expected by TC-008: exactly 1 session, energy_kwh ≈ 56.472 kWh,
+# charging_window_count == 2 (bulk charge + post-completion balancing),
+# no phantom session created for the balancing burst.
+#
+# Format: ISO8601 timestamp | category        | message
+# The _log_parser.py helper reads this format.
+
+2026-05-18T16:30:02.100 | PLUG_STATE      | plug changed: off → on | wh=0.000 power=0
+2026-05-18T16:30:03.200 | CABLE_LOCK      | cus changed: Unlocked → Locked | wh=0.000 power=0
+2026-05-18T16:30:04.300 | TRX_STATE       | trx changed: null → 1 | wh=0.000 power=0
+2026-05-18T16:30:10.000 | CAR_STATE       | car_value changed: Idle → Wait for car | wh=0.000 power=0
+2026-05-18T16:30:15.500 | CAR_STATE       | car_value changed: Wait for car → Charging | wh=0.000 power=0
+2026-05-18T16:30:18.000 | POWER           | power changed: 0 → 11020 | wh=0.000 power=11020
+2026-05-18T16:30:18.001 | SESSION_START   | session_id=elvis-session-001 user=Elvis charger=My go-e Charger
+2026-05-18T16:30:18.002 | ENGINE_DECISION | IDLE → TRACKING (trigger: plug=on + rfid=known)
+2026-05-18T16:30:18.003 | CHARGING_WINDOW_OPEN | window=1 energy_start=0.000 kWh
+# Mercedes charges cleanly at ~11 kW continuous (no BMS pulsing during main charge)
+2026-05-18T17:30:00.000 | POWER           | power changed: 11020 → 10980 | wh=10.980 power=10980
+2026-05-18T18:30:00.000 | POWER           | power changed: 10980 → 11010 | wh=21.960 power=11010
+2026-05-18T19:30:00.000 | POWER           | power changed: 11010 → 10990 | wh=32.940 power=10990
+2026-05-18T20:30:00.000 | POWER           | power changed: 10990 → 11020 | wh=43.920 power=11020
+2026-05-18T21:30:00.000 | POWER           | power changed: 11020 → 10950 | wh=54.870 power=10950
+# Charge completes — car transitions to Complete, power drops to 0
+2026-05-18T22:13:05.000 | CAR_STATE       | car_value changed: Charging → Complete | wh=56.472 power=0
+2026-05-18T22:13:05.001 | POWER           | power changed: 10950 → 0 | wh=56.472 power=0
+# 5-minute idle threshold elapses — window 1 closes (bulk charge done)
+# Power stays at 0 for > 5 min
+2026-05-18T22:18:10.000 | CHARGING_WINDOW_CLOSE | window=1 energy_end=56.472 kWh duration=20871s
+# Car (and cable) remains plugged overnight. Long idle period.
+# The next morning at ~05:55, the car's BMS initiates cell-balancing burst.
+2026-05-19T05:55:12.000 | CAR_STATE       | car_value changed: Complete → Charging | wh=56.472 power=2100
+2026-05-19T05:55:12.001 | POWER           | power changed: 0 → 2100 | wh=56.472 power=2100
+2026-05-19T05:55:12.002 | CHARGING_WINDOW_OPEN | window=2 energy_start=56.472 kWh
+# Cell-balancing burst: low power, short duration ~9 min
+2026-05-19T06:01:00.000 | POWER           | power changed: 2100 → 2050 | wh=56.682 power=2050
+2026-05-19T06:04:18.000 | CAR_STATE       | car_value changed: Charging → Complete | wh=56.892 power=0
+2026-05-19T06:04:18.001 | POWER           | power changed: 2050 → 0 | wh=56.892 power=0
+# 5-minute idle threshold elapses — window 2 closes (cell-balancing done)
+2026-05-19T06:09:25.000 | CHARGING_WINDOW_CLOSE | window=2 energy_end=56.892 kWh duration=553s
+# User unplugs at midday (cable was left in overnight)
+2026-05-19T11:42:33.000 | CABLE_LOCK      | cus changed: Locked → Unlocked | wh=56.892 power=0
+2026-05-19T11:42:34.000 | PLUG_STATE      | plug changed: on → off | wh=56.892 power=0
+2026-05-19T11:42:34.001 | SESSION_STOP    | session_id=elvis-session-001 energy=56.892kWh duration=19:12:16

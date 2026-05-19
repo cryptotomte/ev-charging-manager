@@ -12,9 +12,13 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.ev_charging_manager.config_store import ConfigStore
 from custom_components.ev_charging_manager.const import DOMAIN
 
-# Standard mock data for charger config entry
+# Standard mock data for charger config entry.
+# Uses "generic" profile so tests that import this constant exercise the legacy
+# SessionEngine, which is the correct scope for the pre-PR-22 test suite.
+# Tests that specifically exercise the PlugAnchoredSessionEngine (goe_gemini profile)
+# override the profile in their own setup (e.g. test_session_engine_plug_anchored.py).
 MOCK_CHARGER_DATA = {
-    "charger_profile": "goe_gemini",
+    "charger_profile": "generic",
     "charger_serial": "abc123",
     "car_status_entity": "sensor.goe_abc123_car_value",
     "car_status_charging_value": "Charging",

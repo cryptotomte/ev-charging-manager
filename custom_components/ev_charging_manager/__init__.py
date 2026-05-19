@@ -25,6 +25,7 @@ from .const import (
 from .debug_logger import DebugLogger
 from .lifecycle import async_migrate_observation_slots
 from .session_engine import SessionEngine
+from .session_engine_v2 import PlugAnchoredSessionEngine
 from .session_store import SessionStore
 from .stats_engine import StatsEngine
 from .stats_store import StatsStore
@@ -124,11 +125,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     session_store = SessionStore(hass, max_sessions=max_sessions)
     _sessions, active_snapshot = await session_store.async_load()
 
-    # Set up session engine and recover any active session before registering listeners
-    # Pass None when debug logging is disabled so if-guards in SessionEngine short-circuit
-    session_engine = SessionEngine(
-        hass, entry, config_store, session_store, debug_logger if debug_logging_enabled else None
-    )
+    # Select the session engine based on the charger profile (T013 / FR-036, FR-037).
+    # goe_gemini → PlugAnchoredSessionEngine (PR-22 plug-anchored model).
+    # All other profiles → legacy SessionEngine (unchanged behaviour).
+    # Both engines expose the same coordinator-callable interface so all downstream
+    # platforms (sensor.py, binary_sensor.py, button.py, stats_sensor.py) remain profile-blind.
+    uses_plug_anchored = profile.get("supports_plug_anchored_model", False)
+    _dl = debug_logger if debug_logging_enabled else None
+    if uses_plug_anchored:
+        session_engine: SessionEngine | PlugAnchoredSessionEngine = PlugAnchoredSessionEngine(
+            hass, entry, config_store, session_store, _dl
+        )
+    else:
+        session_engine = SessionEngine(hass, entry, config_store, session_store, _dl)
     if active_snapshot is not None:
         await session_engine.async_recover(active_snapshot)
     session_engine.async_setup()
@@ -163,5 +172,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        # BUG-6: tear down engine-managed listeners (per-session unsubs) that we
+        # cannot register via entry.async_on_unload because they were created
+        # mid-session, not at setup. PlugAnchoredSessionEngine exposes async_unload;
+        # the legacy SessionEngine does not, so we duck-type the call.
+        domain_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        session_engine = domain_data.get("session_engine")
+        if session_engine is not None and hasattr(session_engine, "async_unload"):
+            try:
+                await session_engine.async_unload()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("session_engine.async_unload failed: %s", err)
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok

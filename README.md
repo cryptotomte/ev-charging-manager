@@ -6,6 +6,7 @@ A custom integration for Home Assistant (installable via [HACS](https://hacs.xyz
 
 **Key features:**
 
+- Plug-anchored session detection (go-e Gemini) — no phantom sessions
 - RFID-based user identification
 - Per-user energy and cost tracking
 - Static and spot pricing support
@@ -154,7 +155,7 @@ The integration creates the following sensor entities per charger:
 
 | Sensor | Description |
 |---|---|
-| **Status** | Current engine state: `idle`, `tracking`, or `completing` |
+| **Status** | Engine sub-state: `idle`, `waiting`, `charging`, or `charged` |
 | **Current User** | Name of the identified user (or "Unknown") |
 | **Current Vehicle** | Name of the identified vehicle |
 | **Session Energy** | Energy delivered in the current session (kWh) |
@@ -162,8 +163,11 @@ The integration creates the following sensor entities per charger:
 | **Session Duration** | Elapsed time of the current session (HH:MM:SS) |
 | **Session Cost** | Accumulated cost of the current session |
 | **Estimated SoC Added** | Estimated state-of-charge added to the battery (%) |
+| **Last Session Charging Duration** | Active charging time in the most recent completed session (s) |
+| **Last Session Connection Duration** | Total plug-in time in the most recent completed session (s) |
 
 Session sensors become available when a charging session is active and return to unavailable when idle.
+`Last Session` sensors become available after the first completed session.
 
 ### Per-User Statistics Sensors
 
@@ -238,6 +242,21 @@ The integration automatically recovers active sessions after a Home Assistant re
 - Very short sessions (< 60s) or sessions with negligible energy (< 50 Wh) may be discarded as micro-sessions.
 
 Check the logs for "Recovered session" entries to confirm recovery occurred. If a session was lost, look for "Discarded micro-session" or "Session continuity mismatch" messages.
+
+---
+
+## Session Model
+
+The plug-anchored session engine (go-e Gemini) tracks sessions using the cable
+presence sensor as the primary boundary signal.  Key behaviors:
+
+- Transient disconnects trigger a configurable grace timer rather than immediate session end.
+- Charger power outages do not end sessions (all entities simultaneously unavailable).
+- Multi-window sessions track charging duration separately from connection duration.
+- Micro-sessions (< 60 s or < 50 Wh) are discarded automatically.
+
+See [docs/SESSION-MODEL.md](docs/SESSION-MODEL.md) for the full specification, including
+the session store schema and configurable timing parameters.
 
 ---
 

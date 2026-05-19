@@ -20,6 +20,9 @@ from typing import Any
 # - cable_lock_sensor: Entity pattern for cable-lock status sensor (optional)
 # - model_status_sensor: Entity pattern for charger model-status sensor (optional)
 # - error_sensor: Entity pattern for charger error sensor (optional)
+# - supports_plug_anchored_model: True → use PlugAnchoredSessionEngine (PR-22).
+#   Only goe_gemini is True. All other profiles keep the legacy SessionEngine
+#   until verified against real hardware. (FR-036, FR-037)
 
 CHARGER_PROFILES: dict[str, dict[str, Any]] = {
     "goe_gemini": {
@@ -44,6 +47,8 @@ CHARGER_PROFILES: dict[str, dict[str, Any]] = {
         "cable_lock_sensor": "sensor.goe_{serial}_cus_value",
         "model_status_sensor": "sensor.goe_{serial}_modelstatus_value",
         "error_sensor": "sensor.goe_{serial}_err_value",
+        # PR-22: goe_gemini uses the new plug-anchored session engine (FR-036)
+        "supports_plug_anchored_model": True,
     },
     "generic": {
         "name": "Other / Manual configuration",
@@ -62,5 +67,7 @@ CHARGER_PROFILES: dict[str, dict[str, Any]] = {
         "cable_lock_sensor": None,
         "model_status_sensor": None,
         "error_sensor": None,
+        # PR-22: generic profile retains the legacy session engine (FR-036)
+        "supports_plug_anchored_model": False,
     },
 }

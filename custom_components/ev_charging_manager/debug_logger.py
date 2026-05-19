@@ -1,4 +1,33 @@
-"""DebugLogger — optional diagnostic file writer for EV Charging Manager."""
+"""DebugLogger — optional diagnostic file writer for EV Charging Manager.
+
+The DebugLogger accepts arbitrary category strings. The recognized category
+constants are defined in const.py. PR-22 adds the following new categories
+(DEBUG_CAT_* constants — listed here for discoverability):
+
+  CHARGING_WINDOW_OPEN       — a new charging window opened (power > 0 after idle)
+  CHARGING_WINDOW_CLOSE      — a charging window closed (idle threshold elapsed)
+  DISCONNECT_DETECTED        — plug=off but cable_lock != Unlocked (transient)
+  DISCONNECT_RESOLVED        — plug returned to on before grace timer expired
+  HA_RESTART_DETECTED        — HA restart detected while session was active
+  SESSION_RESUMED            — session restored after HA restart (plug still on)
+  SESSION_FORCE_ENDED_BY_RESTART    — session ended because plug was off at restart
+  SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT — safety-net disconnect grace timer fired
+  CHARGER_OFFLINE            — all charger entities simultaneously unavailable
+  CHARGER_BACK_ONLINE        — charger entities returned from all-unavailable state
+  TRX_MIDSESSION             — trx changed mid-session (defensive log only, ignored)
+  RFID_BLOCKED               — force-off sent to go-e for unmapped RFID
+  RFID_BLOCK_FAILED          — force-off command failed (API error)
+  RFID_BLOCK_RELEASED        — force-neutral sent; block lifted after mapping added
+
+Pre-PR-22 categories (still in use):
+  DEBUG_ON, DEBUG_OFF, DEBUG_CLEAR
+  SESSION_START, SESSION_STOP
+  ENGINE_DECISION
+  RFID_READ
+  CAR_STATE, CAR_STATE_UNAVAIL
+  PLUG_STATE, CABLE_LOCK, MODEL_STATUS, ERR_STATE, TRX_STATE
+  GATE_ENGAGED, GATE_PROMOTE, GATE_CLEAR, BALANCING_SKIP  (legacy engine only)
+"""
 
 from __future__ import annotations
 

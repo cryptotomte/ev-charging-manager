@@ -117,8 +117,8 @@ EVENT_SESSION_COMPLETED = "ev_charging_manager_session_completed"
 # Dispatcher signal for sensor updates (format with entry_id)
 SIGNAL_SESSION_UPDATE = "ev_charging_manager_session_update_{}"
 
-# Platforms to forward to
-PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
+# Platforms to forward to (PR-22 adds Platform.SWITCH for unknown-RFID block)
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON, Platform.SWITCH]
 
 # Cross-validation: total energy counter entity (PR-07)
 CONF_ETO_ENTITY = "eto_entity"
@@ -165,3 +165,53 @@ GOE_FLAT_KEY_SUFFIX_INSTALLED = "i"
 
 # Firmware version threshold for flat key format
 GOE_FLAT_KEYS_FW_THRESHOLD = 60
+
+# ---------------------------------------------------------------------------
+# PR-22: Session boundary redesign — new configuration keys and debug categories
+# ---------------------------------------------------------------------------
+
+# New advanced options for the plug-anchored session model (OptionsFlowHandler)
+CONF_CHARGING_IDLE_TIMEOUT_MIN = "charging_idle_timeout_min"
+CONF_DISCONNECT_GRACE_MIN = "disconnect_grace_min"
+CONF_BLOCK_UNMAPPED_RFID = "block_unmapped_rfid"
+
+# Defaults and ranges for the new advanced options
+DEFAULT_CHARGING_IDLE_TIMEOUT_MIN = 5   # minutes; range 3–30
+DEFAULT_DISCONNECT_GRACE_MIN = 10       # minutes; range 5–30
+DEFAULT_BLOCK_UNMAPPED_RFID = True
+
+MIN_CHARGING_IDLE_TIMEOUT_MIN = 3
+MAX_CHARGING_IDLE_TIMEOUT_MIN = 30
+MIN_DISCONNECT_GRACE_MIN = 5
+MAX_DISCONNECT_GRACE_MIN = 30
+
+# New debug log categories (FR-034) — used as the first argument to DebugLogger.log().
+# The DebugLogger accepts arbitrary category strings; these constants ensure
+# consistent spelling across session_engine_v2.py, rfid_blocker.py, and tests.
+DEBUG_CAT_CHARGING_WINDOW_OPEN = "CHARGING_WINDOW_OPEN"
+DEBUG_CAT_CHARGING_WINDOW_CLOSE = "CHARGING_WINDOW_CLOSE"
+DEBUG_CAT_DISCONNECT_DETECTED = "DISCONNECT_DETECTED"
+DEBUG_CAT_DISCONNECT_RESOLVED = "DISCONNECT_RESOLVED"
+DEBUG_CAT_HA_RESTART_DETECTED = "HA_RESTART_DETECTED"
+DEBUG_CAT_SESSION_RESUMED = "SESSION_RESUMED"
+DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART = "SESSION_FORCE_ENDED_BY_RESTART"
+DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT = "SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT"
+DEBUG_CAT_CHARGER_OFFLINE = "CHARGER_OFFLINE"
+DEBUG_CAT_CHARGER_BACK_ONLINE = "CHARGER_BACK_ONLINE"
+DEBUG_CAT_TRX_MIDSESSION = "TRX_MIDSESSION"
+DEBUG_CAT_RFID_BLOCKED = "RFID_BLOCKED"
+DEBUG_CAT_RFID_BLOCK_FAILED = "RFID_BLOCK_FAILED"
+DEBUG_CAT_RFID_BLOCK_RELEASED = "RFID_BLOCK_RELEASED"
+
+# New HA events (PR-22)
+EVENT_CHARGING_CHARGED = "ev_charging_charged"
+EVENT_UNKNOWN_RFID_DETECTED = "ev_charging_unknown_rfid_detected"
+
+# Dispatcher signal for mapping changes (triggers RfidBlocker re-evaluation)
+SIGNAL_MAPPINGS_CHANGED = "ev_charging_manager_mappings_changed_{}"
+
+# Switch entity unique ID suffix for the unknown-RFID block switch
+SWITCH_UNKNOWN_RFID_BLOCK = "unknown_rfid_block"
+
+# Persistent notification ID prefix for unmapped RFID (formatted with rfid_index)
+NOTIFICATION_ID_UNKNOWN_RFID = "ev_charging_manager_unmapped_rfid_{}"

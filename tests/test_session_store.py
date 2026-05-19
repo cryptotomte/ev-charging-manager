@@ -165,7 +165,8 @@ async def test_save_active_session(hass: HomeAssistant):
     mock_save.assert_called_once()
     # Completed sessions list should still be empty
     assert store.sessions == []
-    # But the save should include the active session
-    saved_data = mock_save.call_args[0][0]
-    assert len(saved_data) == 1
-    assert saved_data[0]["id"] == "active_session"
+    # But the save should include the active session in the data envelope
+    saved_envelope = mock_save.call_args[0][0]
+    saved_list = saved_envelope["data"] if isinstance(saved_envelope, dict) else saved_envelope
+    assert len(saved_list) == 1
+    assert saved_list[0]["id"] == "active_session"

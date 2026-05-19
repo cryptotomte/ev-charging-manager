@@ -98,6 +98,9 @@
                     "cable_lock_entity": "Cable lock sensor",
                     "model_status_entity": "Charger model-status sensor",
                     "error_entity": "Charger error sensor",
+                    "charging_idle_timeout_min": "Charging idle timeout (minutes)",
+                    "disconnect_grace_min": "Disconnect grace period (minutes)",
+                    "block_unmapped_rfid": "Block unmapped RFID tags",
                     "debug_logging": "Enable debug logging"
                 },
                 "data_description": {
@@ -110,6 +113,9 @@
                     "cable_lock_entity": "Optional. Sensor reporting cable lock status (e.g. sensor.goe_123456_cus_value). Used for CABLE_LOCK observation logging.",
                     "model_status_entity": "Optional. Sensor reporting charger model status (e.g. sensor.goe_123456_modelstatus_value). Used for MODEL_STATUS observation logging.",
                     "error_entity": "Optional. Sensor reporting charger error code (e.g. sensor.goe_123456_err_value). Used for ERR_STATE observation logging.",
+                    "charging_idle_timeout_min": "How long power must stay at 0 W before a charging window is closed (3–30 min, default 5). Increase for vehicles with frequent BMS micro-pauses.",
+                    "disconnect_grace_min": "How long to wait after a transient plug-off before force-ending the session (5–30 min, default 10). Only applies when cable lock is not Unlocked.",
+                    "block_unmapped_rfid": "When enabled and an unmapped RFID tag is detected, the integration will send a force-off command to the charger and create a persistent notification.",
                     "debug_logging": "Write charging events to www/ev_charging_manager_debug.log for diagnostics. Disable when investigation is complete."
                 }
             },
@@ -148,6 +154,8 @@
             "session_power": { "name": "Session Power" },
             "session_soc_added": { "name": "Session SoC Added" },
             "status": { "name": "Status" },
+            "last_session_charging_duration": { "name": "Last session charging time" },
+            "last_session_connection_duration": { "name": "Last session connection time" },
             "user_total_energy": { "name": "{user} Total Energy" },
             "user_total_cost": { "name": "{user} Total Cost" },
             "user_session_count": { "name": "{user} Sessions" },
@@ -164,6 +172,11 @@
         "button": {
             "clear_debug_log": {
                 "name": "Clear debug log"
+            }
+        },
+        "switch": {
+            "unknown_rfid_block": {
+                "name": "Block unmapped RFID"
             }
         }
     },

@@ -322,10 +322,19 @@ class StatusSensor(_SessionSensorBase):
 
     @property
     def native_value(self) -> str:
-        """Return current engine state. Falls back to 'idle' if engine missing."""
+        """Return current engine state.
+
+        For PlugAnchoredSessionEngine (goe_gemini profile), returns the fine-grained
+        sub-state: idle / waiting / charging / charged (per FR-013–FR-017, T041).
+        For the legacy SessionEngine, returns the raw state machine value.
+        Falls back to 'idle' if engine is missing.
+        """
         engine = self._engine()
         if engine is None:
             return SessionEngineState.IDLE
+        # PlugAnchoredSessionEngine exposes get_status_sub_state() (PR-22 / T041)
+        if hasattr(engine, "get_status_sub_state"):
+            return engine.get_status_sub_state()
         return engine.state
 
     @property

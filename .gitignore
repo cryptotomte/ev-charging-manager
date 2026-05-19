@@ -55,4 +55,5 @@ docs/*
 !docs/charger-profiles/
 !docs/grafana-queries.md
 !docs/images/
+!docs/SESSION-MODEL.md
 specs/

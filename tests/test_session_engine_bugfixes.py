@@ -35,6 +35,7 @@ from custom_components.ev_charging_manager.charging_window import (
 from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
+    CONF_RFID_GRACE_SECONDS,
     DEFERRED_RECOVERY_TIMEOUT_MIN,
     DOMAIN,
     SessionEngineState,
@@ -151,6 +152,7 @@ async def _setup_engine_with_session(
             "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
             CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
             CONF_DISCONNECT_GRACE_MIN: 10,
+            CONF_RFID_GRACE_SECONDS: 0,  # opt out: plug/persist behavior tests
         },
         title="Test go-e Charger",
     )

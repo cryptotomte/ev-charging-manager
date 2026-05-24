@@ -20,6 +20,7 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
+    CONF_RFID_GRACE_SECONDS,
     DOMAIN,
 )
 from custom_components.ev_charging_manager.session_engine_v2 import (
@@ -46,6 +47,7 @@ async def _make_engine_entry(hass: HomeAssistant) -> MockConfigEntry:
             "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
             CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
             CONF_DISCONNECT_GRACE_MIN: 10,
+            CONF_RFID_GRACE_SECONDS: 0,  # opt out: micro-filter/energy behavior tests
         },
         title="Test go-e Charger",
     )

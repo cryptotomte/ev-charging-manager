@@ -23,6 +23,7 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
+    CONF_RFID_GRACE_SECONDS,
     DEFAULT_CHARGING_IDLE_TIMEOUT_MIN,
     DOMAIN,
     EVENT_CHARGING_CHARGED,
@@ -41,12 +42,15 @@ from tests.conftest import (
 MOCK_PLUG_ENTITY = "binary_sensor.goe_abc123_car_0"
 MOCK_CABLE_LOCK_ENTITY = "sensor.goe_abc123_cus_value"
 
-# Options that provide entity bindings for the new engine
+# Options that provide entity bindings for the new engine.
+# CONF_RFID_GRACE_SECONDS=0 opts these tests out of the RFID grace timer;
+# the timer is irrelevant here (tests exercise BMS pulsing / multi-window behavior).
 MOCK_OPTIONS_V2 = {
     "plug_entity": MOCK_PLUG_ENTITY,
     "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
     CONF_CHARGING_IDLE_TIMEOUT_MIN: DEFAULT_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN: 10,
+    CONF_RFID_GRACE_SECONDS: 0,
 }
 
 

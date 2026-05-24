@@ -78,6 +78,15 @@ class SessionEngineState(StrEnum):
     COMPLETING = "completing"
 
 
+class SessionSubState(StrEnum):
+    """Charging session sub-state — derived from engine state + window state."""
+
+    IDLE = "idle"  # no active session
+    WAITING = "waiting"  # active session, no charging window yet
+    CHARGING = "charging"  # active session, charging window currently open
+    CHARGED = "charged"  # active session, all known windows closed
+
+
 # Session options configuration keys
 CONF_MIN_SESSION_DURATION_S = "min_session_duration_s"
 CONF_MIN_SESSION_ENERGY_WH = "min_session_energy_wh"
@@ -177,6 +186,31 @@ GOE_FLAT_KEYS_FW_THRESHOLD = 60
 CONF_CHARGING_IDLE_TIMEOUT_MIN = "charging_idle_timeout_min"
 CONF_DISCONNECT_GRACE_MIN = "disconnect_grace_min"
 
+# RFID grace timer — wait this many seconds after plug-on for a non-null trx
+# before committing the session with user=Unknown (FR-007, IC-1).
+# Default is 5 s as specified by IC-1. Tests that exercise behaviors unrelated
+# to RFID grace should set CONF_RFID_GRACE_SECONDS: 0 in their entry options.
+CONF_RFID_GRACE_SECONDS = "rfid_grace_seconds"
+DEFAULT_RFID_GRACE_SECONDS = 5
+RFID_GRACE_SECONDS_MIN = 0
+RFID_GRACE_SECONDS_MAX = 30
+
+# HEARTBEAT log timer — emit a HEARTBEAT debug-log line at this cadence
+# during TRACKING state (FR-012, IC-3). Set to 0 to disable.
+CONF_HEARTBEAT_LOG_INTERVAL_MIN = "heartbeat_log_interval_min"
+DEFAULT_HEARTBEAT_LOG_INTERVAL_MIN = 5
+HEARTBEAT_LOG_INTERVAL_MIN_MIN = 0
+HEARTBEAT_LOG_INTERVAL_MIN_MAX = 30
+
+# UI dispatch timer — dispatch a session-update signal at this cadence
+# during TRACKING state to unblock live sensor ticks (FR-013, IC-3).
+# Set to 0 to disable (sensors only re-render on engine state changes).
+CONF_UI_DISPATCH_INTERVAL_S = "ui_dispatch_interval_s"
+DEFAULT_UI_DISPATCH_INTERVAL_S = 60
+UI_DISPATCH_INTERVAL_S_MIN = 0
+UI_DISPATCH_INTERVAL_S_ACTIVE_MIN = 10  # Minimum when not disabled (0 = disable sentinel)
+UI_DISPATCH_INTERVAL_S_MAX = 300
+
 # PR-22 revision 2026-05-19: passive notification replaces active blocking for Story 07.
 # Default to True so existing installs surface attribution gaps; users may disable to
 # rely solely on the EVENT_UNKNOWN_RFID_DETECTED event for their own automations.
@@ -220,6 +254,12 @@ DEBUG_CAT_RFID_UNMAPPED_NOTIFY_FAILED = "RFID_UNMAPPED_NOTIFY_FAILED"
 
 # HIGH-1: deferred restart recovery timed out (plug entity never appeared).
 DEBUG_CAT_RECOVERY_TIMEOUT = "RECOVERY_TIMEOUT"
+
+# PR-23: periodic heartbeat during TRACKING state (FR-012, IC-3).
+DEBUG_CAT_HEARTBEAT = "HEARTBEAT"
+
+# PR-23: RFID grace timer lifecycle events (FR-001, FR-004, FR-005, FR-007, FR-008).
+DEBUG_CAT_RFID_GRACE = "RFID_GRACE"
 
 # New HA events (PR-22)
 EVENT_CHARGING_CHARGED = "ev_charging_charged"

@@ -147,6 +147,62 @@ class ChargingWindowTracker:
         self._active_window = None
         return closed
 
+    def inject_closed_window(self, window: ChargingWindow) -> None:
+        """Inject a pre-built closed window into the tracker (restart recovery only).
+
+        Used by the HA-restart recovery path to insert a synthetic window covering
+        the pre-restart open window whose close event was never observed.
+
+        Validates that the window is fully closed (end_at must be set) and that it
+        does not overlap with any already-tracked window. Raises RuntimeError on
+        validation failure.
+
+        Args:
+            window: A fully closed ChargingWindow (end_at must be set).
+
+        Raises:
+            RuntimeError: If window is not closed, if an active window is open,
+                          or if the window overlaps with an existing closed window.
+        """
+        if window.end_at is None:
+            raise RuntimeError("inject_closed_window: window must be closed (end_at must be set)")
+        if self._active_window is not None and self._active_window.is_open:
+            raise RuntimeError(
+                "inject_closed_window: cannot inject while an active window is open — "
+                "close the active window first"
+            )
+        # Reject inverted intervals — recovery caller is expected to clamp
+        # end_at to start_at before injection (data-model.md §E2 invariant).
+        if window.end_at < window.start_at:
+            raise RuntimeError(
+                f"inject_closed_window: end_at ({window.end_at!r}) must be >= "
+                f"start_at ({window.start_at!r})"
+            )
+        # Check for overlap with existing closed windows
+        for existing in self._closed_windows:
+            if existing.end_at is None:
+                # Guard (should not happen — _closed_windows only holds closed windows;
+                # the active one is in _active_window).
+                continue
+            # Overlap: the new window starts before the existing one ends
+            # AND the new window ends after the existing one starts.
+            if window.start_at < existing.end_at and window.end_at > existing.start_at:
+                raise RuntimeError(
+                    f"inject_closed_window: window [{window.start_at!r}, {window.end_at!r}] "
+                    f"overlaps with existing window [{existing.start_at!r}, {existing.end_at!r}]"
+                )
+        # Enforce chronological ordering: the new window must start after the last
+        # closed window ends. Today's caller (restart-recovery) always injects before
+        # any normal window opens, so this guard is dormant in normal usage — it
+        # protects against future callers breaking the "windows ordered by index" invariant.
+        if self._closed_windows and window.start_at < self._closed_windows[-1].end_at:
+            raise RuntimeError(
+                f"inject_closed_window: out-of-order injection — "
+                f"window.start_at={window.start_at.isoformat()} precedes last "
+                f"closed window's end_at={self._closed_windows[-1].end_at.isoformat()}"
+            )
+        self._closed_windows.append(window)
+
     def on_power_change(self, now: datetime, new_power: float) -> None:
         """Record a power transition on the active window.
 
@@ -203,3 +259,20 @@ class ChargingWindowTracker:
     def all_closed_windows(self) -> list[ChargingWindow]:
         """Return a copy of the closed windows list."""
         return list(self._closed_windows)
+
+    def windows_for_attributes(self) -> list[ChargingWindow]:
+        """Return all windows (closed + open) in index order for sensor attributes.
+
+        Returns a combined list of all closed windows followed by the currently
+        open window (if any). The open window is always the last entry. Closed
+        windows appear in the order they were added to the tracker.
+
+        Returns:
+            List of ChargingWindow objects in index order. Open window (if any)
+            is last, with end_at == None. Empty list when no windows have been
+            opened this session.
+        """
+        result: list[ChargingWindow] = list(self._closed_windows)
+        if self._active_window is not None and self._active_window.is_open:
+            result.append(self._active_window)
+        return result

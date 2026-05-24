@@ -101,6 +101,9 @@
                     "charging_idle_timeout_min": "Charging idle timeout (minutes)",
                     "disconnect_grace_min": "Disconnect grace period (minutes)",
                     "notify_unmapped_rfid": "Notify on unmapped RFID tags",
+                    "rfid_grace_seconds": "RFID blip grace (seconds)",
+                    "heartbeat_log_interval_min": "Heartbeat log interval (minutes, 0 = disable)",
+                    "ui_dispatch_interval_s": "UI update interval (seconds, 0 = disable)",
                     "debug_logging": "Enable debug logging"
                 },
                 "data_description": {
@@ -116,6 +119,9 @@
                     "charging_idle_timeout_min": "How long power must stay at 0 W before a charging window is closed (3–30 min, default 5). Increase for vehicles with frequent BMS micro-pauses.",
                     "disconnect_grace_min": "How long to wait after a transient plug-off before force-ending the session (5–30 min, default 10). Only applies when cable lock is not Unlocked.",
                     "notify_unmapped_rfid": "Notify when an RFID tag is detected by the charger but not mapped to a user in this integration. Energy from such sessions is attributed to the ''Unknown'' user. Disable only if you want to handle attribution gaps via automations.",
+                    "rfid_grace_seconds": "Seconds to wait after plug-in for an RFID blip before committing session with Unknown user (0–30, default 5). Set to 0 to disable.",
+                    "heartbeat_log_interval_min": "Minutes between HEARTBEAT lines in the debug log during active charging (0–30, default 5). Set to 0 to disable.",
+                    "ui_dispatch_interval_s": "Seconds between live sensor refreshes during active charging (0–300, default 60). Set to 0 to disable live ticks.",
                     "debug_logging": "Write charging events to www/ev_charging_manager_debug.log for diagnostics. Disable when investigation is complete."
                 }
             },
@@ -145,29 +151,74 @@
     },
     "entity": {
         "sensor": {
-            "current_user": { "name": "Current User" },
-            "current_vehicle": { "name": "Current Vehicle" },
-            "session_energy": { "name": "Session Energy" },
-            "session_duration": { "name": "Session Duration" },
-            "session_cost": { "name": "Session Cost" },
-            "session_charge_price": { "name": "Session Charge Price" },
-            "session_power": { "name": "Session Power" },
-            "session_soc_added": { "name": "Session SoC Added" },
-            "status": { "name": "Status" },
-            "last_session_charging_duration": { "name": "Last session charging time" },
-            "last_session_connection_duration": { "name": "Last session connection time" },
-            "user_total_energy": { "name": "{user} Total Energy" },
-            "user_total_cost": { "name": "{user} Total Cost" },
-            "user_session_count": { "name": "{user} Sessions" },
-            "user_avg_session_energy": { "name": "{user} Avg Session Energy" },
-            "user_last_session": { "name": "{user} Last Session" },
-            "guest_last_energy": { "name": "Guest Last Energy" },
-            "guest_last_charge_price": { "name": "Guest Last Charge Price" },
-            "guest_total_energy": { "name": "Guest Total Energy" },
-            "guest_total_cost": { "name": "Guest Total Cost" }
+            "current_user": {
+                "name": "Current User"
+            },
+            "current_vehicle": {
+                "name": "Current Vehicle"
+            },
+            "session_energy": {
+                "name": "Session Energy"
+            },
+            "session_duration": {
+                "name": "Session Duration"
+            },
+            "session_cost": {
+                "name": "Session Cost"
+            },
+            "session_charge_price": {
+                "name": "Session Charge Price"
+            },
+            "session_power": {
+                "name": "Session Power"
+            },
+            "session_soc_added": {
+                "name": "Session SoC Added"
+            },
+            "status": {
+                "name": "Status"
+            },
+            "charging_duration": {
+                "name": "Charging duration"
+            },
+            "last_session_charging_duration": {
+                "name": "Last session charging time"
+            },
+            "last_session_connection_duration": {
+                "name": "Last session connection time"
+            },
+            "user_total_energy": {
+                "name": "{user} Total Energy"
+            },
+            "user_total_cost": {
+                "name": "{user} Total Cost"
+            },
+            "user_session_count": {
+                "name": "{user} Sessions"
+            },
+            "user_avg_session_energy": {
+                "name": "{user} Avg Session Energy"
+            },
+            "user_last_session": {
+                "name": "{user} Last Session"
+            },
+            "guest_last_energy": {
+                "name": "Guest Last Energy"
+            },
+            "guest_last_charge_price": {
+                "name": "Guest Last Charge Price"
+            },
+            "guest_total_energy": {
+                "name": "Guest Total Energy"
+            },
+            "guest_total_cost": {
+                "name": "Guest Total Cost"
+            }
         },
         "binary_sensor": {
-            "charging": { "name": "Charging" }
+            "charging": {
+                "name": "Charging"
+            }
         },
         "button": {
             "clear_debug_log": {

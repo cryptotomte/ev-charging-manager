@@ -34,6 +34,7 @@ from .const import (
     CONF_ENERGY_UNIT,
     CONF_ERROR_ENTITY,
     CONF_ETO_ENTITY,
+    CONF_HEARTBEAT_LOG_INTERVAL_MIN,
     CONF_MAX_STORED_SESSIONS,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
@@ -44,6 +45,7 @@ from .const import (
     CONF_POWER_ENTITY,
     CONF_PRICING_MODE,
     CONF_RFID_ENTITY,
+    CONF_RFID_GRACE_SECONDS,
     CONF_RFID_UID_ENTITY,
     CONF_SPOT_ADDITIONAL_COST_KWH,
     CONF_SPOT_FALLBACK_PRICE_KWH,
@@ -51,23 +53,34 @@ from .const import (
     CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
     CONF_TOTAL_ENERGY_ENTITY,
+    CONF_UI_DISPATCH_INTERVAL_S,
     DEFAULT_CHARGER_NAME,
     DEFAULT_CHARGING_EFFICIENCY,
     DEFAULT_CHARGING_IDLE_TIMEOUT_MIN,
     DEFAULT_DEBUG_LOGGING,
     DEFAULT_DISCONNECT_GRACE_MIN,
     DEFAULT_ENERGY_UNIT,
+    DEFAULT_HEARTBEAT_LOG_INTERVAL_MIN,
     DEFAULT_MAX_STORED_SESSIONS,
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
     DEFAULT_NOTIFY_UNMAPPED_RFID,
     DEFAULT_PERSISTENCE_INTERVAL_S,
     DEFAULT_PRICING_MODE,
+    DEFAULT_RFID_GRACE_SECONDS,
     DEFAULT_SPOT_ADDITIONAL_COST_KWH,
     DEFAULT_SPOT_FALLBACK_PRICE_KWH,
     DEFAULT_SPOT_VAT_MULTIPLIER,
     DEFAULT_STATIC_PRICE_KWH,
+    DEFAULT_UI_DISPATCH_INTERVAL_S,
     DOMAIN,
+    HEARTBEAT_LOG_INTERVAL_MIN_MAX,
+    HEARTBEAT_LOG_INTERVAL_MIN_MIN,
+    RFID_GRACE_SECONDS_MAX,
+    RFID_GRACE_SECONDS_MIN,
+    UI_DISPATCH_INTERVAL_S_ACTIVE_MIN,
+    UI_DISPATCH_INTERVAL_S_MAX,
+    UI_DISPATCH_INTERVAL_S_MIN,
 )
 from .rfid_discovery import (
     DiscoveredCard,
@@ -476,6 +489,21 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
 # ---------------------------------------------------------------------------
 
 
+def _validate_ui_dispatch(value: int) -> int:
+    """Validate ui_dispatch_interval_s: accept 0 (disable) or 10..300 (active range).
+
+    Values 1-9 are rejected because they would create excessive UI fan-out (IC-3).
+    """
+    if value == 0:
+        return 0
+    if UI_DISPATCH_INTERVAL_S_ACTIVE_MIN <= value <= UI_DISPATCH_INTERVAL_S_MAX:
+        return value
+    raise vol.Invalid(
+        f"ui_dispatch_interval_s must be 0 (disabled) or "
+        f"{UI_DISPATCH_INTERVAL_S_ACTIVE_MIN}..{UI_DISPATCH_INTERVAL_S_MAX}"
+    )
+
+
 class OptionsFlowHandler(OptionsFlow):
     """Handle EV Charging Manager options."""
 
@@ -576,6 +604,54 @@ class OptionsFlowHandler(OptionsFlow):
                         )
                     ),
                     vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_RFID_GRACE_SECONDS,
+                    default=opts.get(CONF_RFID_GRACE_SECONDS, DEFAULT_RFID_GRACE_SECONDS),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=RFID_GRACE_SECONDS_MIN,
+                            max=RFID_GRACE_SECONDS_MAX,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                            unit_of_measurement="s",
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_HEARTBEAT_LOG_INTERVAL_MIN,
+                    default=opts.get(
+                        CONF_HEARTBEAT_LOG_INTERVAL_MIN, DEFAULT_HEARTBEAT_LOG_INTERVAL_MIN
+                    ),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=HEARTBEAT_LOG_INTERVAL_MIN_MIN,
+                            max=HEARTBEAT_LOG_INTERVAL_MIN_MAX,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                            unit_of_measurement="min",
+                        )
+                    ),
+                    vol.Coerce(int),
+                ),
+                vol.Optional(
+                    CONF_UI_DISPATCH_INTERVAL_S,
+                    default=opts.get(CONF_UI_DISPATCH_INTERVAL_S, DEFAULT_UI_DISPATCH_INTERVAL_S),
+                ): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=UI_DISPATCH_INTERVAL_S_MIN,
+                            max=UI_DISPATCH_INTERVAL_S_MAX,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                            unit_of_measurement="s",
+                        )
+                    ),
+                    vol.Coerce(int),
+                    _validate_ui_dispatch,
                 ),
                 vol.Optional(
                     CONF_NOTIFY_UNMAPPED_RFID,

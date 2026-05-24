@@ -12,7 +12,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, SIGNAL_SESSION_UPDATE, SessionEngineState
+from .const import DOMAIN, SIGNAL_SESSION_UPDATE, SessionEngineState, SessionSubState
 
 
 async def async_setup_entry(
@@ -52,9 +52,27 @@ class ChargingBinarySensor(BinarySensorEntity):
         self.async_on_remove(async_dispatcher_connect(self._hass, signal, self._handle_update))
 
     @property
+    def available(self) -> bool:
+        """Return False when the session engine has not yet been set up.
+
+        Drives the entity to 'unavailable' rather than 'off' during the brief
+        window between async_added_to_hass and async_setup_entry completing,
+        consistent with _SessionSensorBase.available in sensor.py.
+        """
+        engine = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("session_engine")
+        return engine is not None
+
+    @property
     def is_on(self) -> bool:
-        """Return True when a session is actively being tracked."""
+        """Return True when active charging is currently in progress.
+
+        For PlugAnchoredSessionEngine (goe_gemini profile): True iff a charging
+        window is currently open. For the legacy SessionEngine: True iff the
+        engine is in TRACKING state (window concept does not exist).
+        """
         engine = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("session_engine")
         if engine is None:
             return False
+        if hasattr(engine, "get_status_sub_state"):
+            return engine.get_status_sub_state() == SessionSubState.CHARGING
         return engine.state == SessionEngineState.TRACKING

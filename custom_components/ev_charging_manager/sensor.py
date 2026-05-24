@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, TypedDict
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -21,6 +21,24 @@ from .const import CONF_CAR_STATUS_ENTITY, DOMAIN, SIGNAL_SESSION_UPDATE, Sessio
 from .stats_sensor import create_stats_sensors
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class _WindowAttribute(TypedDict):
+    """One entry in ChargingDurationSensor.extra_state_attributes['windows']."""
+
+    index: int
+    started_at: str  # ISO-8601 UTC
+    ended_at: str | None
+    duration_s: int
+    energy_kwh: float
+
+
+class _ChargingDurationAttributes(TypedDict):
+    """Shape of ChargingDurationSensor.extra_state_attributes."""
+
+    window_count: int
+    current_window_open: bool
+    windows: list[_WindowAttribute]
 
 
 async def async_setup_entry(
@@ -43,6 +61,8 @@ async def async_setup_entry(
         # PR-22: last-session duration sensors (US2 / T034)
         LastSessionChargingDurationSensor(hass, entry),
         LastSessionConnectionDurationSensor(hass, entry),
+        # PR-23: live charging duration sensor (US4 / T036)
+        ChargingDurationSensor(hass, entry),
     ]
 
     # Per-user statistics sensors (PR-04, T011)
@@ -393,6 +413,102 @@ class StatusSensor(_SessionSensorBase):
             "current_charging_duration_s": current_charging_duration_s,
             "current_connection_duration_s": current_connection_duration_s,
         }
+
+
+# ---------------------------------------------------------------------------
+# PR-23 (T035/US4): Live charging duration sensor
+# ---------------------------------------------------------------------------
+
+
+class ChargingDurationSensor(_SessionSensorBase):
+    """Live charging duration sensor showing accumulated window time as HH:MM:SS.
+
+    Displays the sum of all closed window durations plus the elapsed time of
+    the currently open window (if any). Freezes between windows when no window
+    is open. Updates via the dispatcher signal from SessionEngine (FR-022).
+
+    Mirrors SessionDurationSensor's HH:MM:SS format (see SessionDurationSensor.native_value).
+    Exposes per-window detail in extra_state_attributes.
+    """
+
+    _attr_icon = "mdi:battery-clock"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        """Initialize the sensor."""
+        super().__init__(hass, entry)
+        self._attr_unique_id = f"{entry.entry_id}_charging_duration"
+        self._attr_translation_key = "charging_duration"
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the live charging duration as HH:MM:SS, or None when no session.
+
+        Computation (IC-5):
+          total_closed_s + (utcnow() - open_window.start_at).total_seconds() if open else 0
+        Formatted as zero-padded HH:MM:SS for parity with SessionDurationSensor.
+        """
+        engine = self._engine()
+        if engine is None or not self._is_tracking():
+            return None
+
+        from homeassistant.util import dt as dt_util
+
+        tracker = getattr(engine, "_window_tracker", None)
+        if tracker is None:
+            return None
+
+        now = dt_util.utcnow()
+        total_s = tracker.total_charging_duration_s(now)
+
+        hours = total_s // 3600
+        minutes = (total_s % 3600) // 60
+        seconds = total_s % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    @property
+    def extra_state_attributes(self) -> _ChargingDurationAttributes | dict[str, Any]:
+        """Return per-window detail for the active session.
+
+        Returns {} when no session is active (FR-021).
+
+        Schema per contracts/sensor-attributes.md:
+            window_count: int         — session.charging_window_count
+            current_window_open: bool — tracker.is_open()
+            windows: list             — index/started_at/ended_at/duration_s/energy_kwh
+        """
+        engine = self._engine()
+        if engine is None or not self._is_tracking():
+            return {}
+
+        session = self._active_session()
+        if session is None:
+            return {}
+
+        tracker = getattr(engine, "_window_tracker", None)
+        if tracker is None:
+            return {}
+
+        from homeassistant.util import dt as dt_util
+
+        now = dt_util.utcnow()
+
+        windows_list: list[_WindowAttribute] = [
+            _WindowAttribute(
+                index=idx,
+                started_at=w.start_at.isoformat(),
+                # ended_at: ISO string for closed windows, None for the open window
+                ended_at=w.end_at.isoformat() if w.end_at is not None else None,
+                duration_s=w.duration_s(now),
+                energy_kwh=round(w.energy_kwh(), 3),
+            )
+            for idx, w in enumerate(tracker.windows_for_attributes(), start=1)
+        ]
+
+        return _ChargingDurationAttributes(
+            window_count=session.charging_window_count,
+            current_window_open=tracker.is_open(),
+            windows=windows_list,
+        )
 
 
 # ---------------------------------------------------------------------------

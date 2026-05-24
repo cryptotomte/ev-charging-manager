@@ -104,6 +104,20 @@ timer is **not** started.
 
 ---
 
+## HA Restart Recovery
+
+When Home Assistant restarts while a `PlugAnchoredSessionEngine` session is
+active, the deferred-recovery path detects that a session was in progress
+(via the persisted snapshot's `reconstructed`/`data_gap` fields and the
+current plug entity state) and resumes it.  The recovered session is marked
+`data_gap=True` and `reconstructed=True` in the session store.
+
+### Restart recovery — synthetic window injection
+
+When Home Assistant restarts mid-session, the deferred-recovery path detects a pre-restart open charging window (via `session.charging_started_at`) and injects a synthetic closed window into the tracker before any subsequent window opens when charging power returns. This ensures `session.charging_duration_s` correctly accounts for the pre-restart charging period. See `specs/019-session-quality-fixes/spec.md` IC-6 for the binding decisions.
+
+---
+
 ## Session Store Schema (v1.2)
 
 Completed sessions are stored in `ev_charging_manager_sessions.json` with the
@@ -148,12 +162,14 @@ Engine selection occurs in `__init__.py` during `async_setup_entry`.
 
 ## Advanced Options
 
-Three new options control `PlugAnchoredSessionEngine` timing:
+These options control `PlugAnchoredSessionEngine` timing (two existing in v0.3.0, three new in v0.4.0):
 
 | Option | Default | Range | Description |
 |--------|---------|-------|-------------|
 | `charging_idle_timeout_min` | 5 min | 3–30 min | Inactivity timeout before window close |
 | `disconnect_grace_min` | 10 min | 5–30 min | Grace period for transient disconnects |
-| `block_unmapped_rfid` | True | boolean | Block (and flag) sessions from unmapped RFID cards |
+| `rfid_grace_seconds` | 5 s | 0 (disable) or 1–30 s | Seconds to wait after plug-on for an RFID blip before committing user attribution |
+| `heartbeat_log_interval_min` | 5 min | 0 (disable) or 1–30 min | Minutes between HEARTBEAT debug-log entries during active charging |
+| `ui_dispatch_interval_s` | 60 s | 0 (disable) or 10–300 s | Seconds between live UI updates for session-derived sensors during active charging |
 
 Configure via **Settings > Devices & Services > EV Charging Manager > Configure**.

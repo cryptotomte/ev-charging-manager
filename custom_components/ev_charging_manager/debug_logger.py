@@ -27,6 +27,9 @@ Pre-PR-22 categories (still in use):
   CAR_STATE, CAR_STATE_UNAVAIL
   PLUG_STATE, CABLE_LOCK, MODEL_STATUS, ERR_STATE, TRX_STATE
   GATE_ENGAGED, GATE_PROMOTE, GATE_CLEAR, BALANCING_SKIP  (legacy engine only)
+
+PR-23 categories:
+  HEARTBEAT — periodic "alive" marker emitted during TRACKING state (FR-012)
 """
 
 from __future__ import annotations

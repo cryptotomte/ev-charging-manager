@@ -8,6 +8,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.ev_charging_manager.const import (
     CONF_CABLE_LOCK_ENTITY,
     CONF_ERROR_ENTITY,
+    CONF_HEARTBEAT_LOG_INTERVAL_MIN,
     CONF_MAX_STORED_SESSIONS,
     CONF_MIN_SESSION_DURATION_S,
     CONF_MIN_SESSION_ENERGY_WH,
@@ -15,11 +16,13 @@ from custom_components.ev_charging_manager.const import (
     CONF_PERSISTENCE_INTERVAL_S,
     CONF_PLUG_ENTITY,
     CONF_PRICING_MODE,
+    CONF_RFID_GRACE_SECONDS,
     CONF_SPOT_ADDITIONAL_COST_KWH,
     CONF_SPOT_FALLBACK_PRICE_KWH,
     CONF_SPOT_PRICE_ENTITY,
     CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
+    CONF_UI_DISPATCH_INTERVAL_S,
     DEFAULT_MAX_STORED_SESSIONS,
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
@@ -402,3 +405,256 @@ async def test_options_flow_clearing_observation_slot_persists_none(
     assert refreshed.options.get(CONF_PLUG_ENTITY) == plug
     assert refreshed.options.get(CONF_MODEL_STATUS_ENTITY) == model_status
     assert refreshed.options.get(CONF_ERROR_ENTITY) == error
+
+
+# ---------------------------------------------------------------------------
+# T008 (PR-23 Phase 1): Options flow — three new PR-23 options
+# Contract assertions per contracts/options-schema.md §Test contract
+# ---------------------------------------------------------------------------
+
+
+async def test_options_flow_pr23_new_options_appear_in_schema(
+    hass: HomeAssistant,
+) -> None:
+    """T008-a: New PR-23 options appear in the options-flow form schema."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert result["type"] == "form"
+    assert result["step_id"] == "init"
+    schema_keys = [str(k) for k in result["data_schema"].schema]
+    assert CONF_RFID_GRACE_SECONDS in schema_keys, (
+        "Options init must contain rfid_grace_seconds field"
+    )
+    assert CONF_HEARTBEAT_LOG_INTERVAL_MIN in schema_keys, (
+        "Options init must contain heartbeat_log_interval_min field"
+    )
+    assert CONF_UI_DISPATCH_INTERVAL_S in schema_keys, (
+        "Options init must contain ui_dispatch_interval_s field"
+    )
+
+
+async def test_options_flow_pr23_explicit_values_persisted(
+    hass: HomeAssistant,
+) -> None:
+    """T008-b: Submitting explicit PR-23 option values persists them to entry.options."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
+            CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
+            CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
+            CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
+            CONF_RFID_GRACE_SECONDS: 10,
+            CONF_HEARTBEAT_LOG_INTERVAL_MIN: 15,
+            CONF_UI_DISPATCH_INTERVAL_S: 120,
+        },
+    )
+    assert result["step_id"] == "pricing"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_PRICING_MODE: "static",
+            CONF_STATIC_PRICE_KWH: DEFAULT_STATIC_PRICE_KWH,
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] == "create_entry"
+    refreshed = hass.config_entries.async_get_entry(entry.entry_id)
+    assert refreshed.options[CONF_RFID_GRACE_SECONDS] == 10
+    assert refreshed.options[CONF_HEARTBEAT_LOG_INTERVAL_MIN] == 15
+    assert refreshed.options[CONF_UI_DISPATCH_INTERVAL_S] == 120
+
+
+async def test_options_flow_pr23_unchanged_values_preserved(
+    hass: HomeAssistant,
+) -> None:
+    """T008-c: Submitting without changing PR-23 options preserves existing values."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={
+            CONF_RFID_GRACE_SECONDS: 7,
+            CONF_HEARTBEAT_LOG_INTERVAL_MIN: 3,
+            CONF_UI_DISPATCH_INTERVAL_S: 90,
+        },
+        title="Test Charger",
+    )
+    await setup_session_engine(hass, entry)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    # Retrieve the schema defaults (which should be the pre-set values)
+    schema = result["data_schema"].schema
+    defaults = {
+        str(k): k.default() for k in schema if hasattr(k, "default") and callable(k.default)
+    }
+    # The form defaults should reflect the existing entry.options values
+    assert defaults.get(CONF_RFID_GRACE_SECONDS) == 7
+    assert defaults.get(CONF_HEARTBEAT_LOG_INTERVAL_MIN) == 3
+    assert defaults.get(CONF_UI_DISPATCH_INTERVAL_S) == 90
+
+
+async def test_options_flow_pr23_zero_values_accepted(
+    hass: HomeAssistant,
+) -> None:
+    """T008-d: Submitting 0 for any of the three PR-23 options is accepted (disable behavior)."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
+            CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
+            CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
+            CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
+            CONF_RFID_GRACE_SECONDS: 0,
+            CONF_HEARTBEAT_LOG_INTERVAL_MIN: 0,
+            CONF_UI_DISPATCH_INTERVAL_S: 0,
+        },
+    )
+    assert result["step_id"] == "pricing"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_PRICING_MODE: "static",
+            CONF_STATIC_PRICE_KWH: DEFAULT_STATIC_PRICE_KWH,
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] == "create_entry"
+    refreshed = hass.config_entries.async_get_entry(entry.entry_id)
+    assert refreshed.options[CONF_RFID_GRACE_SECONDS] == 0
+    assert refreshed.options[CONF_HEARTBEAT_LOG_INTERVAL_MIN] == 0
+    assert refreshed.options[CONF_UI_DISPATCH_INTERVAL_S] == 0
+
+
+async def test_options_flow_pr23_out_of_range_value_rejected(
+    hass: HomeAssistant,
+) -> None:
+    """T008-e: Submitting an out-of-range value (e.g. 31 for rfid_grace_seconds) is rejected."""
+    import voluptuous as vol
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    schema = result["data_schema"]
+
+    # rfid_grace_seconds max is 30; 31 must be rejected
+    try:
+        schema(
+            {
+                CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
+                CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
+                CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
+                CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
+                CONF_RFID_GRACE_SECONDS: 31,  # out of range: max is 30
+            }
+        )
+        raised = False
+    except vol.Invalid:
+        raised = True
+
+    assert raised, "Schema must reject rfid_grace_seconds=31 (max is 30)"
+
+    # Likewise heartbeat_log_interval_min max is 30; 31 must be rejected
+    try:
+        schema(
+            {
+                CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
+                CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
+                CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
+                CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
+                CONF_HEARTBEAT_LOG_INTERVAL_MIN: 31,  # out of range: max is 30
+            }
+        )
+        raised = False
+    except vol.Invalid:
+        raised = True
+
+    assert raised, "Schema must reject heartbeat_log_interval_min=31 (max is 30)"
+
+    # ui_dispatch_interval_s max is 300; 301 must be rejected
+    try:
+        schema(
+            {
+                CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
+                CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
+                CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
+                CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
+                CONF_UI_DISPATCH_INTERVAL_S: 301,  # out of range: max is 300
+            }
+        )
+        raised = False
+    except vol.Invalid:
+        raised = True
+
+    assert raised, "Schema must reject ui_dispatch_interval_s=301 (max is 300)"
+
+
+async def test_options_flow_pr23_ui_dispatch_interval_1_to_9_rejected(
+    hass: HomeAssistant,
+) -> None:
+    """T008-f: ui_dispatch_interval_s values 1-9 are rejected by the two-band validator.
+
+    The spec (IC-3) allows 0 (disable) or 10..300 (active range). Values 1-9 are
+    rejected because they would create excessive UI fan-out.
+
+    Verifies: 0 accepted, 10 accepted, 300 accepted, 5 rejected.
+    """
+    import voluptuous as vol
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    schema = result["data_schema"]
+
+    base_input = {
+        CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
+        CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
+        CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
+        CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
+    }
+
+    # Accepted: 0 (disable sentinel)
+    try:
+        schema({**base_input, CONF_UI_DISPATCH_INTERVAL_S: 0})
+        accepted_0 = True
+    except vol.Invalid:
+        accepted_0 = False
+    assert accepted_0, "ui_dispatch_interval_s=0 must be accepted (disable sentinel)"
+
+    # Accepted: 10 (lower bound of active range)
+    try:
+        schema({**base_input, CONF_UI_DISPATCH_INTERVAL_S: 10})
+        accepted_10 = True
+    except vol.Invalid:
+        accepted_10 = False
+    assert accepted_10, "ui_dispatch_interval_s=10 must be accepted (active range lower bound)"
+
+    # Accepted: 300 (upper bound of active range)
+    try:
+        schema({**base_input, CONF_UI_DISPATCH_INTERVAL_S: 300})
+        accepted_300 = True
+    except vol.Invalid:
+        accepted_300 = False
+    assert accepted_300, "ui_dispatch_interval_s=300 must be accepted (active range upper bound)"
+
+    # Rejected: 5 (in gap between 0 and 10)
+    try:
+        schema({**base_input, CONF_UI_DISPATCH_INTERVAL_S: 5})
+        rejected_5 = False
+    except vol.Invalid:
+        rejected_5 = True
+    assert rejected_5, "ui_dispatch_interval_s=5 must be rejected (gap 1-9 is invalid per IC-3)"

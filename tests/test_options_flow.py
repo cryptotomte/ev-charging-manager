@@ -16,7 +16,6 @@ from custom_components.ev_charging_manager.const import (
     CONF_PERSISTENCE_INTERVAL_S,
     CONF_PLUG_ENTITY,
     CONF_PRICING_MODE,
-    CONF_RFID_GRACE_SECONDS,
     CONF_SPOT_ADDITIONAL_COST_KWH,
     CONF_SPOT_FALLBACK_PRICE_KWH,
     CONF_SPOT_PRICE_ENTITY,
@@ -416,7 +415,10 @@ async def test_options_flow_clearing_observation_slot_persists_none(
 async def test_options_flow_pr23_new_options_appear_in_schema(
     hass: HomeAssistant,
 ) -> None:
-    """T008-a: New PR-23 options appear in the options-flow form schema."""
+    """T008-a: Remaining PR-23 options (heartbeat, ui_dispatch) appear in the options-flow schema.
+
+    Note: rfid_grace_seconds was removed in PR-24 (FR-014) and must NOT appear.
+    """
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
     await setup_session_engine(hass, entry)
 
@@ -425,21 +427,24 @@ async def test_options_flow_pr23_new_options_appear_in_schema(
     assert result["type"] == "form"
     assert result["step_id"] == "init"
     schema_keys = [str(k) for k in result["data_schema"].schema]
-    assert CONF_RFID_GRACE_SECONDS in schema_keys, (
-        "Options init must contain rfid_grace_seconds field"
-    )
     assert CONF_HEARTBEAT_LOG_INTERVAL_MIN in schema_keys, (
         "Options init must contain heartbeat_log_interval_min field"
     )
     assert CONF_UI_DISPATCH_INTERVAL_S in schema_keys, (
         "Options init must contain ui_dispatch_interval_s field"
     )
+    assert "rfid_grace_seconds" not in schema_keys, (
+        "Options init must NOT contain rfid_grace_seconds (removed in PR-24)"
+    )
 
 
 async def test_options_flow_pr23_explicit_values_persisted(
     hass: HomeAssistant,
 ) -> None:
-    """T008-b: Submitting explicit PR-23 option values persists them to entry.options."""
+    """T008-b: Submitting explicit heartbeat/ui_dispatch values persists them to entry.options.
+
+    Note: rfid_grace_seconds is no longer in the schema (removed in PR-24).
+    """
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
     await setup_session_engine(hass, entry)
 
@@ -451,7 +456,6 @@ async def test_options_flow_pr23_explicit_values_persisted(
             CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
             CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
             CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
-            CONF_RFID_GRACE_SECONDS: 10,
             CONF_HEARTBEAT_LOG_INTERVAL_MIN: 15,
             CONF_UI_DISPATCH_INTERVAL_S: 120,
         },
@@ -468,7 +472,6 @@ async def test_options_flow_pr23_explicit_values_persisted(
 
     assert result["type"] == "create_entry"
     refreshed = hass.config_entries.async_get_entry(entry.entry_id)
-    assert refreshed.options[CONF_RFID_GRACE_SECONDS] == 10
     assert refreshed.options[CONF_HEARTBEAT_LOG_INTERVAL_MIN] == 15
     assert refreshed.options[CONF_UI_DISPATCH_INTERVAL_S] == 120
 
@@ -476,12 +479,15 @@ async def test_options_flow_pr23_explicit_values_persisted(
 async def test_options_flow_pr23_unchanged_values_preserved(
     hass: HomeAssistant,
 ) -> None:
-    """T008-c: Submitting without changing PR-23 options preserves existing values."""
+    """T008-c: Submitting without changing heartbeat/ui_dispatch options preserves existing values.
+
+    Note: rfid_grace_seconds is silently ignored if present in entry.options (stale key from
+    v0.4.0). It no longer appears in the schema defaults.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
         data=MOCK_CHARGER_DATA,
         options={
-            CONF_RFID_GRACE_SECONDS: 7,
             CONF_HEARTBEAT_LOG_INTERVAL_MIN: 3,
             CONF_UI_DISPATCH_INTERVAL_S: 90,
         },
@@ -496,7 +502,6 @@ async def test_options_flow_pr23_unchanged_values_preserved(
         str(k): k.default() for k in schema if hasattr(k, "default") and callable(k.default)
     }
     # The form defaults should reflect the existing entry.options values
-    assert defaults.get(CONF_RFID_GRACE_SECONDS) == 7
     assert defaults.get(CONF_HEARTBEAT_LOG_INTERVAL_MIN) == 3
     assert defaults.get(CONF_UI_DISPATCH_INTERVAL_S) == 90
 
@@ -504,7 +509,7 @@ async def test_options_flow_pr23_unchanged_values_preserved(
 async def test_options_flow_pr23_zero_values_accepted(
     hass: HomeAssistant,
 ) -> None:
-    """T008-d: Submitting 0 for any of the three PR-23 options is accepted (disable behavior)."""
+    """T008-d: Submitting 0 for heartbeat/ui_dispatch options is accepted (disable behavior)."""
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
     await setup_session_engine(hass, entry)
 
@@ -516,7 +521,6 @@ async def test_options_flow_pr23_zero_values_accepted(
             CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
             CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
             CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
-            CONF_RFID_GRACE_SECONDS: 0,
             CONF_HEARTBEAT_LOG_INTERVAL_MIN: 0,
             CONF_UI_DISPATCH_INTERVAL_S: 0,
         },
@@ -533,7 +537,6 @@ async def test_options_flow_pr23_zero_values_accepted(
 
     assert result["type"] == "create_entry"
     refreshed = hass.config_entries.async_get_entry(entry.entry_id)
-    assert refreshed.options[CONF_RFID_GRACE_SECONDS] == 0
     assert refreshed.options[CONF_HEARTBEAT_LOG_INTERVAL_MIN] == 0
     assert refreshed.options[CONF_UI_DISPATCH_INTERVAL_S] == 0
 
@@ -541,7 +544,7 @@ async def test_options_flow_pr23_zero_values_accepted(
 async def test_options_flow_pr23_out_of_range_value_rejected(
     hass: HomeAssistant,
 ) -> None:
-    """T008-e: Submitting an out-of-range value (e.g. 31 for rfid_grace_seconds) is rejected."""
+    """T008-e: Submitting out-of-range heartbeat/ui_dispatch values is rejected by schema."""
     import voluptuous as vol
 
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
@@ -550,24 +553,7 @@ async def test_options_flow_pr23_out_of_range_value_rejected(
     result = await hass.config_entries.options.async_init(entry.entry_id)
     schema = result["data_schema"]
 
-    # rfid_grace_seconds max is 30; 31 must be rejected
-    try:
-        schema(
-            {
-                CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
-                CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
-                CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
-                CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
-                CONF_RFID_GRACE_SECONDS: 31,  # out of range: max is 30
-            }
-        )
-        raised = False
-    except vol.Invalid:
-        raised = True
-
-    assert raised, "Schema must reject rfid_grace_seconds=31 (max is 30)"
-
-    # Likewise heartbeat_log_interval_min max is 30; 31 must be rejected
+    # heartbeat_log_interval_min max is 30; 31 must be rejected
     try:
         schema(
             {
@@ -658,3 +644,33 @@ async def test_options_flow_pr23_ui_dispatch_interval_1_to_9_rejected(
     except vol.Invalid:
         rejected_5 = True
     assert rejected_5, "ui_dispatch_interval_s=5 must be rejected (gap 1-9 is invalid per IC-3)"
+
+
+# ---------------------------------------------------------------------------
+# T021 (PR-24 US5): Stale rfid_grace_seconds key in storage is tolerated
+# FR-015: existing entries with rfid_grace_seconds in options must load cleanly
+# ---------------------------------------------------------------------------
+
+
+async def test_options_flow_tolerates_stale_rfid_grace_seconds_key(
+    hass: HomeAssistant,
+) -> None:
+    """FR-015: Entry with stale rfid_grace_seconds in options loads without error.
+
+    Simulates an upgrade from v0.4.0 (which persisted rfid_grace_seconds=5 in
+    entry.options) to v0.4.1 (which removes the option). HA simply ignores the
+    unknown key — the integration must not crash on setup.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"rfid_grace_seconds": 5, "heartbeat_log_interval_min": 5},
+        title="Test Charger",
+    )
+    # Setup must succeed without raising any exception
+    refreshed = await setup_session_engine(hass, entry)
+
+    assert refreshed is not None, "Entry must be present after setup"
+    assert refreshed.state.value == "loaded", (
+        f"Entry must be in 'loaded' state, got: {refreshed.state.value!r}"
+    )

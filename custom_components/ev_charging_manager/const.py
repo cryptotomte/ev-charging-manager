@@ -79,10 +79,12 @@ class SessionEngineState(StrEnum):
 
 
 class SessionSubState(StrEnum):
-    """Charging session sub-state — derived from engine state + window state."""
+    """Charging session sub-state — derived from engine state, plug, trx, and window state."""
 
     IDLE = "idle"  # no active session
-    WAITING = "waiting"  # active session, no charging window yet
+    WAITING_FOR_PLUG = "waiting_for_plug"  # Blip received, no cable yet
+    WAITING_FOR_RFID = "waiting_for_rfid"  # Cable in, no blip yet
+    INITIALIZING = "initializing"  # Active session, no charging window opened yet
     CHARGING = "charging"  # active session, charging window currently open
     CHARGED = "charged"  # active session, all known windows closed
 
@@ -142,12 +144,24 @@ CONF_CABLE_LOCK_ENTITY = "cable_lock_entity"
 CONF_MODEL_STATUS_ENTITY = "model_status_entity"
 CONF_ERROR_ENTITY = "error_entity"
 
+
 # Unknown session diagnostic reason codes (PR-07)
-UNKNOWN_REASON_TRX_NULL = "trx_was_null"
-UNKNOWN_REASON_TRX_ZERO = "trx_was_zero"
-UNKNOWN_REASON_RFID_INACTIVE = "rfid_inactive"
-UNKNOWN_REASON_RFID_UNMAPPED = "rfid_unmapped"
-UNKNOWN_REASON_RFID_TYPE_ERROR = "rfid_type_error"
+class UnknownReason(StrEnum):
+    """Diagnostic reason why a session was created with user=Unknown.
+
+    Used by the session engine to populate engine.last_unknown_reason for
+    debugging/diagnostics. StrEnum so that == "string_value" comparisons
+    in tests and existing code continue to work unchanged.
+    """
+
+    TRX_NULL = "trx_was_null"
+    TRX_ZERO = "trx_was_zero"
+    RFID_INACTIVE = "rfid_inactive"
+    RFID_UNMAPPED = "rfid_unmapped"
+    RFID_TYPE_ERROR = "rfid_type_error"
+    # PR-24: open-access inference — power flow started without any RFID blip (FR-003)
+    OPEN_ACCESS_INFERRED = "open_access_inferred"
+
 
 # Notification ID for recurring unknown-sessions alert (formatted with entry_id)
 NOTIFICATION_ID_UNKNOWN_SESSIONS = "ev_charging_manager_unknown_sessions_{}"
@@ -185,15 +199,6 @@ GOE_FLAT_KEYS_FW_THRESHOLD = 60
 # New advanced options for the plug-anchored session model (OptionsFlowHandler)
 CONF_CHARGING_IDLE_TIMEOUT_MIN = "charging_idle_timeout_min"
 CONF_DISCONNECT_GRACE_MIN = "disconnect_grace_min"
-
-# RFID grace timer — wait this many seconds after plug-on for a non-null trx
-# before committing the session with user=Unknown (FR-007, IC-1).
-# Default is 5 s as specified by IC-1. Tests that exercise behaviors unrelated
-# to RFID grace should set CONF_RFID_GRACE_SECONDS: 0 in their entry options.
-CONF_RFID_GRACE_SECONDS = "rfid_grace_seconds"
-DEFAULT_RFID_GRACE_SECONDS = 5
-RFID_GRACE_SECONDS_MIN = 0
-RFID_GRACE_SECONDS_MAX = 30
 
 # HEARTBEAT log timer — emit a HEARTBEAT debug-log line at this cadence
 # during TRACKING state (FR-012, IC-3). Set to 0 to disable.
@@ -258,8 +263,8 @@ DEBUG_CAT_RECOVERY_TIMEOUT = "RECOVERY_TIMEOUT"
 # PR-23: periodic heartbeat during TRACKING state (FR-012, IC-3).
 DEBUG_CAT_HEARTBEAT = "HEARTBEAT"
 
-# PR-23: RFID grace timer lifecycle events (FR-001, FR-004, FR-005, FR-007, FR-008).
-DEBUG_CAT_RFID_GRACE = "RFID_GRACE"
+# PR-24: RFID wait lifecycle events (renamed from RFID_GRACE; event-driven model, no timer).
+DEBUG_CAT_RFID_WAIT = "RFID_WAIT"
 
 # New HA events (PR-22)
 EVENT_CHARGING_CHARGED = "ev_charging_charged"

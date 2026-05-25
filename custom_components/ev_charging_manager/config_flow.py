@@ -45,7 +45,6 @@ from .const import (
     CONF_POWER_ENTITY,
     CONF_PRICING_MODE,
     CONF_RFID_ENTITY,
-    CONF_RFID_GRACE_SECONDS,
     CONF_RFID_UID_ENTITY,
     CONF_SPOT_ADDITIONAL_COST_KWH,
     CONF_SPOT_FALLBACK_PRICE_KWH,
@@ -67,7 +66,6 @@ from .const import (
     DEFAULT_NOTIFY_UNMAPPED_RFID,
     DEFAULT_PERSISTENCE_INTERVAL_S,
     DEFAULT_PRICING_MODE,
-    DEFAULT_RFID_GRACE_SECONDS,
     DEFAULT_SPOT_ADDITIONAL_COST_KWH,
     DEFAULT_SPOT_FALLBACK_PRICE_KWH,
     DEFAULT_SPOT_VAT_MULTIPLIER,
@@ -76,8 +74,6 @@ from .const import (
     DOMAIN,
     HEARTBEAT_LOG_INTERVAL_MIN_MAX,
     HEARTBEAT_LOG_INTERVAL_MIN_MIN,
-    RFID_GRACE_SECONDS_MAX,
-    RFID_GRACE_SECONDS_MIN,
     UI_DISPATCH_INTERVAL_S_ACTIVE_MIN,
     UI_DISPATCH_INTERVAL_S_MAX,
     UI_DISPATCH_INTERVAL_S_MIN,
@@ -601,21 +597,6 @@ class OptionsFlowHandler(OptionsFlow):
                     selector.NumberSelector(
                         selector.NumberSelectorConfig(
                             min=5, max=30, step=1, mode=selector.NumberSelectorMode.BOX
-                        )
-                    ),
-                    vol.Coerce(int),
-                ),
-                vol.Optional(
-                    CONF_RFID_GRACE_SECONDS,
-                    default=opts.get(CONF_RFID_GRACE_SECONDS, DEFAULT_RFID_GRACE_SECONDS),
-                ): vol.All(
-                    selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=RFID_GRACE_SECONDS_MIN,
-                            max=RFID_GRACE_SECONDS_MAX,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                            unit_of_measurement="s",
                         )
                     ),
                     vol.Coerce(int),

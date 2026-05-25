@@ -31,7 +31,6 @@ from custom_components.ev_charging_manager.const import (
     CONF_DEBUG_LOGGING,
     CONF_DISCONNECT_GRACE_MIN,
     CONF_HEARTBEAT_LOG_INTERVAL_MIN,
-    CONF_RFID_GRACE_SECONDS,
     CONF_UI_DISPATCH_INTERVAL_S,
     DEFAULT_HEARTBEAT_LOG_INTERVAL_MIN,
     DEFAULT_UI_DISPATCH_INTERVAL_S,
@@ -57,7 +56,7 @@ MOCK_CABLE_LOCK_ENTITY = "sensor.goe_abc123_cus_value"
 #   2026-05-23T14:32:17.123 | HEARTBEAT       | state=charging window=1
 #     session_id=ae0afefb-... wh=4.512 power=3680 connection_s=4925 charging_s=4920
 HEARTBEAT_RE = re.compile(
-    r"^[\d\-T:.+]+ \| HEARTBEAT\s+\| state=(?:charging|charged|waiting) "
+    r"^[\d\-T:.+]+ \| HEARTBEAT\s+\| state=(?:charging|charged|initializing) "
     r"window=\d+ session_id=[\w-]+ wh=\d+\.\d{3} power=\d+ "
     r"connection_s=\d+ charging_s=\d+$"
 )
@@ -73,8 +72,8 @@ async def _make_engine_entry(
 ) -> MockConfigEntry:
     """Create a config entry with PlugAnchoredSessionEngine active.
 
-    Uses CONF_RFID_GRACE_SECONDS=0 to opt out of the RFID grace timer so
-    tests that exercise heartbeat/dispatch are not affected by the grace window.
+    Configures heartbeat and UI dispatch intervals for testing. The RFID wait
+    (PR-24 event-driven model) is not exercised by these tests.
     """
     if enable_debug_logging and tmp_path is not None:
         hass.config.config_dir = str(tmp_path)
@@ -84,8 +83,6 @@ async def _make_engine_entry(
         "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
         CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
         CONF_DISCONNECT_GRACE_MIN: 10,
-        # Opt out of RFID grace — not under test here (US1 lesson)
-        CONF_RFID_GRACE_SECONDS: 0,
         CONF_HEARTBEAT_LOG_INTERVAL_MIN: heartbeat_interval_min,
         CONF_UI_DISPATCH_INTERVAL_S: ui_dispatch_interval_s,
     }

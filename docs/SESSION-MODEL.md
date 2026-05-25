@@ -36,16 +36,18 @@ TRACKING (grace timer running)
 
 ### Status Sub-States
 
-While in `TRACKING`, the engine reports one of four human-readable sub-states:
+The Status sensor exposes one of six human-readable sub-states derived from engine state, plug state, trx state, and window state.
 
-| Sub-state   | Condition |
-|-------------|-----------|
-| `waiting`   | Cable in, no energy flowing |
-| `charging`  | Power > 0 W |
-| `charged`   | Power was > 0, now ≤ 0 (BMS paused or full) |
-| `idle`      | Engine is in IDLE state (no session) |
+| Sub-state | Engine state | Plug | trx | Description |
+|---|---|---|---|---|
+| `idle` | IDLE | off | null/0 | No session, no blip in flight |
+| `waiting_for_plug` | IDLE | off | non-null + non-zero | Blip received, waiting for cable insertion |
+| `waiting_for_rfid` | TRACKING | on | null | Cable in, waiting for RFID blip or power flow |
+| `initializing` | TRACKING | on | non-null | Session active, no charging window yet |
+| `charging` | TRACKING | on | non-null | Charging window currently open |
+| `charged` | TRACKING | on | non-null | Window(s) closed, cable still in |
 
-These are exposed through `StatusSensor` and the `get_status_sub_state()` method.
+These are exposed through `StatusSensor` and the `get_status_sub_state()` method. See `specs/020-rfid-wait-model/data-model.md §E2` for the binding state-mapping table.
 
 ---
 
@@ -162,13 +164,12 @@ Engine selection occurs in `__init__.py` during `async_setup_entry`.
 
 ## Advanced Options
 
-These options control `PlugAnchoredSessionEngine` timing (two existing in v0.3.0, three new in v0.4.0):
+These options control `PlugAnchoredSessionEngine` timing (two existing in v0.3.0, two new in v0.4.0):
 
 | Option | Default | Range | Description |
 |--------|---------|-------|-------------|
 | `charging_idle_timeout_min` | 5 min | 3–30 min | Inactivity timeout before window close |
 | `disconnect_grace_min` | 10 min | 5–30 min | Grace period for transient disconnects |
-| `rfid_grace_seconds` | 5 s | 0 (disable) or 1–30 s | Seconds to wait after plug-on for an RFID blip before committing user attribution |
 | `heartbeat_log_interval_min` | 5 min | 0 (disable) or 1–30 min | Minutes between HEARTBEAT debug-log entries during active charging |
 | `ui_dispatch_interval_s` | 60 s | 0 (disable) or 10–300 s | Seconds between live UI updates for session-derived sensors during active charging |
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 from homeassistant.components import persistent_notification
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
@@ -46,7 +46,6 @@ from .const import (
     CONF_PLUG_ENTITY,
     CONF_POWER_ENTITY,
     CONF_RFID_ENTITY,
-    CONF_RFID_GRACE_SECONDS,
     CONF_RFID_UID_ENTITY,
     CONF_SPOT_ADDITIONAL_COST_KWH,
     CONF_SPOT_FALLBACK_PRICE_KWH,
@@ -63,9 +62,9 @@ from .const import (
     DEBUG_CAT_HA_RESTART_DETECTED,
     DEBUG_CAT_HEARTBEAT,
     DEBUG_CAT_RECOVERY_TIMEOUT,
-    DEBUG_CAT_RFID_GRACE,
     DEBUG_CAT_RFID_UNMAPPED_NOTIFIED,
     DEBUG_CAT_RFID_UNMAPPED_NOTIFY_FAILED,
+    DEBUG_CAT_RFID_WAIT,
     DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT,
     DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
     DEBUG_CAT_SESSION_RESUMED,
@@ -76,7 +75,6 @@ from .const import (
     DEFAULT_MIN_SESSION_DURATION_S,
     DEFAULT_MIN_SESSION_ENERGY_WH,
     DEFAULT_NOTIFY_UNMAPPED_RFID,
-    DEFAULT_RFID_GRACE_SECONDS,
     DEFAULT_SPOT_ADDITIONAL_COST_KWH,
     DEFAULT_SPOT_FALLBACK_PRICE_KWH,
     DEFAULT_SPOT_VAT_MULTIPLIER,
@@ -90,13 +88,9 @@ from .const import (
     NOTIFICATION_ID_UNKNOWN_RFID,
     SIGNAL_RFID_MAPPING_ADDED,
     SIGNAL_SESSION_UPDATE,
-    UNKNOWN_REASON_RFID_INACTIVE,
-    UNKNOWN_REASON_RFID_TYPE_ERROR,
-    UNKNOWN_REASON_RFID_UNMAPPED,
-    UNKNOWN_REASON_TRX_NULL,
-    UNKNOWN_REASON_TRX_ZERO,
     SessionEngineState,
     SessionSubState,
+    UnknownReason,
 )
 from .debug_logger import DebugLogger
 from .models import GuestPricing
@@ -115,35 +109,43 @@ _Unsub = CALLBACK_TYPE | None
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, "null", ""}
 
 # Map RfidResolution.reason → diagnostic reason constant
-_RFID_REASON_MAP: dict[str, str] = {
-    "no_rfid": UNKNOWN_REASON_TRX_ZERO,
-    "unmapped": UNKNOWN_REASON_RFID_UNMAPPED,
-    "rfid_inactive": UNKNOWN_REASON_RFID_INACTIVE,
-    "type_error": UNKNOWN_REASON_RFID_TYPE_ERROR,
+_RFID_REASON_MAP: dict[str, UnknownReason] = {
+    "no_rfid": UnknownReason.TRX_ZERO,
+    "unmapped": UnknownReason.RFID_UNMAPPED,
+    "rfid_inactive": UnknownReason.RFID_INACTIVE,
+    "type_error": UnknownReason.RFID_TYPE_ERROR,
 }
 
 
-@dataclass(slots=True)
-class _RfidGraceState:
-    """In-memory state for an active RFID grace window.
+@dataclass(frozen=True, slots=True)
+class _RfidWaitState:
+    """In-memory state for an active RFID wait (event-driven; no timer).
 
-    See data-model.md §E1. The grace state is either fully present
-    (all three fields set) or ``None`` (no grace window in flight) —
-    there is no partial state.
+    See data-model.md §E1. The wait state is either fully present
+    (field set) or ``None`` (no wait in flight) — there is no partial state.
+    The engine-wide trx listener handles wait-time trx changes.
+
+    Invariants (see data-model.md §E1):
+      - ``_rfid_wait is not None`` iff engine sub-state == WAITING_FOR_RFID.
+      - Plug-off or plug-invalid MUST call ``_cancel_rfid_wait()``.
+      - The dataclass is immutable post-construction (frozen=True).
     """
 
     plug_on_at: datetime
-    cancel: CALLBACK_TYPE  # async_call_later handle
-    trx_listener_unsub: Callable[[], None] | None  # may be None if listener never attached
 
 
 class PlugAnchoredSessionEngine:
     """Plug-anchored multi-window session engine for goe_gemini profile.
 
-    Session lifecycle:
-      IDLE → (plug=on) → TRACKING/WAITING → (power>0) → TRACKING/CHARGING
-           → (idle timeout) → TRACKING/CHARGED → (plug=off + cable_lock=Unlocked)
+    Session lifecycle (plug-first path):
+      IDLE → (plug=on) → TRACKING/WAITING_FOR_RFID → (trx non-null) →
+           TRACKING/INITIALIZING → (power>0) → TRACKING/CHARGING →
+           (idle timeout) → TRACKING/CHARGED → (plug=off + cable_lock=Unlocked)
            → COMPLETING → IDLE
+
+    Session lifecycle (blip-first path):
+      IDLE/WAITING_FOR_PLUG → (plug=on) → TRACKING/INITIALIZING → (power>0) →
+           TRACKING/CHARGING → ...
 
     One session per physical cable insertion. Session splitting on car_status
     oscillation, BMS pulses, or any internal signal is explicitly forbidden
@@ -151,7 +153,7 @@ class PlugAnchoredSessionEngine:
 
     Internal sub-state within TRACKING is tracked via:
       _window_tracker.is_open() → CHARGING sub-state
-      not _window_tracker.is_open() and active_session → CHARGED/WAITING sub-state
+      not _window_tracker.is_open() and active_session → CHARGED/INITIALIZING sub-state
     """
 
     def __init__(
@@ -191,12 +193,12 @@ class PlugAnchoredSessionEngine:
         # NOT persisted across restarts (FR-030)
         self._disconnect_grace_cancel: _Unsub = None
 
-        # RFID grace state (PR-23, US1, FR-001).
-        # When plug transitions off→on with trx in _INVALID_STATES and
-        # rfid_grace_seconds > 0, we defer session start for up to
-        # rfid_grace_seconds seconds to allow a real RFID blip to propagate.
-        # None when no grace window is active; fully set otherwise (no partial state).
-        self._rfid_grace: _RfidGraceState | None = None
+        # RFID wait state (PR-24, US1, FR-001).
+        # When plug transitions off→on with trx in _INVALID_STATES, we enter
+        # an event-driven wait: session start is deferred indefinitely until
+        # trx becomes non-null, power > 0, or plug-off. No timer involved (FR-005).
+        # None when no wait is active; set otherwise (no partial state).
+        self._rfid_wait: _RfidWaitState | None = None
 
         # Idle timer handle — cancels when power resumes (T026)
         self._idle_timer_cancel: _Unsub = None
@@ -213,7 +215,7 @@ class PlugAnchoredSessionEngine:
         self._eto_start: float | None = None
 
         # Last unknown session diagnostics (persists until next unknown session)
-        self._last_unknown_reason: str | None = None
+        self._last_unknown_reason: UnknownReason | None = None
         self._last_unknown_at: str | None = None
 
         # Last completed session info (for StatusSensor attributes)
@@ -287,7 +289,7 @@ class PlugAnchoredSessionEngine:
         return self._active_session
 
     @property
-    def last_unknown_reason(self) -> str | None:
+    def last_unknown_reason(self) -> UnknownReason | None:
         """Return the last diagnostic reason for an unknown session."""
         return self._last_unknown_reason
 
@@ -314,19 +316,52 @@ class PlugAnchoredSessionEngine:
     def get_status_sub_state(self) -> SessionSubState:
         """Return the status sensor sub-state for the current engine state.
 
-        Returns:
-            SessionSubState.IDLE     — no active session
-            SessionSubState.WAITING  — active session but no charging window has opened
-            SessionSubState.CHARGING — a charging window is currently open
-            SessionSubState.CHARGED  — all windows closed, cable still in
+        Mapping (data-model.md §E2):
+
+            IDLE          — no active session, no pending wait
+            WAITING_FOR_PLUG — IDLE + trx non-null/non-zero (PR-24 FR-009)
+            WAITING_FOR_RFID — TRACKING + no session + trx null (PR-24 FR-008)
+            INITIALIZING  — active session, no charging window opened yet
+            CHARGING      — a charging window is currently open
+            CHARGED       — all windows closed, cable still in
+
+        Sub-state derivation asymmetry (IC-5):
+          - WAITING_FOR_RFID: engine state == TRACKING (plug-on always promotes to TRACKING
+            regardless of trx; we're holding the wait state in-memory).
+          - WAITING_FOR_PLUG: engine state == IDLE (a trx-arrives-first event does NOT
+            promote IDLE → TRACKING; no resources are allocated until plug-on).
+        This asymmetry is intentional. The visible sub-state is what the user sees;
+        engine state is internal bookkeeping. See spec.md IC-5 for the binding rationale.
         """
-        if self._state == SessionEngineState.IDLE or self._active_session is None:
+        if self._state == SessionEngineState.IDLE:
+            # PR-24 FR-009: blip-first sub-state — engine idle, plug off, trx non-null/non-zero.
+            # Visibility: user blipped before inserting cable; show "waiting for cable".
+            trx_val = self._get_trx()
+            # _get_trx() already filters _INVALID_STATES via _get_entity_state (returns None
+            # for any unavailable/unknown/null/"" value), so the not-in check is unnecessary.
+            if trx_val is not None and trx_val != "0":
+                return SessionSubState.WAITING_FOR_PLUG
             return SessionSubState.IDLE
+
+        if self._active_session is None:
+            # PR-24 FR-008: plug-first sub-state — TRACKING, no session, plug on, trx invalid.
+            # Visibility: cable in, waiting for RFID blip or power flow.
+            if self._rfid_wait is not None:
+                return SessionSubState.WAITING_FOR_RFID
+            # Transient invariant violation — engine in TRACKING but no session and no
+            # wait state. This shouldn't normally be observed; if it is, the state
+            # machine has gotten out of sync with the wait-state lifecycle.
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: TRACKING with no active_session and no "
+                "_rfid_wait — invariant violation, returning IDLE"
+            )
+            return SessionSubState.IDLE
+
         if self._window_tracker.is_open():
             return SessionSubState.CHARGING
         if self._window_tracker.window_count() > 0:
             return SessionSubState.CHARGED
-        return SessionSubState.WAITING
+        return SessionSubState.INITIALIZING
 
     def get_active_session_dict(self) -> dict | None:
         """Return the active session as a dict for periodic persistence, or None."""
@@ -347,7 +382,7 @@ class PlugAnchoredSessionEngine:
         # Cancel idle/grace timers if still pending.
         self._cancel_idle_timer()
         self._cancel_grace_timer()
-        self._cancel_rfid_grace_timer()
+        self._cancel_rfid_wait()
 
         # PR-23 US5: cancel periodic HEARTBEAT and UI dispatch timers (FR-015).
         # These are also registered with entry.async_on_unload, but explicit
@@ -719,7 +754,7 @@ class PlugAnchoredSessionEngine:
                         f"continuing without pre-restart window in tracker; "
                         f"charging_duration_s will be undercounted for this session",
                     )
-        # else: session has no pre-restart open window — either WAITING (no window had
+        # else: session has no pre-restart open window — either INITIALIZING (no window had
         # opened yet) or already finalized (charging_ended_at set); nothing to inject.
 
         # Reconcile window state: if power > 0, continue/open a window; else keep closed
@@ -881,10 +916,10 @@ class PlugAnchoredSessionEngine:
         )
         entry.async_on_unload(signal_unsub)
 
-        # FR-015 (PR-23): ensure the RFID grace timer is always cancelled on entry
-        # reload/unload, preventing a stranded timer from firing a session start
-        # after the engine has been torn down.
-        entry.async_on_unload(self._cancel_rfid_grace_timer)
+        # PR-24: ensure the RFID wait state is always cleared on entry reload/unload.
+        # Although the event-driven wait has no timer to cancel, clearing _rfid_wait
+        # on unload prevents a stale wait from re-triggering after reload (FR-005).
+        entry.async_on_unload(self._cancel_rfid_wait)
 
         # PR-23 US5 (FR-015, FR-016): register HEARTBEAT log timer and UI dispatch
         # timer. Each is only registered when its option value is > 0 (0 = disabled).
@@ -976,9 +1011,22 @@ class PlugAnchoredSessionEngine:
                 self._handle_observation_change("ERR_STATE", "err", "_last_err", new_val)
             return
 
-        # ----- RFID/trx: observation log + defensive mid-session detection -----
+        # ----- RFID/trx: observation log + RFID wait resolution + mid-session detection -----
         if entity_id == rfid_entity and rfid_entity and new_val is not None:
             self._handle_observation_change("TRX_STATE", "trx", "_last_trx", new_val)
+
+            # FR-002 (PR-24): if we are in the RFID wait state and trx becomes non-null,
+            # resolve the wait and start the session with the plug-on timestamp (FR-007).
+            if (
+                self._rfid_wait is not None
+                and self._state == SessionEngineState.TRACKING
+                and self._active_session is None
+                and new_val not in _INVALID_STATES
+            ):
+                self._on_trx_non_null_during_wait(new_val)
+                self._dispatch_update()
+                return
+
             if self._state == SessionEngineState.TRACKING and self._active_session is not None:
                 # Defensive mid-session RFID change detection (FR-N05, Decision 18.5)
                 # Log but do NOT alter session attribution
@@ -998,6 +1046,10 @@ class PlugAnchoredSessionEngine:
                             )
                 except (ValueError, TypeError):
                     pass
+            # A1 fix (PR-24): dispatch on every trx change so that IDLE-state trx
+            # set/clear (waiting_for_plug sub-state, FR-009) reaches the Status sensor.
+            # _dispatch_update() is idempotent — safe to call unconditionally here.
+            self._dispatch_update()
             return
 
         # ----- Power entity: drives window open/close logic -----
@@ -1034,16 +1086,19 @@ class PlugAnchoredSessionEngine:
                     f"plug entity reports non-binary value: {new_val!r} — "
                     "treating as offline (BUG-7 fix)",
                 )
-            # FR-005 (PR-23): if RFID grace timer is active, cancel it and return to
-            # IDLE — the session must not start after an invalid plug state.
-            if self._rfid_grace is not None:
-                self._cancel_rfid_grace_timer()
+            # FR-004 (PR-24): if RFID wait is active, cancel it and return to IDLE.
+            # Safe action: when the plug signal is stale we don't know if the cable
+            # is still connected, so we clear the wait.  When the plug entity recovers,
+            # a fresh state-change fires and re-enters waiting_for_rfid if plug==on.
+            # This matches spec.md Edge Cases (A4 fix) and test_rfid_wait_plug_invalid_cancels.
+            if self._rfid_wait is not None:
+                self._cancel_rfid_wait()
                 self._state = SessionEngineState.IDLE
                 if self._debug_logger:
                     self._debug_logger.log(
-                        DEBUG_CAT_RFID_GRACE,
-                        f"plug entered invalid state ({new_val!r}) during RFID grace "
-                        "window — grace cancelled, no session started (FR-005)",
+                        DEBUG_CAT_RFID_WAIT,
+                        f"plug entered invalid state ({new_val!r}) during RFID wait "
+                        "— wait cancelled, no session started (FR-004)",
                     )
             self._check_charger_offline()
             return
@@ -1071,19 +1126,19 @@ class PlugAnchoredSessionEngine:
                 )
 
     def _handle_plug_on(self) -> None:
-        """Plug transitioned off → on: start a new session (PR-22 FR-001).
+        """Plug transitioned off → on: start a new session or enter RFID wait (PR-24).
 
         If called while already TRACKING (transient disconnect resolved),
-        cancel the grace timer and log DISCONNECT_RESOLVED.
+        delegate to _handle_plug_on_during_tracking.
 
-        Implements PR-22 FR-001 (plug-on handling) extended by PR-23 FR-001/FR-007/FR-008
-        (RFID grace timer): if rfid_grace_seconds > 0 and the current trx is null/invalid,
-        defer session start by starting the RFID grace timer instead of calling
-        _async_start_session immediately.  The grace timer will fire _async_start_session
-        once trx resolves or the timer expires.
+        PR-24 FR-001/FR-006: if trx is in _INVALID_STATES at plug-on, enter the
+        event-driven RFID wait (no timer). If trx is already non-null, start the
+        session immediately (fast path, FR-006).
+        trx="0" (open-access sentinel at go-e) is NOT in _INVALID_STATES and
+        triggers the immediate-start path.
         """
         if self._state == SessionEngineState.TRACKING:
-            # Plug returned during a transient disconnect — cancel grace timer
+            # Plug returned during a transient disconnect
             self._handle_plug_on_during_tracking()
             return
 
@@ -1091,71 +1146,63 @@ class PlugAnchoredSessionEngine:
             # Already completing — ignore
             return
 
-        # Cancel any lingering grace or disconnect timer (defensive)
+        # Cancel any lingering disconnect timer (defensive)
         self._cancel_grace_timer()
-        self._cancel_rfid_grace_timer()
+        self._cancel_rfid_wait()
 
         self._state = SessionEngineState.TRACKING
 
-        # Determine whether to defer session start via RFID grace timer
-        # (PR-23 FR-001, FR-007, FR-008). trx="0" denotes open-access at go-e
-        # and is intentionally NOT in _INVALID_STATES, so the immediate-start
-        # branch handles it (PR-23 FR-008).
-        rfid_grace_seconds = self._entry.options.get(
-            CONF_RFID_GRACE_SECONDS, DEFAULT_RFID_GRACE_SECONDS
-        )
         current_trx = self._get_trx()
 
-        # rfid_grace_seconds == 0 is the explicit "disabled" sentinel (PR-23 FR-007);
-        # falsy short-circuit takes us straight to the immediate-start path.
-        if rfid_grace_seconds > 0 and current_trx in _INVALID_STATES:
-            # trx is null/unavailable at plug-on and grace is enabled → defer (PR-23 FR-001)
+        if current_trx in _INVALID_STATES:
+            # trx is null/unavailable at plug-on → enter event-driven RFID wait (FR-001)
             now = dt_util.utcnow()
-            self._start_rfid_grace_timer(now, rfid_grace_seconds)
+            self._start_rfid_wait(now)
         else:
-            # Either grace is disabled (PR-23 FR-007) or trx is already non-null (PR-23 FR-008) →
-            # immediate start (preserves existing behavior)
+            # trx is already non-null (fast path: blip-before-plug, or open-access)
+            # → immediate session start (FR-006)
             self._hass.async_create_task(self._async_start_session())
 
     def _handle_plug_off(self) -> None:
         """Plug transitioned on → off: validate with cable_lock before ending (PR-22 FR-002/FR-003).
 
         If cable_lock == Unlocked → real unplug → end session immediately.
-        Otherwise → transient disconnect → start grace timer (PR-22 FR-003, FR-004).
+        Otherwise → transient disconnect → start grace timer (PR-22 FR-003, PR-22 FR-004).
 
-        PR-23 FR-004: if the RFID grace timer is still active (session not yet
-        started), cancel it and return to IDLE — do NOT start a session.
+        PR-24 FR-004: if the RFID wait is active (no session committed yet),
+        clear it and return to IDLE — do NOT start a session.
         """
         if self._state == SessionEngineState.IDLE:
             return  # no session to end
 
-        # FR-028: If all entities just went unavailable simultaneously,
+        # PR-22 FR-028: If all entities just went unavailable simultaneously,
         # do NOT treat this as a real plug-off
         if self._charger_offline:
             _LOGGER.debug("PlugAnchoredSessionEngine: plug=off but charger is offline — ignoring")
             return
 
-        # FR-004 (PR-23): if RFID grace timer is active, a session has not been committed
-        # yet — cancel the timer and return to IDLE without starting any session.
-        if self._rfid_grace is not None:
-            self._cancel_rfid_grace_timer()
+        # PR-24 FR-004: if RFID wait is active, a session has not been committed
+        # yet — cancel the wait and return to IDLE without starting any session.
+        if self._rfid_wait is not None:
+            self._cancel_rfid_wait()
             self._state = SessionEngineState.IDLE
             if self._debug_logger:
                 self._debug_logger.log(
-                    DEBUG_CAT_RFID_GRACE,
-                    "plug went off during RFID grace window — grace cancelled, no session started",
+                    DEBUG_CAT_RFID_WAIT,
+                    "plug went off during RFID wait — wait cancelled, "
+                    "no session started (PR-24 FR-004)",
                 )
             return
 
         cable_lock = self._get_cable_lock()
         if cable_lock == "Unlocked":
-            # Validated real unplug (FR-002)
+            # Validated real unplug (PR-22 FR-002)
             self._cancel_grace_timer()
             self._cancel_idle_timer()
             self._state = SessionEngineState.COMPLETING
             self._hass.async_create_task(self._async_complete_session())
         else:
-            # Transient disconnect (FR-003) — cable_lock is Locked / unknown / Lock failed
+            # Transient disconnect (PR-22 FR-003) — cable_lock is Locked / unknown / Lock failed
             self._data_gap = True  # engine-level flag; transferred to session on completion
             if self._active_session is not None:
                 self._active_session.data_gap = True
@@ -1168,7 +1215,7 @@ class PlugAnchoredSessionEngine:
             self._start_grace_timer()
 
     def _start_grace_timer(self) -> None:
-        """Start the disconnect grace timer (FR-004)."""
+        """Start the disconnect grace timer (PR-22 FR-004)."""
         self._cancel_grace_timer()
         grace_min = self._entry.options.get(CONF_DISCONNECT_GRACE_MIN, DEFAULT_DISCONNECT_GRACE_MIN)
         grace_seconds = grace_min * 60
@@ -1213,129 +1260,119 @@ class PlugAnchoredSessionEngine:
         self._safe_cancel("_disconnect_grace_cancel")
 
     # -----------------------------------------------------------------------
-    # RFID grace timer (PR-23, US1, FR-001..FR-008)
-    # Mirrors the disconnect-grace pattern (research.md R1 / IC-1).
+    # RFID event-driven wait — entry into and exit from the `waiting_for_rfid`
+    # sub-state (PR-24, US1, FR-001..FR-007).
+    # The engine-wide trx listener (_async_on_state_change → RFID branch)
+    # and power listener (_handle_power_change) handle the three exit conditions
+    # (trx non-null, power > 0, plug-off). No new listener registration needed.
     # -----------------------------------------------------------------------
 
-    def _start_rfid_grace_timer(self, plug_on_at: datetime, grace_seconds: int) -> None:
-        """Start the RFID grace timer after plug-on with trx=null (FR-001).
+    def _start_rfid_wait(self, plug_on_at: datetime) -> None:
+        """Enter the event-driven RFID wait after plug-on with trx=null (FR-001).
 
-        Schedules _rfid_grace_expired to fire after grace_seconds. Also
-        registers a temporary trx listener so we fire immediately if trx
-        becomes non-null before the timer expires (FR-002).
+        Creates a _RfidWaitState recording the plug-on timestamp and logs the
+        wait entry. No timer is scheduled — the wait resolves when one of three
+        events fires:
+          - trx becomes non-null (handled by engine-wide trx listener in
+            _async_on_state_change → _on_trx_non_null_during_wait)
+          - power > 0 (handled by _handle_power_change, FR-003)
+          - plug-off or plug-invalid (handled by _handle_plug_off / _handle_plug_change)
 
         Args:
-            plug_on_at: UTC timestamp of the plug-on event (used as connected_at, FR-006).
-            grace_seconds: Seconds to wait before committing with user=Unknown.
+            plug_on_at: UTC timestamp of the plug-on event (becomes session.connected_at, FR-007).
         """
-        # Cancel any stale grace state (defensive; should not be active in IDLE)
-        self._cancel_rfid_grace_timer()
+        # Cancel any stale wait state (defensive)
+        self._cancel_rfid_wait()
 
-        @callback
-        def _rfid_grace_expired(_fire_time: datetime) -> None:
-            """Fire when grace window expires without RFID resolution (FR-003)."""
-            # Only proceed if we are still waiting for RFID resolution.
-            # If the plug has gone away in the meantime, _cancel_rfid_grace_timer
-            # should have already cleared _rfid_grace — check it here as a safety net.
-            if self._rfid_grace is None:
-                return
-            if self._state != SessionEngineState.TRACKING:
-                # Engine left TRACKING (plug-off during grace, etc.) — abort
-                self._rfid_grace = None
-                return
-
-            # Save plug_on_at BEFORE calling _cancel_rfid_grace_timer (which clears the state)
-            saved_plug_on_at = self._rfid_grace.plug_on_at
-            self._cancel_rfid_grace_timer()
-
-            # Start session with Unknown user; pass plug-on time as connected_at (FR-006)
-            self._hass.async_create_task(self._async_start_session(connected_at=saved_plug_on_at))
-
-        cancel_handle = async_call_later(self._hass, grace_seconds, _rfid_grace_expired)
-
-        # Register a temporary trx listener so we can fire immediately if a
-        # non-null trx arrives during the grace window (FR-002).
-        rfid_entity = self._entry.data.get(CONF_RFID_ENTITY)
-        trx_listener_unsub: Callable[[], None] | None = None
-        if rfid_entity:
-
-            async def _on_trx_non_null_during_grace(event: Any) -> None:
-                """Fire session start with the resolved trx and cancel the grace timer.
-
-                Order of operations matters: save plug_on_at BEFORE calling
-                _cancel_rfid_grace_timer (which clears the state), then schedule the
-                session start with the saved value.
-                """
-                new_state = event.data.get("new_state")
-                new_val = new_state.state if new_state else None
-
-                # Ignore invalid or null values — keep waiting
-                if new_val in _INVALID_STATES:
-                    return
-
-                # Grace was already completed or cancelled — do not double-start
-                if self._rfid_grace is None:
-                    return
-
-                if self._state != SessionEngineState.TRACKING:
-                    return
-
-                # Save plug_on_at BEFORE cancelling (cancel clears the state)
-                saved_plug_on_at = self._rfid_grace.plug_on_at
-
-                # Cancel the timer (and the trx listener) now that we have the trx
-                self._cancel_rfid_grace_timer()
-
-                # Start session immediately with the resolved trx (FR-002).
-                # _async_start_session reads trx from the entity directly via _get_trx(),
-                # so as long as the new_val is already in the entity state by now
-                # (which it is — this callback fires after the state change), it will
-                # be resolved by RfidLookup.
-                self._hass.async_create_task(
-                    self._async_start_session(connected_at=saved_plug_on_at)
-                )
-
-            trx_listener_unsub = async_track_state_change_event(
-                self._hass,
-                [rfid_entity],
-                _on_trx_non_null_during_grace,
-            )
-
-        self._rfid_grace = _RfidGraceState(
-            plug_on_at=plug_on_at,
-            cancel=cancel_handle,
-            trx_listener_unsub=trx_listener_unsub,
-        )
+        self._rfid_wait = _RfidWaitState(plug_on_at=plug_on_at)
 
         if self._debug_logger:
             self._debug_logger.log(
-                DEBUG_CAT_RFID_GRACE,
-                f"RFID grace timer started: waiting up to {grace_seconds}s for non-null trx "
+                DEBUG_CAT_RFID_WAIT,
+                f"RFID wait started (event-driven, no timer): waiting for trx/power/plug-off "
                 f"(plug_on_at={plug_on_at.isoformat()})",
             )
 
-    def _cancel_rfid_grace_timer(self) -> None:
-        """Cancel the RFID grace timer and associated trx listener. Idempotent (IC-1)."""
-        state = self._rfid_grace
-        if state is None:
+    def _cancel_rfid_wait(self) -> None:
+        """Clear the RFID wait state. Idempotent — no timer handle to cancel (PR-24)."""
+        self._rfid_wait = None
+
+    def _on_trx_non_null_during_wait(self, new_val: str) -> None:
+        """Handle trx becoming non-null while in the RFID wait state (FR-002).
+
+        Called from the engine-wide trx change handler in _async_on_state_change
+        when self._rfid_wait is not None. Saves plug_on_at BEFORE clearing the
+        wait state, then schedules _async_start_session with the saved timestamp.
+
+        Args:
+            new_val: The new (non-null, non-invalid) trx value from the entity state.
+        """
+        # Only proceed if we are still in the RFID wait state
+        if self._rfid_wait is None:
             return
-        try:
-            state.cancel()
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("rfid_grace cancel failed: %s", err)
-        if state.trx_listener_unsub is not None:
-            try:
-                state.trx_listener_unsub()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("rfid_grace trx listener unsub failed: %s", err)
-        self._rfid_grace = None
+
+        if self._state != SessionEngineState.TRACKING:
+            return
+
+        # Save plug_on_at BEFORE cancelling (cancel clears the state)
+        saved_plug_on_at = self._rfid_wait.plug_on_at
+
+        # Clear the wait state
+        self._cancel_rfid_wait()
+
+        # Start session immediately with the resolved trx (FR-002).
+        # _async_start_session reads trx from the entity directly via _get_trx(),
+        # so as long as the new_val is already in the entity state by now
+        # (which it is — this callback fires after the state change), it will
+        # be resolved by RfidLookup.
+        self._hass.async_create_task(self._async_start_session(connected_at=saved_plug_on_at))
 
     # -----------------------------------------------------------------------
     # Power handling: charging window lifecycle (T025, T026)
     # -----------------------------------------------------------------------
 
     def _handle_power_change(self, new_val: str | None) -> None:
-        """Handle power entity state change — drives window open/close logic."""
+        """Handle power entity state change — drives window open/close logic.
+
+        FR-003 (PR-24): at the top of this handler, before any session-window logic,
+        check whether we are in the RFID wait state and power is starting to flow.
+        If so, infer open-access mode and start a session attributed to Unknown.
+        """
+        # PR-24 FR-003: open-access inference — power flow during RFID wait.
+        # This runs even when active_session is None, before the main early-return guard.
+        # Race note (research §R3): trx-listener normally wins this race in forced-RFID
+        # mode because trx fires before power flows. This branch is reached only when
+        # power arrives first (open-access or rare timing). First-fire-wins; the other
+        # listener sees active_session is not None and is a no-op.
+        if (
+            self._state == SessionEngineState.TRACKING
+            and self._active_session is None
+            and self._rfid_wait is not None
+        ):
+            try:
+                new_power_w = float(new_val) if new_val not in _INVALID_STATES else None
+            except (ValueError, TypeError):
+                new_power_w = None
+
+            if new_power_w is not None and new_power_w > 0:
+                # Power began flowing while waiting for RFID — open-access charger.
+                # Save plug_on_at and clear wait before starting session (FR-007).
+                plug_on_at = self._rfid_wait.plug_on_at
+                self._cancel_rfid_wait()
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        DEBUG_CAT_RFID_WAIT,
+                        f"power flow detected during RFID wait ({new_power_w:.0f}W) — "
+                        "inferring open-access mode, starting Unknown session (FR-003)",
+                    )
+                self._hass.async_create_task(
+                    self._async_start_session(
+                        connected_at=plug_on_at,
+                        reason=UnknownReason.OPEN_ACCESS_INFERRED,
+                    )
+                )
+                return
+
         if self._state != SessionEngineState.TRACKING or self._active_session is None:
             return
 
@@ -1525,165 +1562,203 @@ class PlugAnchoredSessionEngine:
     # Session start (T029, T030)
     # -----------------------------------------------------------------------
 
-    async def _async_start_session(self, connected_at: datetime | None = None) -> None:
-        """Create a new session on plug-on event — WAITING state.
+    async def _async_start_session(
+        self,
+        connected_at: datetime | None = None,
+        reason: UnknownReason | None = None,
+    ) -> None:
+        """Create a new session on plug-on event — INITIALIZING state.
 
         Args:
             connected_at: Optional plug-on timestamp to use as the session's
-                connected_at value (FR-006, PR-23 US1). When provided (RFID
-                grace path), this records the actual plug-on time rather than
-                the deferred session-start time. When None (immediate path),
-                the current time is used (existing behavior).
+                connected_at value (FR-007, PR-24). When provided (RFID wait path
+                or open-access inference), this records the actual plug-on time
+                rather than the deferred session-start time. When None (immediate
+                path), the current time is used (existing behavior).
+            reason: Optional override for the unknown-session diagnostic reason.
+                Used by the open-access inference path (FR-003, PR-24) to record
+                UnknownReason.OPEN_ACCESS_INFERRED instead of the default
+                UnknownReason.TRX_NULL when trx is null but power flow started.
         """
-        # Idempotency guard: a late-arriving scheduled task (e.g. from grace-expiry
-        # or trx-resolve callback) must abort if the engine has moved on between
-        # task scheduling and execution (FR-004).
+        # Idempotency guard: a late-arriving scheduled task (e.g. from trx-resolve
+        # callback) must abort if the engine has moved on between task scheduling
+        # and execution (FR-004, PR-24).
         if self._state != SessionEngineState.TRACKING or self._active_session is not None:
             if self._debug_logger:
                 self._debug_logger.log(
-                    DEBUG_CAT_RFID_GRACE,
+                    DEBUG_CAT_RFID_WAIT,
                     f"late session-start task aborted (state={self._state.value} "
                     f"active_session={'present' if self._active_session else 'None'})",
                 )
             return
 
-        now = dt_util.utcnow()
-        now_iso = now.isoformat()
-        # Use the caller-provided plug-on time if available (FR-006), else current time.
-        connected_at_iso = connected_at.isoformat() if connected_at is not None else now_iso
+        try:
+            now = dt_util.utcnow()
+            now_iso = now.isoformat()
+            # Use the caller-provided plug-on time if available (FR-007), else current time.
+            connected_at_iso = connected_at.isoformat() if connected_at is not None else now_iso
 
-        trx = self._get_trx()
-        rfid_lookup = RfidLookup(self._config_store.data)
-        resolution = rfid_lookup.resolve(trx)
+            trx = self._get_trx()
+            rfid_lookup = RfidLookup(self._config_store.data)
+            resolution = rfid_lookup.resolve(trx)
 
-        # Debug log RFID resolution
-        if self._debug_logger:
-            if resolution is not None and resolution.user_type != "unknown":
+            # Debug log RFID resolution
+            if self._debug_logger:
+                if resolution is not None and resolution.user_type != "unknown":
+                    self._debug_logger.log(
+                        "RFID_READ",
+                        f"tag={trx} matched user={resolution.user_name} "
+                        f"(rfid_index={resolution.rfid_index})",
+                    )
+                else:
+                    self._debug_logger.log("RFID_READ", f"tag={trx} unknown")
+
+            # Snapshot energy at session start
+            energy = self._get_energy() or 0.0
+            self._last_energy_kwh = energy
+
+            power = self._get_power() or 0.0
+            self._last_power_w = power
+
+            # Optional RFID UID
+            rfid_uid: str | None = None
+            uid_entity = self._entry.data.get(CONF_RFID_UID_ENTITY)
+            if uid_entity:
+                uid_val = self._get_entity_state(uid_entity)
+                if uid_val:
+                    rfid_uid = uid_val
+
+            charger_name = self._entry.data.get(CONF_CHARGER_NAME, "")
+
+            # Create session record — snapshot principle: all user/vehicle/pricing data at start
+            self._active_session = Session(
+                user_name=resolution.user_name if resolution else "Unknown",
+                user_type=resolution.user_type if resolution else "unknown",
+                vehicle_name=resolution.vehicle_name if resolution else None,
+                vehicle_battery_kwh=resolution.vehicle_battery_kwh if resolution else None,
+                efficiency_factor=resolution.efficiency_factor if resolution else None,
+                rfid_index=resolution.rfid_index if resolution else None,
+                rfid_uid=rfid_uid,
+                charger_name=charger_name,
+                # Legacy alias (backward compat) — always the session-start time
+                started_at=now_iso,
+                # PR-22 canonical — plug-on time (may predate session start when set via
+                # the RFID wait path or open-access inference; PR-24 FR-007)
+                connected_at=connected_at_iso,
+                energy_start_kwh=energy,
+                energy_kwh=0.0,
+            )
+
+            # Reset window tracker for this session
+            self._window_tracker = ChargingWindowTracker()
+            self._data_gap = False
+            self._eto_start = self._get_eto()
+
+            # Snapshot guest pricing (Constitution §II Snapshot Principle)
+            if resolution is not None and resolution.guest_pricing is not None:
+                self._guest_pricing = GuestPricing.from_dict(resolution.guest_pricing)
+                self._active_session.charge_price_method = self._guest_pricing.method
+            else:
+                self._guest_pricing = None
+
+            # Record diagnostic reason for unknown sessions
+            session_user_type = resolution.user_type if resolution else "unknown"
+            if session_user_type == "unknown":
+                if reason is not None:
+                    # Caller-provided reason override (e.g. open_access_inferred from FR-003)
+                    self._last_unknown_reason = reason
+                elif resolution is None:
+                    self._last_unknown_reason = UnknownReason.TRX_NULL
+                else:
+                    self._last_unknown_reason = _RFID_REASON_MAP.get(
+                        resolution.reason or "", UnknownReason.RFID_UNMAPPED
+                    )
+                self._last_unknown_at = now_iso
+
+            # Spot mode initialization
+            if self._pricing.mode == "spot":
+                self._active_session.cost_method = "spot"
+                self._active_session.price_details = []
+                self._hour_energy_snapshot = 0.0
+                self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+                self._hourly_unsub = async_track_utc_time_change(
+                    self._hass, self._async_hourly_snapshot, minute=0, second=0
+                )
+                # BUG-6 fix: do NOT call entry.async_on_unload here. Each session would
+                # leak a stale callback into the entry's unload list because
+                # _async_complete_session cancels the handle but cannot remove it from
+                # the list. Manage lifecycle ourselves via async_unload() below.
+                self._engine_unsubs.append(self._hourly_unsub)
+
+            # Story 07: check for unmapped RFID and trigger passive notification if needed
+            if session_user_type == "unknown" and resolution is not None:
+                if resolution.reason in ("unmapped", "rfid_inactive", "type_error"):
+                    await self._async_handle_unknown_rfid(resolution.rfid_index, resolution.reason)
+
+            if self._debug_logger:
                 self._debug_logger.log(
-                    "RFID_READ",
-                    f"tag={trx} matched user={resolution.user_name} "
-                    f"(rfid_index={resolution.rfid_index})",
+                    "SESSION_START",
+                    f"session_id={self._active_session.id} user={self._active_session.user_name} "
+                    f"charger={charger_name} connected_at={connected_at_iso}",
                 )
-            else:
-                self._debug_logger.log("RFID_READ", f"tag={trx} unknown")
-
-        # Snapshot energy at session start
-        energy = self._get_energy() or 0.0
-        self._last_energy_kwh = energy
-
-        power = self._get_power() or 0.0
-        self._last_power_w = power
-
-        # Optional RFID UID
-        rfid_uid: str | None = None
-        uid_entity = self._entry.data.get(CONF_RFID_UID_ENTITY)
-        if uid_entity:
-            uid_val = self._get_entity_state(uid_entity)
-            if uid_val:
-                rfid_uid = uid_val
-
-        charger_name = self._entry.data.get(CONF_CHARGER_NAME, "")
-
-        # Create session record — snapshot principle: all user/vehicle/pricing data at start
-        self._active_session = Session(
-            user_name=resolution.user_name if resolution else "Unknown",
-            user_type=resolution.user_type if resolution else "unknown",
-            vehicle_name=resolution.vehicle_name if resolution else None,
-            vehicle_battery_kwh=resolution.vehicle_battery_kwh if resolution else None,
-            efficiency_factor=resolution.efficiency_factor if resolution else None,
-            rfid_index=resolution.rfid_index if resolution else None,
-            rfid_uid=rfid_uid,
-            charger_name=charger_name,
-            # Legacy alias (backward compat) — always the session-start time
-            started_at=now_iso,
-            # PR-22 canonical — plug-on time (may predate session start when RFID grace used)
-            connected_at=connected_at_iso,
-            energy_start_kwh=energy,
-            energy_kwh=0.0,
-        )
-
-        # Reset window tracker for this session
-        self._window_tracker = ChargingWindowTracker()
-        self._data_gap = False
-        self._eto_start = self._get_eto()
-
-        # Snapshot guest pricing (Constitution §II Snapshot Principle)
-        if resolution is not None and resolution.guest_pricing is not None:
-            self._guest_pricing = GuestPricing.from_dict(resolution.guest_pricing)
-            self._active_session.charge_price_method = self._guest_pricing.method
-        else:
-            self._guest_pricing = None
-
-        # Record diagnostic reason for unknown sessions
-        session_user_type = resolution.user_type if resolution else "unknown"
-        if session_user_type == "unknown":
-            if resolution is None:
-                self._last_unknown_reason = UNKNOWN_REASON_TRX_NULL
-            else:
-                self._last_unknown_reason = _RFID_REASON_MAP.get(
-                    resolution.reason or "", UNKNOWN_REASON_RFID_UNMAPPED
+                self._debug_logger.log(
+                    "ENGINE_DECISION",
+                    f"IDLE → TRACKING (trigger: plug=on + rfid_resolved) "
+                    f"energy_start={energy:.3f}kWh",
                 )
-            self._last_unknown_at = now_iso
 
-        # Spot mode initialization
-        if self._pricing.mode == "spot":
-            self._active_session.cost_method = "spot"
-            self._active_session.price_details = []
-            self._hour_energy_snapshot = 0.0
-            self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-            self._hourly_unsub = async_track_utc_time_change(
-                self._hass, self._async_hourly_snapshot, minute=0, second=0
-            )
-            # BUG-6 fix: do NOT call entry.async_on_unload here. Each session would
-            # leak a stale callback into the entry's unload list because
-            # _async_complete_session cancels the handle but cannot remove it from
-            # the list. Manage lifecycle ourselves via async_unload() below.
-            self._engine_unsubs.append(self._hourly_unsub)
-
-        # Story 07: check for unmapped RFID and trigger passive notification if needed
-        if session_user_type == "unknown" and resolution is not None:
-            if resolution.reason in ("unmapped", "rfid_inactive", "type_error"):
-                await self._async_handle_unknown_rfid(resolution.rfid_index, resolution.reason)
-
-        if self._debug_logger:
-            self._debug_logger.log(
-                "SESSION_START",
-                f"session_id={self._active_session.id} user={self._active_session.user_name} "
-                f"charger={charger_name} connected_at={connected_at_iso}",
-            )
-            self._debug_logger.log(
-                "ENGINE_DECISION",
-                f"IDLE → TRACKING (trigger: plug=on + rfid_resolved) energy_start={energy:.3f}kWh",
+            _LOGGER.info(
+                "PlugAnchoredSessionEngine: session started id=%s user=%s trx=%s",
+                self._active_session.id,
+                self._active_session.user_name,
+                trx,
             )
 
-        _LOGGER.info(
-            "PlugAnchoredSessionEngine: session started id=%s user=%s trx=%s",
-            self._active_session.id,
-            self._active_session.user_name,
-            trx,
-        )
+            # Fire session_started event (keeping started_at as backward-compat alias)
+            self._hass.bus.async_fire(
+                EVENT_SESSION_STARTED,
+                {
+                    "session_id": self._active_session.id,
+                    "user_name": self._active_session.user_name,
+                    "user_type": self._active_session.user_type,
+                    "vehicle_name": self._active_session.vehicle_name,
+                    "rfid_index": self._active_session.rfid_index,
+                    "rfid_uid": self._active_session.rfid_uid,
+                    "started_at": now_iso,  # backward-compat alias for connected_at
+                    "charger": charger_name,
+                },
+            )
 
-        # Fire session_started event (keeping started_at as backward-compat alias)
-        self._hass.bus.async_fire(
-            EVENT_SESSION_STARTED,
-            {
-                "session_id": self._active_session.id,
-                "user_name": self._active_session.user_name,
-                "user_type": self._active_session.user_type,
-                "vehicle_name": self._active_session.vehicle_name,
-                "rfid_index": self._active_session.rfid_index,
-                "rfid_uid": self._active_session.rfid_uid,
-                "started_at": now_iso,  # backward-compat alias for connected_at
-                "charger": charger_name,
-            },
-        )
-
-        self._dispatch_update()
-
-        # If power is already > 0 at plug-in (rare: pre-authorized charge), open window
-        if power > 0:
-            self._open_window(now)
             self._dispatch_update()
+
+            # If power is already > 0 at plug-in (rare: pre-authorized charge), open window
+            if power > 0:
+                self._open_window(now)
+                self._dispatch_update()
+
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error(
+                "PlugAnchoredSessionEngine: _async_start_session failed (%s); "
+                "resetting engine to IDLE to avoid ghost-tracking state",
+                err,
+                exc_info=True,
+            )
+            # Defensive reset to keep the engine in a coherent state.
+            self._state = SessionEngineState.IDLE
+            self._active_session = None
+            self._rfid_wait = None
+            # Surface to the user via persistent notification (mirror BUG-4 pattern).
+            try:
+                persistent_notification.async_create(
+                    self._hass,
+                    f"EV Charging Manager: session start failed "
+                    f"({type(err).__name__}: {err}). "
+                    "Check Home Assistant logs.",
+                    title="EV Charging Manager error",
+                    notification_id="ev_charging_manager_session_start_failure",
+                )
+            except Exception:  # noqa: BLE001
+                pass  # notification is best-effort
 
     async def _async_handle_unknown_rfid(self, rfid_index: int | None, reason: str) -> None:
         """Passive-notification handler for unmapped RFID at session start.
@@ -1979,6 +2054,7 @@ class PlugAnchoredSessionEngine:
             # Reset to IDLE — must always happen so the engine does not get
             # stuck in COMPLETING after a persist failure (BUG-4).
             self._active_session = None
+            self._rfid_wait = None  # defensive parity: complete session implies no pending wait
             self._window_tracker = ChargingWindowTracker()
             self._guest_pricing = None
             self._last_energy_kwh = 0.0
@@ -2301,7 +2377,13 @@ class PlugAnchoredSessionEngine:
     # -----------------------------------------------------------------------
 
     def _handle_plug_on_during_tracking(self) -> None:
-        """Cable returned to on during a transient disconnect grace window."""
+        """Plug=on event while engine is already TRACKING.
+
+        Possible causes:
+          1. Active session is running — disconnect was transient (existing).
+          2. RFID wait in progress, duplicate plug-on signal (NEW).
+        Neither case requires action; both just record the event in the debug log.
+        """
         self._cancel_grace_timer()
         if self._active_session is not None:
             if self._debug_logger:
@@ -2309,4 +2391,11 @@ class PlugAnchoredSessionEngine:
                     DEBUG_CAT_DISCONNECT_RESOLVED,
                     f"plug returned to on — disconnect was transient; "
                     f"session_id={self._active_session.id}",
+                )
+        elif self._rfid_wait is not None:
+            # Duplicate plug-on during RFID wait — record for diagnostics.
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_RFID_WAIT,
+                    "duplicate plug-on event during RFID wait — ignored",
                 )

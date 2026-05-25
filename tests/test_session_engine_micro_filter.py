@@ -20,7 +20,6 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
-    CONF_RFID_GRACE_SECONDS,
     DOMAIN,
 )
 from custom_components.ev_charging_manager.session_engine_v2 import (
@@ -47,7 +46,6 @@ async def _make_engine_entry(hass: HomeAssistant) -> MockConfigEntry:
             "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
             CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
             CONF_DISCONNECT_GRACE_MIN: 10,
-            CONF_RFID_GRACE_SECONDS: 0,  # opt out: micro-filter/energy behavior tests
         },
         title="Test go-e Charger",
     )
@@ -86,7 +84,9 @@ async def test_tc025_micro_filter_no_energy(hass: HomeAssistant, freezer) -> Non
     session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
 
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
-        # Plug in
+        # Plug in — set trx to a valid card index before plug-on so the
+        # event-driven RFID wait resolves immediately (PR-24: no timer fallback).
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
         await hass.async_block_till_done()

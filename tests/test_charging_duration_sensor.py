@@ -34,7 +34,6 @@ from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
     CONF_HEARTBEAT_LOG_INTERVAL_MIN,
-    CONF_RFID_GRACE_SECONDS,
     CONF_UI_DISPATCH_INTERVAL_S,
     DOMAIN,
     SIGNAL_SESSION_UPDATE,
@@ -59,8 +58,7 @@ IDLE_TIMEOUT_MIN = 3
 async def _make_engine_entry(hass: HomeAssistant) -> MockConfigEntry:
     """Create and set up a goe_gemini config entry with PlugAnchoredSessionEngine.
 
-    All three timer options are set to 0 to avoid interference with the tests:
-      - CONF_RFID_GRACE_SECONDS = 0   — no grace deferral
+    Timers are set to 0 to avoid interference with the tests:
       - CONF_HEARTBEAT_LOG_INTERVAL_MIN = 0 — no heartbeat timer
       - CONF_UI_DISPATCH_INTERVAL_S = 0 — no automatic dispatch tick
     The tests fire SIGNAL_SESSION_UPDATE manually when they want a sensor render.
@@ -73,7 +71,6 @@ async def _make_engine_entry(hass: HomeAssistant) -> MockConfigEntry:
             "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
             CONF_CHARGING_IDLE_TIMEOUT_MIN: IDLE_TIMEOUT_MIN,
             CONF_DISCONNECT_GRACE_MIN: 10,
-            CONF_RFID_GRACE_SECONDS: 0,
             CONF_HEARTBEAT_LOG_INTERVAL_MIN: 0,
             CONF_UI_DISPATCH_INTERVAL_S: 0,
         },
@@ -523,4 +520,70 @@ async def test_window_attribute_schema(hass: HomeAssistant, freezer) -> None:
     # Invariant: len(windows) == window_count
     assert len(windows) == attrs["window_count"], (
         f"len(windows)={len(windows)} must equal window_count={attrs['window_count']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 7 — IC-3 row 3: waiting_for_rfid → sensor must be unavailable
+# ---------------------------------------------------------------------------
+
+
+async def test_charging_duration_unavailable_during_waiting_for_rfid(
+    hass: HomeAssistant,
+) -> None:
+    """Scenario 7: engine in waiting_for_rfid → ChargingDurationSensor is unavailable.
+
+    IC-3 row 3: "Returns None. No active session yet."
+    TRACKING state without an active session (plug=on, trx=null) must NOT
+    render "00:00:00" — it must be STATE_UNAVAILABLE or STATE_UNKNOWN.
+    Covers the A2 fix (PR-24 review).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+    from custom_components.ev_charging_manager.const import (
+        SIGNAL_SESSION_UPDATE,
+        SessionSubState,
+    )
+
+    entry = await _make_engine_entry(hass)
+    engine = _get_engine(hass, entry)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Plug in with trx=null → engine enters waiting_for_rfid (TRACKING, no session)
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+
+    # Sanity check: engine is in waiting_for_rfid sub-state
+    assert engine.get_status_sub_state() == SessionSubState.WAITING_FOR_RFID, (
+        f"Pre-condition: expected waiting_for_rfid, got {engine.get_status_sub_state()!r}"
+    )
+    assert engine.active_session is None, "Pre-condition: no active session in wait state"
+
+    # Look up the sensor entity
+    registry = er.async_get(hass)
+    unique_id = f"{entry.entry_id}_charging_duration"
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+    assert entity_id is not None, "ChargingDurationSensor must be registered"
+
+    # Trigger a sensor render via the dispatcher
+    async_dispatcher_send(hass, SIGNAL_SESSION_UPDATE.format(entry.entry_id))
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None, f"State for {entity_id} must exist"
+
+    # IC-3 row 3: sensor must be unavailable (native_value returns None)
+    assert state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN), (
+        f"ChargingDurationSensor must be unavailable during waiting_for_rfid, "
+        f"got state={state.state!r}"
+    )
+
+    # Belt-and-suspenders: active_session is None confirms available=False
+    assert engine.active_session is None, (
+        "IC-3: available=False iff active_session is None — confirmed"
     )

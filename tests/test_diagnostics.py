@@ -7,12 +7,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ev_charging_manager.const import (
     DOMAIN,
-    UNKNOWN_REASON_RFID_INACTIVE,
-    UNKNOWN_REASON_RFID_TYPE_ERROR,
-    UNKNOWN_REASON_RFID_UNMAPPED,
-    UNKNOWN_REASON_TRX_NULL,
-    UNKNOWN_REASON_TRX_ZERO,
     SessionEngineState,
+    UnknownReason,
 )
 from tests.conftest import (
     MOCK_CAR_STATUS_ENTITY,
@@ -22,6 +18,13 @@ from tests.conftest import (
     start_charging_session,
     stop_charging_session,
 )
+
+# Convenience aliases so all existing assertions continue to read clearly.
+UNKNOWN_REASON_TRX_NULL = UnknownReason.TRX_NULL
+UNKNOWN_REASON_TRX_ZERO = UnknownReason.TRX_ZERO
+UNKNOWN_REASON_RFID_INACTIVE = UnknownReason.RFID_INACTIVE
+UNKNOWN_REASON_RFID_UNMAPPED = UnknownReason.RFID_UNMAPPED
+UNKNOWN_REASON_RFID_TYPE_ERROR = UnknownReason.RFID_TYPE_ERROR
 
 NO_FILTER_OPTIONS = {"min_session_duration_s": 0, "min_session_energy_wh": 0}
 

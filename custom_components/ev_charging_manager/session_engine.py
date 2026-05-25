@@ -44,12 +44,8 @@ from .const import (
     EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
     SIGNAL_SESSION_UPDATE,
-    UNKNOWN_REASON_RFID_INACTIVE,
-    UNKNOWN_REASON_RFID_TYPE_ERROR,
-    UNKNOWN_REASON_RFID_UNMAPPED,
-    UNKNOWN_REASON_TRX_NULL,
-    UNKNOWN_REASON_TRX_ZERO,
     SessionEngineState,
+    UnknownReason,
 )
 from .debug_logger import DebugLogger
 from .models import GuestPricing
@@ -65,11 +61,11 @@ _LOGGER = logging.getLogger(__name__)
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, "null", ""}
 
 # Map RfidResolution.reason → diagnostic reason constant
-_RFID_REASON_MAP: dict[str, str] = {
-    "no_rfid": UNKNOWN_REASON_TRX_ZERO,
-    "unmapped": UNKNOWN_REASON_RFID_UNMAPPED,
-    "rfid_inactive": UNKNOWN_REASON_RFID_INACTIVE,
-    "type_error": UNKNOWN_REASON_RFID_TYPE_ERROR,
+_RFID_REASON_MAP: dict[str, UnknownReason] = {
+    "no_rfid": UnknownReason.TRX_ZERO,
+    "unmapped": UnknownReason.RFID_UNMAPPED,
+    "rfid_inactive": UnknownReason.RFID_INACTIVE,
+    "type_error": UnknownReason.RFID_TYPE_ERROR,
 }
 
 
@@ -926,10 +922,10 @@ class SessionEngine:
         session_user_type = resolution.user_type if resolution else "unknown"
         if session_user_type == "unknown":
             if resolution is None:
-                self._last_unknown_reason = UNKNOWN_REASON_TRX_NULL
+                self._last_unknown_reason = UnknownReason.TRX_NULL
             else:
                 self._last_unknown_reason = _RFID_REASON_MAP.get(
-                    resolution.reason or "", UNKNOWN_REASON_RFID_UNMAPPED
+                    resolution.reason or "", UnknownReason.RFID_UNMAPPED
                 )
             self._last_unknown_at = now_iso
             _LOGGER.debug(

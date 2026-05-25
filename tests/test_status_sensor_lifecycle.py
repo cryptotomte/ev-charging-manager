@@ -1,7 +1,7 @@
 """TC-023, TC-005b: Status sensor lifecycle tests for PlugAnchoredSessionEngine (PR-22).
 
 TC-023: Full lifecycle state transitions — StatusSensor value at each step:
-        idle → waiting → charging → charged → idle.
+        idle → initializing → charging → charged → idle.
 
 TC-005b: Multi-window scenario — window 1 fires ev_charging_charged once, sensor
          returns 'charging' again for window 2, then 'charged', window count == 2.
@@ -24,7 +24,6 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
-    CONF_RFID_GRACE_SECONDS,
     DOMAIN,
     EVENT_CHARGING_CHARGED,
 )
@@ -55,7 +54,6 @@ async def _make_engine_entry(hass: HomeAssistant) -> MockConfigEntry:
             "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
             CONF_CHARGING_IDLE_TIMEOUT_MIN: IDLE_TIMEOUT_MIN,
             CONF_DISCONNECT_GRACE_MIN: 10,
-            CONF_RFID_GRACE_SECONDS: 0,  # opt out: sensor lifecycle/sub-state tests
         },
         title="Test go-e Charger",
     )
@@ -102,11 +100,11 @@ def _get_status_sensor_state(hass: HomeAssistant, entry: MockConfigEntry) -> str
 
 
 async def test_tc023_status_sensor_lifecycle(hass: HomeAssistant, freezer) -> None:
-    """TC-023: StatusSensor transitions through idle→waiting→charging→charged→idle.
+    """TC-023: StatusSensor transitions through idle→initializing→charging→charged→idle.
 
     Verifies that:
     - Before plug: 'idle'
-    - After plug-in (no power): 'waiting'
+    - After plug-in (no power, RFID resolved): 'initializing'
     - After power > 0: 'charging'
     - After power = 0 + idle timeout fires: 'charged'
     - After unplug: 'idle'
@@ -120,13 +118,17 @@ async def test_tc023_status_sensor_lifecycle(hass: HomeAssistant, freezer) -> No
             "TC-023: engine should be 'idle' before plug-in"
         )
 
-        # ---- Plug in cable (no power yet): waiting ----
+        # ---- Plug in cable (no power yet): initializing ----
+        # Set trx to a valid card index before plug-on so the event-driven RFID
+        # wait resolves immediately (PR-24: no timer fallback). The session enters
+        # INITIALIZING (formerly 'waiting') until power > 0.
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
         await hass.async_block_till_done()
 
-        assert engine.get_status_sub_state() == "waiting", (
-            f"TC-023: expected 'waiting' after plug-in, got {engine.get_status_sub_state()!r}"
+        assert engine.get_status_sub_state() == "initializing", (
+            f"TC-023: expected 'initializing' after plug-in, got {engine.get_status_sub_state()!r}"
         )
 
         # ---- Power rises: charging ----
@@ -161,9 +163,14 @@ async def test_tc023_status_sensor_lifecycle(hass: HomeAssistant, freezer) -> No
         )
 
         # ---- Unplug (cable_lock=Unlocked first, then plug=off) → 'idle' ----
+        # Also clear trx to null (go-e firmware auto-clears trx after session ends;
+        # without this, the idle engine would show 'waiting_for_plug' because trx="2"
+        # is still set from the session that just completed).
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
         await hass.async_block_till_done()
         hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_TRX_ENTITY, "null")
         await hass.async_block_till_done()
 
         assert engine.get_status_sub_state() == "idle", (
@@ -195,11 +202,15 @@ async def test_tc005b_multi_window_status_sensor(hass: HomeAssistant, freezer) -
 
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
         # ---- Plug in ----
+        # Set trx to a valid card index before plug-on so the event-driven RFID
+        # wait resolves immediately (PR-24: no timer fallback). The session enters
+        # INITIALIZING (formerly 'waiting') until power > 0.
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
         await hass.async_block_till_done()
 
-        assert engine.get_status_sub_state() == "waiting"
+        assert engine.get_status_sub_state() == "initializing"
 
         # ---- Window 1: start charging ----
         hass.states.async_set(MOCK_POWER_ENTITY, "11000.0")
@@ -269,9 +280,14 @@ async def test_tc005b_multi_window_status_sensor(hass: HomeAssistant, freezer) -
         )
 
         # ---- Unplug → session completes → idle ----
+        # Also clear trx to null (go-e firmware auto-clears trx after session ends;
+        # without this, the idle engine would show 'waiting_for_plug' because trx="2"
+        # is still set from the session that just completed).
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
         await hass.async_block_till_done()
         hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_TRX_ENTITY, "null")
         await hass.async_block_till_done()
 
         assert engine.get_status_sub_state() == "idle", (

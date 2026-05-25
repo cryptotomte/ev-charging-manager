@@ -344,10 +344,11 @@ class StatusSensor(_SessionSensorBase):
     def native_value(self) -> str:
         """Return current engine state.
 
-        For PlugAnchoredSessionEngine (goe_gemini profile), returns the fine-grained
-        sub-state: idle / waiting / charging / charged (per FR-013–FR-017, T041).
-        For the legacy SessionEngine, returns the raw state machine value.
-        Falls back to 'idle' if engine is missing.
+        For PlugAnchoredSessionEngine (goe_gemini profile), returns one of six
+        sub-states: idle, waiting_for_plug, waiting_for_rfid, initializing,
+        charging, charged. See specs/020-rfid-wait-model/data-model.md §E2 for the
+        state-mapping table. For the legacy SessionEngine, returns the raw
+        SessionEngineState enum value.
         """
         engine = self._engine()
         if engine is None:
@@ -440,6 +441,17 @@ class ChargingDurationSensor(_SessionSensorBase):
         self._attr_translation_key = "charging_duration"
 
     @property
+    def available(self) -> bool:
+        """Return True only when an active session exists (IC-3 row 3).
+
+        The base class returns True for any TRACKING state, but TRACKING without
+        an active session means waiting_for_rfid — no session yet.  Returning
+        True there would cause HA to show "00:00:00" instead of "unavailable".
+        """
+        engine = self._engine()
+        return engine is not None and engine.active_session is not None
+
+    @property
     def native_value(self) -> str | None:
         """Return the live charging duration as HH:MM:SS, or None when no session.
 
@@ -448,7 +460,8 @@ class ChargingDurationSensor(_SessionSensorBase):
         Formatted as zero-padded HH:MM:SS for parity with SessionDurationSensor.
         """
         engine = self._engine()
-        if engine is None or not self._is_tracking():
+        # IC-3 row 3: no active session → unavailable (never "00:00:00")
+        if engine is None or engine.active_session is None:
             return None
 
         from homeassistant.util import dt as dt_util

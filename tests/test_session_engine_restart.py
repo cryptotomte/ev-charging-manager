@@ -34,7 +34,6 @@ from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DEBUG_LOGGING,
     CONF_DISCONNECT_GRACE_MIN,
-    CONF_RFID_GRACE_SECONDS,
     DEBUG_CAT_CHARGING_WINDOW_CLOSE,
     DOMAIN,
     SESSION_STORE_VERSION,
@@ -382,10 +381,10 @@ async def test_tc019b_restart_window_state_power_off(
         "TC-019b: window must NOT be open when power=0 at restart"
     )
     # Sub-state reflects no open window with at least 1 previous window
-    # (snapshot had charging_window_count=1 so we're 'charged' or 'waiting')
+    # (snapshot had charging_window_count=1 so we're 'charged' or 'initializing')
     sub = engine.get_status_sub_state()
-    assert sub in ("charged", "waiting"), (
-        f"TC-019b: expected 'charged' or 'waiting' for idle power at restart, got {sub!r}"
+    assert sub in ("charged", "initializing"), (
+        f"TC-019b: expected 'charged' or 'initializing' for idle power at restart, got {sub!r}"
     )
 
 
@@ -418,8 +417,6 @@ async def _make_engine_entry_with_restart(
         "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
         CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
         CONF_DISCONNECT_GRACE_MIN: 10,
-        # Opt out of RFID grace so restart tests are not affected by the grace timer
-        CONF_RFID_GRACE_SECONDS: 0,
     }
     if debug:
         options[CONF_DEBUG_LOGGING] = True
@@ -814,7 +811,6 @@ async def test_tc020e_schema_version_unchanged_after_restart_session(
         "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
         CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
         CONF_DISCONNECT_GRACE_MIN: 10,
-        CONF_RFID_GRACE_SECONDS: 0,
     }
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -892,6 +888,91 @@ async def test_tc020e_schema_version_unchanged_after_restart_session(
         assert envelope.get("minor_version") == 2, (
             f"TC-020(e): expected minor_version=2, got {envelope.get('minor_version')!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# SF7: HA restart mid-wait → engine re-enters waiting_for_rfid on startup
+# ---------------------------------------------------------------------------
+
+
+async def test_ha_restart_during_rfid_wait_re_enters_wait_state(
+    hass: HomeAssistant,
+) -> None:
+    """HA restarts while a cable is plugged in but no RFID blip has occurred yet.
+
+    Verifies that after restart the engine re-derives the sub-state from current
+    entity values and correctly enters waiting_for_rfid — exactly as it would in a
+    live session.  No active session snapshot exists (the wait was pre-session).
+
+    The test simulates the post-restart scenario: after HA loads the integration
+    (engine listener is now registered), the charger entities fire their restored
+    state-change events.  This is how HA communicates "plug is on at restart" to
+    the engine — via a state_changed event, not via a separate boot hook.
+
+    Per spec.md Edge Cases (A4 / restart handling) and contracts/engine-state-machine.md:
+    on the first plug=on event with trx=null (and no active snapshot), the engine
+    must enter waiting_for_rfid rather than starting a session.
+    """
+    # Create the entry with plug=off (idle). _make_engine_entry only sets states and
+    # returns the entry — it does NOT call add_to_hass or async_setup.
+    entry = await _make_engine_entry(
+        hass,
+        plug_state="off",
+        cable_lock_state="Unlocked",
+        power_state="0.0",
+        energy_state="0.0",
+    )
+    # Complete setup (no snapshot → active_snapshot is None → no async_recover).
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    engine = _get_engine(hass, entry)
+    assert engine.state == SessionEngineState.IDLE, (
+        "SF7 pre-condition: engine must be IDLE before simulating restart-plug-on"
+    )
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Simulate HA restoring the plug entity state after restart — the charger
+        # has been plugged in since before the restart (cable_lock=Locked confirms it).
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        hass.states.async_set(MOCK_TRX_ENTITY, "null")  # no RFID blip before restart
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        await hass.async_block_till_done()
+
+    # The engine must be TRACKING with no active session (RFID wait re-entered)
+    assert engine.state == SessionEngineState.TRACKING, (
+        f"SF7: expected TRACKING after post-restart plug=on, got {engine.state!r}"
+    )
+    assert engine.active_session is None, (
+        "SF7: no session must exist — restart happened before any RFID blip"
+    )
+
+    # Sub-state must be waiting_for_rfid (cable in, no blip)
+    sub = engine.get_status_sub_state()
+    assert sub == "waiting_for_rfid", (
+        f"SF7: expected sub-state 'waiting_for_rfid' after post-restart plug=on/trx=null, "
+        f"got {sub!r}"
+    )
+
+    # _rfid_wait must be initialised (the wait state was re-derived from entity values)
+    assert engine._rfid_wait is not None, (  # noqa: SLF001
+        "SF7: _rfid_wait must be set after post-restart plug=on with trx=null"
+    )
+
+    # Sending a trx event must resolve the wait and start a session normally
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Unmapped blip arrives (no user configured) → session starts as Unknown
+        hass.states.async_set(MOCK_TRX_ENTITY, "5")
+        await hass.async_block_till_done()
+
+    assert engine.active_session is not None, (
+        "SF7: session must start normally when trx resolves after post-restart wait"
+    )
+    assert engine._rfid_wait is None, (  # noqa: SLF001
+        "SF7: _rfid_wait must be cleared after session starts"
+    )
 
 
 async def test_tc020f_no_synthetic_window_when_pre_restart_was_charged(

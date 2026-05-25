@@ -35,7 +35,6 @@ from custom_components.ev_charging_manager.charging_window import (
 from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
-    CONF_RFID_GRACE_SECONDS,
     DEFERRED_RECOVERY_TIMEOUT_MIN,
     DOMAIN,
     SessionEngineState,
@@ -152,7 +151,6 @@ async def _setup_engine_with_session(
             "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
             CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
             CONF_DISCONNECT_GRACE_MIN: 10,
-            CONF_RFID_GRACE_SECONDS: 0,  # opt out: plug/persist behavior tests
         },
         title="Test go-e Charger",
     )
@@ -168,7 +166,9 @@ async def _setup_engine_with_session(
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-        # Start a session
+        # Start a session — set trx to a valid card index before plug-on so the
+        # event-driven RFID wait resolves immediately (PR-24: no timer fallback).
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
         await hass.async_block_till_done()

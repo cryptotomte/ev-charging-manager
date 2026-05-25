@@ -23,10 +23,10 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
-    CONF_RFID_GRACE_SECONDS,
     DEFAULT_CHARGING_IDLE_TIMEOUT_MIN,
     DOMAIN,
     EVENT_CHARGING_CHARGED,
+    SessionEngineState,
 )
 from custom_components.ev_charging_manager.session_engine_v2 import (
     PlugAnchoredSessionEngine,
@@ -43,14 +43,11 @@ MOCK_PLUG_ENTITY = "binary_sensor.goe_abc123_car_0"
 MOCK_CABLE_LOCK_ENTITY = "sensor.goe_abc123_cus_value"
 
 # Options that provide entity bindings for the new engine.
-# CONF_RFID_GRACE_SECONDS=0 opts these tests out of the RFID grace timer;
-# the timer is irrelevant here (tests exercise BMS pulsing / multi-window behavior).
 MOCK_OPTIONS_V2 = {
     "plug_entity": MOCK_PLUG_ENTITY,
     "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
     CONF_CHARGING_IDLE_TIMEOUT_MIN: DEFAULT_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN: 10,
-    CONF_RFID_GRACE_SECONDS: 0,
 }
 
 
@@ -113,18 +110,22 @@ async def test_tc001_one_session_per_plug_cycle_bms_pulsing(
     session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
 
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
-        # Step 1: Plug in cable
+        # Step 1: Plug in cable — engine enters RFID wait (no session yet in PR-24)
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
         await hass.async_block_till_done()
 
-        # Session should be active (WAITING)
-        assert engine.active_session is not None
-        session_id = engine.active_session.id
+        assert engine.state == SessionEngineState.TRACKING
+        # No session yet — RFID wait is active (PR-24 event-driven model)
+        assert engine.active_session is None
 
-        # Step 2: RFID auth
+        # Step 2: RFID auth → resolves the wait, session starts
         hass.states.async_set(MOCK_TRX_ENTITY, "2")
         await hass.async_block_till_done()
+
+        # Session is now active
+        assert engine.active_session is not None, "Session must start after RFID blip"
+        session_id = engine.active_session.id
 
         # Step 3: Car starts charging (power > 0)
         hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")

@@ -65,6 +65,7 @@ from .const import (
     DEBUG_CAT_RFID_UNMAPPED_NOTIFIED,
     DEBUG_CAT_RFID_UNMAPPED_NOTIFY_FAILED,
     DEBUG_CAT_RFID_WAIT,
+    DEBUG_CAT_SESSION_ENDED_BY_CABLE_UNLOCK,
     DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT,
     DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
     DEBUG_CAT_SESSION_RESUMED,
@@ -192,6 +193,19 @@ class PlugAnchoredSessionEngine:
         # Transient-disconnect grace timer handle (FR-004 / Story 06)
         # NOT persisted across restarts (FR-030)
         self._disconnect_grace_cancel: _Unsub = None
+
+        # PR-25 (021-cable-lock-race): captured at the plug→off instant when the
+        # transient-disconnect branch starts the grace timer. Used by the
+        # cable_lock→Unlocked confirmation path so the completed session records the
+        # real unplug moment as disconnected_at (FR-011), not the 0–3 s-later
+        # confirmation time. None when no transient disconnect is in flight.
+        self._plug_off_at: datetime | None = None
+        # PR-25: snapshot of self._data_gap taken in the transient branch BEFORE it
+        # sets _data_gap = True. On cable_lock→Unlocked confirmation, _data_gap is
+        # restored from this snapshot (None→False) so the race-induced flag is cleared
+        # while a genuine earlier gap is preserved (FR-012). None when no transient
+        # disconnect is in flight.
+        self._data_gap_before_disconnect: bool | None = None
 
         # RFID wait state (PR-24, US1, FR-001).
         # When plug transitions off→on with trx in _INVALID_STATES, we enter
@@ -991,10 +1005,11 @@ class PlugAnchoredSessionEngine:
             self._dispatch_update()
             return
 
-        # ----- Cable lock: observation only (read at plug-off time from HA state) -----
+        # ----- Cable lock: observation + PR-25 unplug confirmation -----
         if entity_id == cable_lock_entity and cable_lock_entity:
             if new_val is not None:
                 self._handle_observation_change("CABLE_LOCK", "cus", "_last_cable_lock", new_val)
+            self._handle_cable_lock_confirmation(new_val)
             return
 
         # ----- Model status: observation only -----
@@ -1203,6 +1218,14 @@ class PlugAnchoredSessionEngine:
             self._hass.async_create_task(self._async_complete_session())
         else:
             # Transient disconnect (PR-22 FR-003) — cable_lock is Locked / unknown / Lock failed
+            # PR-25 (021-cable-lock-race): capture the plug-off context BEFORE setting
+            # _data_gap=True. The go-e charger fires cable_lock→Unlocked 0–3 s after
+            # plug→off on a genuine unplug; if that confirmation arrives while plug is
+            # still off, the cable_lock branch completes the session using _plug_off_at
+            # as the disconnect time (FR-011) and restores _data_gap from this snapshot
+            # (FR-012).
+            self._data_gap_before_disconnect = self._data_gap
+            self._plug_off_at = dt_util.utcnow()
             self._data_gap = True  # engine-level flag; transferred to session on completion
             if self._active_session is not None:
                 self._active_session.data_gap = True
@@ -1213,6 +1236,95 @@ class PlugAnchoredSessionEngine:
                     "treating as transient disconnect, starting grace timer",
                 )
             self._start_grace_timer()
+
+    def _handle_cable_lock_confirmation(self, new_val: str | None) -> None:
+        """Confirm a genuine unplug from a late cable_lock→Unlocked (PR-25, FR-001).
+
+        On the goe_gemini profile the charger fires ``plug: on→off`` 0–3 s BEFORE
+        ``cable_lock: Locked→Unlocked`` on a genuine unplug. ``_handle_plug_off``
+        therefore reads ``cable_lock`` synchronously, sees a non-``Unlocked`` value,
+        and starts the transient-disconnect grace timer. This handler re-evaluates
+        that decision when the lagging ``cable_lock→Unlocked`` arrives.
+
+        The unplug is confirmed (session completed immediately) ONLY when ALL of the
+        guard conditions hold (guard truth table, data-model.md):
+
+          1. ``new_val == "Unlocked"`` — the cable_lock transition target,
+          2. a disconnect grace timer is pending (``_disconnect_grace_cancel`` set) —
+             the precise signal that ``_handle_plug_off`` took the transient branch,
+          3. there is an active session,
+          4. plug is currently ``off`` (live read) — FR-004: no confirmation while a
+             car is connected; also excludes the RFID-wait state (plug is on there),
+          5. the charger is not offline — FR-028 of spec 018 stays authoritative.
+
+        Any case that does not match every condition is a safe no-op (FR-004/FR-005),
+        leaving the existing transient-disconnect behavior untouched (FR-007). This
+        handler never reads car_status and never splits sessions (FR-008 / FR-N01..N05).
+        """
+        if new_val != "Unlocked":
+            return
+        if self._disconnect_grace_cancel is None:
+            return
+        if self._active_session is None:
+            return
+        if self._charger_offline:
+            return
+
+        # At this point we were a genuine confirmation candidate: a grace timer is
+        # pending AND there is an active session. The only remaining gate is the live
+        # plug read. If the plug is NOT "off" (either "on", or None when the entity is
+        # momentarily unavailable), decline the confirmation and let the grace timer
+        # arbitrate — but log it (F1: the decline was previously silent). This branch
+        # is reached only for true confirmation candidates, so it does not spam the log
+        # for ordinary plug-on/idle no-ops (those return at the guards above).
+        plug_val = self._get_plug()
+        if plug_val != "off":
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_SESSION_ENDED_BY_CABLE_UNLOCK,
+                    f"cable_lock→Unlocked but plug={plug_val} (not 'off') — "
+                    "confirmation declined, grace timer will arbitrate",
+                )
+            return
+
+        # All guards pass — this is a confirmed genuine unplug (FR-001).
+        session = self._active_session
+
+        # FR-012: restore the pre-disconnect data_gap value. The transient branch set
+        # _data_gap=True at plug-off; the unplug turned out to be clean, so clear that
+        # race-induced flag — unless a genuine gap was set earlier in the session
+        # (snapshot is True), in which case it is preserved. A None snapshot means no
+        # transient context was captured; treat as no prior gap (False).
+        restored_data_gap = bool(self._data_gap_before_disconnect)
+        self._data_gap = restored_data_gap
+        session.data_gap = restored_data_gap
+
+        # FR-011: read the captured plug-off time into a local BEFORE scheduling the
+        # completion task — the completion reset block clears self._plug_off_at, and
+        # the task may run after this synchronous handler returns.
+        plug_off_at = self._plug_off_at
+
+        # FR-003: cancel the pending grace timer so it cannot also fire a (duplicate)
+        # completion later. Also cancel the idle timer (mirrors the synchronous
+        # plug-off path in _handle_plug_off).
+        self._cancel_grace_timer()
+        self._cancel_idle_timer()
+
+        now = dt_util.utcnow()
+        if self._debug_logger:
+            # FR-009 / SC-005: distinct, auditable category for this completion path.
+            plug_off_iso = plug_off_at.isoformat() if plug_off_at is not None else "unknown"
+            self._debug_logger.log(
+                DEBUG_CAT_SESSION_ENDED_BY_CABLE_UNLOCK,
+                f"cable_lock→Unlocked confirmed genuine unplug — "
+                f"session_id={session.id} plug_off_at={plug_off_iso} "
+                f"confirmed_at={now.isoformat()} data_gap={restored_data_gap}",
+            )
+
+        # FR-002: complete via the shared completion path, using the real unplug
+        # moment as the disconnect time (FR-011).
+        self._state = SessionEngineState.COMPLETING
+        self._hass.async_create_task(self._async_complete_session(disconnected_at=plug_off_at))
 
     def _start_grace_timer(self) -> None:
         """Start the disconnect grace timer (PR-22 FR-004)."""
@@ -1878,8 +1990,51 @@ class PlugAnchoredSessionEngine:
     # Session completion (T027)
     # -----------------------------------------------------------------------
 
-    async def _async_complete_session(self) -> None:
-        """Finalize session: compute metrics, apply micro-filter, persist, fire event."""
+    async def _async_complete_session(self, disconnected_at: datetime | None = None) -> None:
+        """Finalize session (safety-net wrapper).
+
+        ``_async_complete_session`` is scheduled via ``async_create_task`` from several
+        call sites (synchronous plug-off, the cable-lock confirmation path, grace-expiry
+        force-end). If the completion body raised, the exception went only to HA's core
+        log and the engine was stranded in ``COMPLETING`` — no event fired, no IDLE
+        reset, the charger effectively dead until reload. This wrapper guarantees the
+        engine can never get stuck: on any unexpected exception it logs (debug log +
+        ``_LOGGER.exception``) and forces the engine back to IDLE. The happy path is
+        unchanged — it simply delegates to ``_async_complete_session_impl``.
+        """
+        session = self._active_session
+        try:
+            await self._async_complete_session_impl(disconnected_at=disconnected_at)
+        except Exception as err:  # noqa: BLE001 — last-resort: never strand in COMPLETING
+            session_id = session.id if session is not None else "unknown"
+            _LOGGER.exception(
+                "PlugAnchoredSessionEngine: unexpected error completing session id=%s — "
+                "forcing engine to IDLE to avoid stranding in COMPLETING",
+                session_id,
+            )
+            if self._debug_logger:
+                self._debug_logger.log(
+                    "SESSION_STOP",
+                    f"unexpected completion error session_id={session_id} error={err!r} "
+                    "— engine force-reset to IDLE",
+                )
+            # Reset engine state so a returning plug-on / RFID can start fresh.
+            self._active_session = None
+            self._state = SessionEngineState.IDLE
+            self._dispatch_update()
+
+    async def _async_complete_session_impl(self, disconnected_at: datetime | None = None) -> None:
+        """Finalize session: compute metrics, apply micro-filter, persist, fire event.
+
+        Args:
+            disconnected_at: PR-25 (021-cable-lock-race). When provided, this UTC
+                timestamp is used for ``session.disconnected_at`` / ``session.ended_at``
+                and as the end bound of ``connection_duration_s`` instead of the
+                current wall-clock time. The cable_lock→Unlocked confirmation path
+                passes the captured plug-off time here so the recorded disconnect is
+                the real unplug moment, not the 0–3 s-later confirmation (FR-011).
+                When ``None`` (every existing caller), current ``now`` behavior is kept.
+        """
         session = self._active_session
 
         if session is None:
@@ -1892,7 +2047,12 @@ class PlugAnchoredSessionEngine:
         self._cancel_grace_timer()
 
         now = dt_util.utcnow()
-        now_iso = now.isoformat()
+        # PR-25: the recorded disconnect time may differ from "now" when the session
+        # is completed via the cable_lock→Unlocked confirmation path (FR-011). The
+        # charging-window close still uses "now" — windows are finalized at the
+        # moment the session completes, independent of the disconnect timestamp.
+        disconnect_time = disconnected_at if disconnected_at is not None else now
+        now_iso = disconnect_time.isoformat()
 
         # Close any open window with current time
         if self._window_tracker.is_open():
@@ -1902,9 +2062,24 @@ class PlugAnchoredSessionEngine:
         connected_at_str = session.connected_at or session.started_at
         try:
             connected_at = datetime.fromisoformat(connected_at_str)
-            connection_s = max(0, int((now - connected_at).total_seconds()))
+            connection_s = max(0, int((disconnect_time - connected_at).total_seconds()))
         except (ValueError, TypeError):
             connection_s = 0
+            # A malformed connected_at silently zeroes connection_duration and can push
+            # the session under the micro-filter threshold, discarding it without trace.
+            # Log it so a silently-dropped session is auditable.
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: malformed connected_at=%r for session id=%s "
+                "— connection_duration_s set to 0 (session may be discarded by micro-filter)",
+                connected_at_str,
+                session.id,
+            )
+            if self._debug_logger:
+                self._debug_logger.log(
+                    "SESSION_STOP",
+                    f"malformed connected_at={connected_at_str!r} session_id={session.id} "
+                    "— connection_duration_s=0",
+                )
 
         session.disconnected_at = now_iso
         session.ended_at = now_iso  # backward compat alias
@@ -2062,6 +2237,10 @@ class PlugAnchoredSessionEngine:
             self._hour_energy_snapshot = 0.0
             self._hour_start_time = ""
             self._data_gap = False
+            # PR-25: clear the captured plug-off context so a stale timestamp/snapshot
+            # cannot be applied to a later, unrelated completion (D7).
+            self._plug_off_at = None
+            self._data_gap_before_disconnect = None
             self._eto_start = None
             self._state = SessionEngineState.IDLE
 
@@ -2385,6 +2564,10 @@ class PlugAnchoredSessionEngine:
         Neither case requires action; both just record the event in the debug log.
         """
         self._cancel_grace_timer()
+        # PR-25: the transient disconnect genuinely recovered (plug returned). Clear
+        # the captured plug-off context so it cannot leak into a later completion (D7).
+        self._plug_off_at = None
+        self._data_gap_before_disconnect = None
         if self._active_session is not None:
             if self._debug_logger:
                 self._debug_logger.log(

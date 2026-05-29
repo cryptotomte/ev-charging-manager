@@ -249,6 +249,11 @@ DEBUG_CAT_HA_RESTART_DETECTED = "HA_RESTART_DETECTED"
 DEBUG_CAT_SESSION_RESUMED = "SESSION_RESUMED"
 DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART = "SESSION_FORCE_ENDED_BY_RESTART"
 DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT = "SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT"
+# PR-25 (021-cable-lock-race): a pending transient-disconnect grace timer is
+# resolved by cable_lock→Unlocked arriving 0–3 s after plug→off, confirming a
+# genuine unplug. Distinguishes this completion path in the debug log from a
+# synchronous plug-off completion (SESSION_STOP) and a grace-timeout force-end.
+DEBUG_CAT_SESSION_ENDED_BY_CABLE_UNLOCK = "SESSION_ENDED_BY_CABLE_UNLOCK"
 DEBUG_CAT_CHARGER_OFFLINE = "CHARGER_OFFLINE"
 DEBUG_CAT_CHARGER_BACK_ONLINE = "CHARGER_BACK_ONLINE"
 DEBUG_CAT_TRX_MIDSESSION = "TRX_MIDSESSION"

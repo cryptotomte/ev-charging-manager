@@ -27,7 +27,8 @@ TRACKING ─────── plug=off + cable_lock=Unlocked ──► session 
   │  (transient disconnect)
   ▼
 TRACKING (grace timer running)
-  │  cable_lock=Unlocked before grace expires ──────► session end
+  │  cable_lock=Unlocked (plug still off) ──────────► session end (PR-25: confirmed unplug,
+  │                                                    disconnect time = plug-off moment)
   │
   │  plug=on before grace expires ──────────────────► session continues (same session)
   │
@@ -85,12 +86,53 @@ the engine interprets this as a transient disconnect (brief power loss, HA
 entity glitch) rather than a genuine unplug.
 
 - A grace timer starts (`disconnect_grace_min`, default 10 min).
-- If the plug comes back `on` within the grace period, the **same session**
-  continues; no gap is recorded.
-- If the cable lock transitions to `Unlocked` within the grace period, the
-  session ends immediately.
-- If the grace timer expires without recovery, the session is force-ended with
-  `data_gap=True`.
+- `data_gap` is provisionally set to `True` while the grace timer runs.
+
+A pending grace timer has **three** possible resolutions:
+
+1. **Resume** — the plug returns to `on` within the grace period: the **same
+   session** continues, the grace timer is cancelled, and the provisional
+   `data_gap` flag stays as it is (the disconnect really was transient).
+2. **Confirmed unplug (PR-25, `cable_lock→Unlocked`)** — the cable lock
+   transitions to `Unlocked` **while the plug is still `off`**: this confirms a
+   genuine unplug and the session ends immediately (see below).
+3. **Force-end** — the grace timer expires with no recovery and no `Unlocked`
+   confirmation: the session is force-ended with `data_gap=True`
+   (`SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT`).
+
+### Confirmed unplug via lagging `cable_lock→Unlocked` (PR-25)
+
+On the go-e Gemini, a genuine unplug fires `plug: on→off` **0–3 s before**
+`cable_lock: Locked→Unlocked`. At the plug-off instant `cable_lock` therefore
+still reads `Locked`, so the synchronous check in `_handle_plug_off` classifies
+the unplug as a transient disconnect and starts the grace timer. The lagging
+`cable_lock→Unlocked` event re-evaluates that decision.
+
+When **all** of the following hold, the engine treats the `cable_lock→Unlocked`
+transition as a confirmed genuine unplug and completes the session immediately
+(`SESSION_ENDED_BY_CABLE_UNLOCK`), cancelling the grace timer so it cannot also
+fire:
+
+- the new cable-lock value is `Unlocked`,
+- a disconnect grace timer is pending,
+- there is an active session,
+- the plug is currently `off` (a car connected — plug `on` — is **not** a
+  confirmation; the session continues),
+- the charger is not offline (the charger-outage path stays authoritative).
+
+Two values differ from a synchronous plug-off completion:
+
+- **Disconnect time** is recorded as the original `plug→off` timestamp (the
+  moment the car was physically removed), **not** the later confirmation time,
+  so `connection_duration_s` is not inflated by the 0–3 s race gap.
+- **`data_gap`** is reverted to its pre-disconnect value (the provisional
+  `True` set at plug-off is cleared), **unless** a genuine gap was independently
+  recorded earlier in the session (e.g. a sensor went `unavailable` mid-charge),
+  in which case it is preserved.
+
+This is the mechanism that lets a second driver who plugs in shortly after the
+first unplugs get a **fresh, correctly-attributed session** instead of having
+their charge folded into the previous driver's session.
 
 ---
 

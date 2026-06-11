@@ -709,7 +709,14 @@ class OptionsFlowHandler(OptionsFlow):
                     if key in user_input:
                         new_data[key] = user_input[key]
 
-                self.hass.config_entries.async_update_entry(entry, data=new_data)
+                # PR-26 Fix 3 (FR-006/FR-007): commit data AND options in one call
+                # BEFORE the reload, so the reloaded integration starts with the
+                # new values. The trailing async_create_entry writes the identical
+                # options dict — async_update_entry short-circuits on no-change,
+                # so no second listener fire and no second reload occurs.
+                self.hass.config_entries.async_update_entry(
+                    entry, data=new_data, options=self._new_options
+                )
                 await self.hass.config_entries.async_reload(entry.entry_id)
                 return self.async_create_entry(data=self._new_options)
 

@@ -7,6 +7,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ev_charging_manager.const import (
     CONF_CABLE_LOCK_ENTITY,
+    CONF_DEBUG_LOGGING,
     CONF_ERROR_ENTITY,
     CONF_HEARTBEAT_LOG_INTERVAL_MIN,
     CONF_MAX_STORED_SESSIONS,
@@ -644,6 +645,70 @@ async def test_options_flow_pr23_ui_dispatch_interval_1_to_9_rejected(
     except vol.Invalid:
         rejected_5 = True
     assert rejected_5, "ui_dispatch_interval_s=5 must be rejected (gap 1-9 is invalid per IC-3)"
+
+
+# ---------------------------------------------------------------------------
+# T004 (PR-26 US2): Options committed before reload — new values observed
+# during the triggered async_setup_entry; exactly one reload (FR-006, FR-007)
+# ---------------------------------------------------------------------------
+
+
+async def test_options_committed_before_reload_and_single_reload(
+    hass: HomeAssistant,
+) -> None:
+    """FR-006/FR-007: a startup-time option (debug_logging) saved via the
+    options flow is in effect immediately after the flow completes, and the
+    flow triggers exactly one reload."""
+    from unittest.mock import AsyncMock, patch
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    # Debug logger starts disabled (debug_logging not set)
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert not debug_logger.enabled
+
+    orig_reload = hass.config_entries.async_reload
+    with patch.object(
+        hass.config_entries, "async_reload", AsyncMock(side_effect=orig_reload)
+    ) as mock_reload:
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
+                CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
+                CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
+                CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
+                CONF_DEBUG_LOGGING: True,
+            },
+        )
+        assert result["step_id"] == "pricing"
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_PRICING_MODE: "static",
+                CONF_STATIC_PRICE_KWH: DEFAULT_STATIC_PRICE_KWH,
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] == "create_entry"
+
+    # (b) Exactly one reload was triggered by the flow (FR-007)
+    assert mock_reload.await_count == 1, (
+        f"Options flow must trigger exactly one reload, got {mock_reload.await_count}"
+    )
+
+    # (a) The reloaded integration observed the NEW option value during setup:
+    # the freshly created DebugLogger is enabled without any further reload.
+    refreshed = hass.config_entries.async_get_entry(entry.entry_id)
+    assert refreshed.options[CONF_DEBUG_LOGGING] is True
+    new_debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    assert new_debug_logger.enabled, (
+        "DebugLogger must be enabled immediately after the options flow — "
+        "options must be committed BEFORE the reload (FR-006)"
+    )
 
 
 # ---------------------------------------------------------------------------

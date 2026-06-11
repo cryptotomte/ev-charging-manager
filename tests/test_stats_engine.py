@@ -447,9 +447,9 @@ async def test_session_older_than_both_buckets_accumulates_with_warning(
     assert stats.previous_month.energy_kwh == 45.2
     assert stats.previous_month.sessions == 3
     # Warning logged
-    assert any(
-        rec.levelname == "WARNING" and "2026-01" in rec.message for rec in caplog.records
-    ), "A warning must be logged for a session older than both month buckets"
+    assert any(rec.levelname == "WARNING" and "2026-01" in rec.message for rec in caplog.records), (
+        "A warning must be logged for a session older than both month buckets"
+    )
 
 
 async def test_fresh_user_empty_previous_month_does_not_false_match(

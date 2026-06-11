@@ -274,16 +274,40 @@ class StatsEngine:
         stats.session_count += 1
         stats.last_session_at = ended_at
 
-        # Update current_month using started_at (FR-006, T014)
+        # Update month buckets using started_at (FR-006, T014).
+        # PR-26 Fix 1 (FR-001…FR-003): three-way month-key branch — "YYYY-MM"
+        # keys compare lexicographically, so plain string comparison is correct.
         month_key = _month_key_from_iso(started_at)
         if month_key:
-            if stats.current_month.month != month_key:
-                # started_at belongs to a new month — inline rollover
+            if month_key == stats.current_month.month:
+                # Same month — accumulate into current (unchanged fast path)
+                bucket = stats.current_month
+            elif month_key > stats.current_month.month:
+                # started_at belongs to a newer month — forward rollover (FR-003)
                 stats.previous_month = stats.current_month
                 stats.current_month = MonthStats.empty(month_key)
-            stats.current_month.energy_kwh = round(stats.current_month.energy_kwh + energy_kwh, 3)
-            stats.current_month.cost_kr = round(stats.current_month.cost_kr + cost_kr, 2)
-            stats.current_month.sessions += 1
+                bucket = stats.current_month
+            elif stats.previous_month.month and month_key == stats.previous_month.month:
+                # Session started before the midnight rollover — accumulate into
+                # the previous-month bucket without touching current (FR-001).
+                # Guard: previous_month.month must be non-empty (fresh users have
+                # a sentinel empty bucket that must never match).
+                bucket = stats.previous_month
+            else:
+                # Older than both tracked months (e.g. extended outage) — never
+                # drop data: accumulate into current month with a warning (FR-002).
+                _LOGGER.warning(
+                    "Session for user '%s' started in %s, older than both tracked "
+                    "months (current=%s, previous=%s) — accumulating into current month",
+                    user_name,
+                    month_key,
+                    stats.current_month.month,
+                    stats.previous_month.month,
+                )
+                bucket = stats.current_month
+            bucket.energy_kwh = round(bucket.energy_kwh + energy_kwh, 3)
+            bucket.cost_kr = round(bucket.cost_kr + cost_kr, 2)
+            bucket.sessions += 1
 
         # Guest last-session update (T021, FR-008/FR-009)
         if user_type == "guest":

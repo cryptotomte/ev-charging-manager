@@ -484,3 +484,33 @@ async def test_config_flow_goe_auto_populates_observation_slots(hass: HomeAssist
     assert CONF_CABLE_LOCK_ENTITY not in entry_data
     assert CONF_MODEL_STATUS_ENTITY not in entry_data
     assert CONF_ERROR_ENTITY not in entry_data
+
+
+# ---------------------------------------------------------------------------
+# T009 (PR-26 US4): single_config_entry — a second add-integration attempt
+# aborts with single_instance_allowed (FR-009, FR-010)
+# ---------------------------------------------------------------------------
+
+
+async def test_second_config_flow_aborts_single_instance(hass: HomeAssistant) -> None:
+    """FR-010: with one configured entry, a second user flow aborts with
+    single_instance_allowed and no second entry is created; the existing
+    entry and its data are untouched."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from tests.conftest import MOCK_CHARGER_DATA
+
+    existing = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="My go-e Charger")
+    existing.add_to_hass(hass)
+    data_before = dict(existing.data)
+
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "single_instance_allowed"
+
+    # No second entry was created; the existing entry is untouched
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert len(entries) == 1
+    assert entries[0].entry_id == existing.entry_id
+    assert dict(entries[0].data) == data_before

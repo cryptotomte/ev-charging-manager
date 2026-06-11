@@ -248,9 +248,12 @@ class StatsEngine:
         """Handle session_completed: accumulate stats and persist.
 
         Extracts user_name, user_type, energy_kwh, cost_kr, started_at,
-        ended_at from the event. Updates or creates UserStats. Updates
-        current_month using started_at (FR-006). Updates GuestLastSession
-        if user_type == "guest" (T021).
+        ended_at from the event. Updates or creates UserStats. Accumulates
+        into the month bucket selected by started_at: current_month for
+        same/newer months (newer triggers a forward rollover), previous_month
+        for sessions that started before the midnight rollover, current_month
+        with a warning otherwise (PR-04 FR-006; PR-26 FR-001…FR-003). Updates
+        GuestLastSession if user_type == "guest" (T021).
         """
         data = event.data
         user_name: str = data.get("user_name") or "Unknown"
@@ -274,9 +277,10 @@ class StatsEngine:
         stats.session_count += 1
         stats.last_session_at = ended_at
 
-        # Update month buckets using started_at (FR-006, T014).
-        # PR-26 Fix 1 (FR-001…FR-003): three-way month-key branch — "YYYY-MM"
-        # keys compare lexicographically, so plain string comparison is correct.
+        # Update month buckets using started_at (PR-04 FR-006, T014).
+        # PR-26 Fix 1 (FR-001…FR-003): month-key dispatch (same / newer /
+        # previous-month / neither) — "YYYY-MM" keys compare
+        # lexicographically, so plain string comparison is correct.
         month_key = _month_key_from_iso(started_at)
         if month_key:
             if month_key == stats.current_month.month:
@@ -294,11 +298,13 @@ class StatsEngine:
                 # a sentinel empty bucket that must never match).
                 bucket = stats.previous_month
             else:
-                # Older than both tracked months (e.g. extended outage) — never
-                # drop data: accumulate into current month with a warning (FR-002).
+                # Matches neither tracked month (e.g. extended outage spanning
+                # one or more months) — never drop data: accumulate into
+                # current month with a warning (FR-002).
                 _LOGGER.warning(
-                    "Session for user '%s' started in %s, older than both tracked "
-                    "months (current=%s, previous=%s) — accumulating into current month",
+                    "Session for user '%s' started in %s which matches neither "
+                    "tracked month (current=%s, previous=%s); accumulating into "
+                    "current month so no data is lost",
                     user_name,
                     month_key,
                     stats.current_month.month,
@@ -308,6 +314,16 @@ class StatsEngine:
             bucket.energy_kwh = round(bucket.energy_kwh + energy_kwh, 3)
             bucket.cost_kr = round(bucket.cost_kr + cost_kr, 2)
             bucket.sessions += 1
+        else:
+            # started_at was empty or unparseable — the session is counted in
+            # lifetime totals above but excluded from monthly statistics.
+            # Log loudly so the lifetime/monthly discrepancy is traceable.
+            _LOGGER.warning(
+                "Session for user '%s' has empty or unparseable started_at (%r); "
+                "counted in lifetime totals but excluded from monthly statistics",
+                user_name,
+                started_at,
+            )
 
         # Guest last-session update (T021, FR-008/FR-009)
         if user_type == "guest":
@@ -358,10 +374,10 @@ class StatsEngine:
         )
 
     async def _async_midnight_callback(self, now: datetime) -> None:
-        """Perform month rollover on 1st of each month at midnight (T015, FR-005/013).
+        """Perform month rollover on 1st of each month at midnight (PR-04 T015, FR-005/FR-013).
 
         Idempotent: if current_month.month already equals the new month key,
-        no rollover is performed for that user (FR-013).
+        no rollover is performed for that user (PR-04 FR-013).
         """
         if now.day != 1:
             return
@@ -370,7 +386,7 @@ class StatsEngine:
         rolled = 0
         for stats in self._user_stats.values():
             if stats.current_month.month == new_month:
-                # Already on the correct month — idempotent (FR-013)
+                # Already on the correct month — idempotent (PR-04 FR-013)
                 continue
             stats.previous_month = stats.current_month
             stats.current_month = MonthStats.empty(new_month)

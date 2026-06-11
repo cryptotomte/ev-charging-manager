@@ -452,6 +452,48 @@ async def test_session_older_than_both_buckets_accumulates_with_warning(
     )
 
 
+async def test_empty_started_at_skips_month_buckets_with_warning(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A session with empty started_at is counted in lifetime totals but
+    excluded from both month buckets — and a warning is logged so the
+    lifetime/monthly discrepancy is traceable."""
+    engine, store, entry = await _setup_engine(hass)
+    engine._user_stats["Petra"] = _make_april_user_after_rollover()
+
+    with patch.object(store._store, "async_save", new_callable=AsyncMock):
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=2.0,
+                cost_kr=5.0,
+                started_at="",
+                ended_at="2026-04-02T10:00:00+02:00",
+            ),
+        )
+        await hass.async_block_till_done()
+
+    stats = engine.user_stats["Petra"]
+    # Lifetime totals updated
+    assert round(stats.total_energy_kwh, 3) == 52.2
+    assert round(stats.total_cost_kr, 2) == 130.5
+    assert stats.session_count == 5
+    # Both month buckets untouched
+    assert stats.current_month.month == "2026-04"
+    assert stats.current_month.energy_kwh == 5.0
+    assert stats.current_month.sessions == 1
+    assert stats.previous_month.month == "2026-03"
+    assert stats.previous_month.energy_kwh == 45.2
+    assert stats.previous_month.sessions == 3
+    # Warning logged with the user name and exclusion notice
+    assert any(
+        rec.levelname == "WARNING"
+        and "Petra" in rec.message
+        and "excluded from monthly statistics" in rec.message
+        for rec in caplog.records
+    ), "A warning must be logged when started_at is empty or unparseable"
+
+
 async def test_fresh_user_empty_previous_month_does_not_false_match(
     hass: HomeAssistant,
 ) -> None:

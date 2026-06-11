@@ -62,7 +62,9 @@ async def test_device_created(hass: HomeAssistant, mock_config_entry: MockConfig
 
 
 async def test_multiple_instances(hass: HomeAssistant) -> None:
-    """Two separate config entries create two separate devices without conflict."""
+    """Device-registry isolation across entries (single_config_entry blocks a
+    second entry via the UI flow; this test bypasses the flow deliberately via
+    add_to_hass)."""
     entry1 = MockConfigEntry(
         domain=DOMAIN,
         data={

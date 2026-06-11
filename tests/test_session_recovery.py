@@ -1,4 +1,4 @@
-"""Tests for session recovery after HA restart (US1, FR-001 to FR-006, FR-020)."""
+"""Tests for session recovery after HA restart (PR-03 US1, FR-001 to FR-006, FR-020)."""
 
 from __future__ import annotations
 
@@ -74,8 +74,9 @@ def make_active_snapshot(
 def _make_store_load_side_effect(session_data: list[dict] | None):
     """Return a side_effect function that serves correct data per-store type.
 
-    HA setup creates three Store instances in order (PR-26: StatsStore moved
-    before SessionStore so StatsEngine subscribes before recovery fires):
+    async_load call order during setup: ConfigStore, StatsStore, SessionStore —
+    StatsStore loads before SessionStore so the StatsEngine listener exists
+    before session recovery can fire EVENT_SESSION_COMPLETED:
     1. ConfigStore (expects dict or None)
     2. StatsStore (expects dict or None)
     3. SessionStore (expects list or None)

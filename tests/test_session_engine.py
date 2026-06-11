@@ -1897,8 +1897,9 @@ def _make_recovery_snapshot(
 def _store_load_side_effect_for_recovery(snapshot: dict):
     """Return an async_load side_effect that injects snapshot into SessionStore slot.
 
-    Store creation order during setup (PR-26: StatsStore moved before
-    SessionStore): ConfigStore, StatsStore, SessionStore.
+    async_load call order during setup: ConfigStore, StatsStore, SessionStore —
+    StatsStore loads before SessionStore so the StatsEngine listener exists
+    before session recovery can fire EVENT_SESSION_COMPLETED.
     """
     call_count = 0
 

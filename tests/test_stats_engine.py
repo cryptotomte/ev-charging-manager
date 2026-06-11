@@ -360,6 +360,269 @@ async def test_inline_rollover_when_session_in_new_month(hass: HomeAssistant) ->
 
 
 # ---------------------------------------------------------------------------
+# PR-26 T002 (US1): Month-boundary regression tests (FR-001…FR-004)
+# ---------------------------------------------------------------------------
+
+
+def _make_april_user_after_rollover() -> UserStats:
+    """Return Petra after the midnight rollover into April.
+
+    March data (45.2 kWh / 113 kr / 3 sessions) lives in previous_month;
+    current_month is April with some accumulated data.
+    """
+    return UserStats(
+        user_name="Petra",
+        user_type="regular",
+        total_energy_kwh=50.2,
+        total_cost_kr=125.5,
+        session_count=4,
+        last_session_at="2026-04-01T08:00:00+00:00",
+        current_month=MonthStats(month="2026-04", energy_kwh=5.0, cost_kr=12.5, sessions=1),
+        previous_month=MonthStats(month="2026-03", energy_kwh=45.2, cost_kr=113.0, sessions=3),
+    )
+
+
+async def test_late_session_after_rollover_lands_in_previous_month(hass: HomeAssistant) -> None:
+    """FR-001: session started in March, completed after rollover to April,
+    accumulates into previous_month (March); current_month (April) untouched;
+    no second rollover occurs."""
+    engine, store, entry = await _setup_engine(hass)
+    engine._user_stats["Petra"] = _make_april_user_after_rollover()
+
+    with patch.object(store._store, "async_save", new_callable=AsyncMock):
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=8.0,
+                cost_kr=20.0,
+                started_at="2026-03-31T23:45:00+02:00",  # March — before midnight
+                ended_at="2026-04-01T06:10:00+02:00",  # April — after rollover
+            ),
+        )
+        await hass.async_block_till_done()
+
+    stats = engine.user_stats["Petra"]
+    # March (previous_month) gains exactly this session
+    assert stats.previous_month.month == "2026-03"
+    assert round(stats.previous_month.energy_kwh, 3) == 53.2
+    assert round(stats.previous_month.cost_kr, 2) == 133.0
+    assert stats.previous_month.sessions == 4
+    # April (current_month) untouched — no second rollover
+    assert stats.current_month.month == "2026-04"
+    assert stats.current_month.energy_kwh == 5.0
+    assert stats.current_month.cost_kr == 12.5
+    assert stats.current_month.sessions == 1
+    # Lifetime totals still accumulate
+    assert round(stats.total_energy_kwh, 3) == 58.2
+    assert stats.session_count == 5
+
+
+async def test_session_older_than_both_buckets_accumulates_with_warning(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """FR-002: session start month older than both buckets is accumulated into
+    current_month with a logged warning — never silently dropped."""
+    engine, store, entry = await _setup_engine(hass)
+    engine._user_stats["Petra"] = _make_april_user_after_rollover()
+
+    with patch.object(store._store, "async_save", new_callable=AsyncMock):
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=2.0,
+                cost_kr=5.0,
+                started_at="2026-01-15T10:00:00+01:00",  # January — older than both
+                ended_at="2026-04-01T06:10:00+02:00",
+            ),
+        )
+        await hass.async_block_till_done()
+
+    stats = engine.user_stats["Petra"]
+    # Accumulated into current_month (April), never dropped
+    assert stats.current_month.month == "2026-04"
+    assert round(stats.current_month.energy_kwh, 3) == 7.0
+    assert stats.current_month.sessions == 2
+    # Previous month (March) untouched
+    assert stats.previous_month.month == "2026-03"
+    assert stats.previous_month.energy_kwh == 45.2
+    assert stats.previous_month.sessions == 3
+    # Warning logged
+    assert any(rec.levelname == "WARNING" and "2026-01" in rec.message for rec in caplog.records), (
+        "A warning must be logged for a session older than both month buckets"
+    )
+
+
+async def test_empty_started_at_skips_month_buckets_with_warning(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A session with empty started_at is counted in lifetime totals but
+    excluded from both month buckets — and a warning is logged so the
+    lifetime/monthly discrepancy is traceable."""
+    engine, store, entry = await _setup_engine(hass)
+    engine._user_stats["Petra"] = _make_april_user_after_rollover()
+
+    with patch.object(store._store, "async_save", new_callable=AsyncMock):
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=2.0,
+                cost_kr=5.0,
+                started_at="",
+                ended_at="2026-04-02T10:00:00+02:00",
+            ),
+        )
+        await hass.async_block_till_done()
+
+    stats = engine.user_stats["Petra"]
+    # Lifetime totals updated
+    assert round(stats.total_energy_kwh, 3) == 52.2
+    assert round(stats.total_cost_kr, 2) == 130.5
+    assert stats.session_count == 5
+    # Both month buckets untouched
+    assert stats.current_month.month == "2026-04"
+    assert stats.current_month.energy_kwh == 5.0
+    assert stats.current_month.sessions == 1
+    assert stats.previous_month.month == "2026-03"
+    assert stats.previous_month.energy_kwh == 45.2
+    assert stats.previous_month.sessions == 3
+    # Warning logged with the user name and exclusion notice
+    assert any(
+        rec.levelname == "WARNING"
+        and "Petra" in rec.message
+        and "excluded from monthly statistics" in rec.message
+        for rec in caplog.records
+    ), "A warning must be logged when started_at is empty or unparseable"
+
+
+async def test_fresh_user_empty_previous_month_does_not_false_match(
+    hass: HomeAssistant,
+) -> None:
+    """Guard (data-model invariant 6): an empty/sentinel previous_month.month
+    must never match the previous-month branch."""
+    engine, store, entry = await _setup_engine(hass)
+    # User with a current month but a fresh (empty-key) previous bucket
+    engine._user_stats["Petra"] = UserStats(
+        user_name="Petra",
+        user_type="regular",
+        current_month=MonthStats(month="2026-04", energy_kwh=5.0, cost_kr=12.5, sessions=1),
+        previous_month=MonthStats.empty(""),
+    )
+
+    with patch.object(store._store, "async_save", new_callable=AsyncMock):
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=3.0,
+                cost_kr=7.5,
+                started_at="2026-02-10T10:00:00+01:00",  # older than current, not empty
+            ),
+        )
+        await hass.async_block_till_done()
+
+    stats = engine.user_stats["Petra"]
+    # The empty previous bucket must remain empty — accumulation goes to current
+    assert stats.previous_month.month == ""
+    assert stats.previous_month.energy_kwh == 0.0
+    assert stats.previous_month.sessions == 0
+    assert stats.current_month.month == "2026-04"
+    assert round(stats.current_month.energy_kwh, 3) == 8.0
+    assert stats.current_month.sessions == 2
+
+
+async def test_same_month_and_forward_rollover_unchanged(hass: HomeAssistant) -> None:
+    """FR-003 pin: same-month accumulation and forward rollover behave exactly
+    as before the three-way branch."""
+    engine, store, entry = await _setup_engine(hass)
+
+    with patch.object(store._store, "async_save", new_callable=AsyncMock):
+        # Same-month accumulation (current month created on first event)
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=10.0, cost_kr=25.0, started_at="2026-03-10T10:00:00+01:00"
+            ),
+        )
+        await hass.async_block_till_done()
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=5.0, cost_kr=12.5, started_at="2026-03-20T10:00:00+01:00"
+            ),
+        )
+        await hass.async_block_till_done()
+
+        stats = engine.user_stats["Petra"]
+        assert stats.current_month.month == "2026-03"
+        assert round(stats.current_month.energy_kwh, 3) == 15.0
+        assert stats.current_month.sessions == 2
+
+        # Forward rollover: a session in April rolls March → previous
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=4.0, cost_kr=10.0, started_at="2026-04-02T10:00:00+02:00"
+            ),
+        )
+        await hass.async_block_till_done()
+
+    stats = engine.user_stats["Petra"]
+    assert stats.previous_month.month == "2026-03"
+    assert round(stats.previous_month.energy_kwh, 3) == 15.0
+    assert stats.previous_month.sessions == 2
+    assert stats.current_month.month == "2026-04"
+    assert round(stats.current_month.energy_kwh, 3) == 4.0
+    assert stats.current_month.sessions == 1
+
+
+async def test_previous_month_accumulation_survives_store_roundtrip(
+    hass: HomeAssistant,
+) -> None:
+    """FR-004: stats accumulated into previous_month survive a save/load
+    round-trip through the StatsStore."""
+    entry = _make_entry(hass)
+    store = StatsStore(hass)
+
+    saved_data: dict = {}
+
+    async def fake_save(data: dict) -> None:
+        saved_data.clear()
+        saved_data.update(data)
+
+    async def fake_load() -> dict | None:
+        return dict(saved_data) if saved_data else None
+
+    with (
+        patch.object(store._store, "async_load", side_effect=fake_load),
+        patch.object(store._store, "async_save", side_effect=fake_save),
+    ):
+        engine = StatsEngine(hass, entry, store)
+        await engine.async_setup()
+        engine._user_stats["Petra"] = _make_april_user_after_rollover()
+
+        # Late session completing after the rollover (FR-001 path)
+        hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            _make_completed_event(
+                energy_kwh=8.0,
+                cost_kr=20.0,
+                started_at="2026-03-31T23:45:00+02:00",
+                ended_at="2026-04-01T06:10:00+02:00",
+            ),
+        )
+        await hass.async_block_till_done()
+
+        # Fresh load from the same backing storage — restart simulation
+        user_stats_out, _, _ = await store.async_load()
+
+    out = user_stats_out["Petra"]
+    assert out.previous_month.month == "2026-03"
+    assert round(out.previous_month.energy_kwh, 3) == 53.2
+    assert out.previous_month.sessions == 4
+    assert out.current_month.month == "2026-04"
+    assert out.current_month.energy_kwh == 5.0
+
+
+# ---------------------------------------------------------------------------
 # T017: Unknown user tests
 # ---------------------------------------------------------------------------
 
@@ -482,6 +745,46 @@ async def test_second_guest_session_overwrites_guest_last(hass: HomeAssistant) -
 
     assert engine.guest_last is not None
     assert engine.guest_last.energy_kwh == 15.0
+
+
+# ---------------------------------------------------------------------------
+# PR-26 T011 (US5): midnight rollover save retains unknown_session_times (FR-005)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.freeze_time("2026-03-31T23:00:00+00:00")
+async def test_midnight_rollover_save_retains_unknown_session_times(
+    hass: HomeAssistant,
+) -> None:
+    """FR-005: the month-rollover save persists the recorded unknown-session
+    timestamps instead of wiping them to []."""
+    engine, store, entry = await _setup_engine(hass)
+
+    # Unknown sessions recorded within the 7-day warning window
+    unknown_times = [
+        "2026-03-29T10:00:00+00:00",
+        "2026-03-30T18:30:00+00:00",
+    ]
+    engine._unknown_session_times = list(unknown_times)
+
+    # A user whose month must roll over so the midnight callback saves
+    engine._user_stats["Petra"] = UserStats(
+        user_name="Petra",
+        user_type="regular",
+        current_month=MonthStats(month="2026-03", energy_kwh=45.2, cost_kr=113.0, sessions=3),
+        previous_month=MonthStats(month="2026-02", energy_kwh=0.0, cost_kr=0.0, sessions=0),
+    )
+
+    save_mock = AsyncMock()
+    with patch.object(store._store, "async_save", save_mock):
+        async_fire_time_changed(hass, datetime(2026, 4, 1, 0, 0, 0, tzinfo=timezone.utc))
+        await hass.async_block_till_done()
+
+    save_mock.assert_called_once()
+    persisted = save_mock.call_args[0][0]
+    assert persisted["unknown_session_times"] == unknown_times, (
+        "Month-rollover save must retain unknown_session_times (FR-005)"
+    )
 
 
 # ---------------------------------------------------------------------------

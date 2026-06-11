@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -86,6 +87,8 @@ from .rfid_discovery import (
     get_discovery_provider,
     suggest_user_for_card,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 # Fields that must have a valid, reachable HA entity state
 _MANDATORY_ENTITY_FIELDS = [
@@ -709,8 +712,22 @@ class OptionsFlowHandler(OptionsFlow):
                     if key in user_input:
                         new_data[key] = user_input[key]
 
-                self.hass.config_entries.async_update_entry(entry, data=new_data)
-                await self.hass.config_entries.async_reload(entry.entry_id)
+                # PR-26 Fix 3 (FR-006/FR-007): commit data AND options in one call
+                # BEFORE the reload, so the reloaded integration starts with the
+                # new values. The trailing async_create_entry writes the identical
+                # options dict — async_update_entry short-circuits on no-change,
+                # so no second listener fire and no second reload occurs.
+                self.hass.config_entries.async_update_entry(
+                    entry, data=new_data, options=self._new_options
+                )
+                reload_ok = await self.hass.config_entries.async_reload(entry.entry_id)
+                if not reload_ok:
+                    _LOGGER.warning(
+                        "Options for entry '%s' were saved but the integration "
+                        "failed to reload; it will retry on the next Home "
+                        "Assistant restart",
+                        entry.title,
+                    )
                 return self.async_create_entry(data=self._new_options)
 
         # Pre-fill with current entry.data values

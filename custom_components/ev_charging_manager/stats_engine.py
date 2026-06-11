@@ -248,9 +248,12 @@ class StatsEngine:
         """Handle session_completed: accumulate stats and persist.
 
         Extracts user_name, user_type, energy_kwh, cost_kr, started_at,
-        ended_at from the event. Updates or creates UserStats. Updates
-        current_month using started_at (FR-006). Updates GuestLastSession
-        if user_type == "guest" (T021).
+        ended_at from the event. Updates or creates UserStats. Accumulates
+        into the month bucket selected by started_at: current_month for
+        same/newer months (newer triggers a forward rollover), previous_month
+        for sessions that started before the midnight rollover, current_month
+        with a warning otherwise (PR-04 FR-006; PR-26 FR-001…FR-003). Updates
+        GuestLastSession if user_type == "guest" (T021).
         """
         data = event.data
         user_name: str = data.get("user_name") or "Unknown"
@@ -274,16 +277,53 @@ class StatsEngine:
         stats.session_count += 1
         stats.last_session_at = ended_at
 
-        # Update current_month using started_at (FR-006, T014)
+        # Update month buckets using started_at (PR-04 FR-006, T014).
+        # PR-26 Fix 1 (FR-001…FR-003): month-key dispatch (same / newer /
+        # previous-month / neither) — "YYYY-MM" keys compare
+        # lexicographically, so plain string comparison is correct.
         month_key = _month_key_from_iso(started_at)
         if month_key:
-            if stats.current_month.month != month_key:
-                # started_at belongs to a new month — inline rollover
+            if month_key == stats.current_month.month:
+                # Same month — accumulate into current (unchanged fast path)
+                bucket = stats.current_month
+            elif month_key > stats.current_month.month:
+                # started_at belongs to a newer month — forward rollover (FR-003)
                 stats.previous_month = stats.current_month
                 stats.current_month = MonthStats.empty(month_key)
-            stats.current_month.energy_kwh = round(stats.current_month.energy_kwh + energy_kwh, 3)
-            stats.current_month.cost_kr = round(stats.current_month.cost_kr + cost_kr, 2)
-            stats.current_month.sessions += 1
+                bucket = stats.current_month
+            elif stats.previous_month.month and month_key == stats.previous_month.month:
+                # Session started before the midnight rollover — accumulate into
+                # the previous-month bucket without touching current (FR-001).
+                # Guard: previous_month.month must be non-empty (fresh users have
+                # a sentinel empty bucket that must never match).
+                bucket = stats.previous_month
+            else:
+                # Matches neither tracked month (e.g. extended outage spanning
+                # one or more months) — never drop data: accumulate into
+                # current month with a warning (FR-002).
+                _LOGGER.warning(
+                    "Session for user '%s' started in %s which matches neither "
+                    "tracked month (current=%s, previous=%s); accumulating into "
+                    "current month so no data is lost",
+                    user_name,
+                    month_key,
+                    stats.current_month.month,
+                    stats.previous_month.month,
+                )
+                bucket = stats.current_month
+            bucket.energy_kwh = round(bucket.energy_kwh + energy_kwh, 3)
+            bucket.cost_kr = round(bucket.cost_kr + cost_kr, 2)
+            bucket.sessions += 1
+        else:
+            # started_at was empty or unparseable — the session is counted in
+            # lifetime totals above but excluded from monthly statistics.
+            # Log loudly so the lifetime/monthly discrepancy is traceable.
+            _LOGGER.warning(
+                "Session for user '%s' has empty or unparseable started_at (%r); "
+                "counted in lifetime totals but excluded from monthly statistics",
+                user_name,
+                started_at,
+            )
 
         # Guest last-session update (T021, FR-008/FR-009)
         if user_type == "guest":
@@ -334,10 +374,10 @@ class StatsEngine:
         )
 
     async def _async_midnight_callback(self, now: datetime) -> None:
-        """Perform month rollover on 1st of each month at midnight (T015, FR-005/013).
+        """Perform month rollover on 1st of each month at midnight (PR-04 T015, FR-005/FR-013).
 
         Idempotent: if current_month.month already equals the new month key,
-        no rollover is performed for that user (FR-013).
+        no rollover is performed for that user (PR-04 FR-013).
         """
         if now.day != 1:
             return
@@ -346,7 +386,7 @@ class StatsEngine:
         rolled = 0
         for stats in self._user_stats.values():
             if stats.current_month.month == new_month:
-                # Already on the correct month — idempotent (FR-013)
+                # Already on the correct month — idempotent (PR-04 FR-013)
                 continue
             stats.previous_month = stats.current_month
             stats.current_month = MonthStats.empty(new_month)
@@ -354,7 +394,11 @@ class StatsEngine:
 
         if rolled:
             _LOGGER.info("Month rollover to %s completed for %d user(s)", new_month, rolled)
-            await self._stats_store.async_save(self._user_stats, self._guest_last)
+            # PR-26 Fix 2 (FR-005): pass unknown_session_times so the rollover
+            # save does not wipe the rolling 7-day warning window to [].
+            await self._stats_store.async_save(
+                self._user_stats, self._guest_last, self._unknown_session_times
+            )
             self._dispatch_update()
 
     @callback

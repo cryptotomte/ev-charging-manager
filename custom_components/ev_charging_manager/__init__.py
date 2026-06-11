@@ -120,6 +120,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Disable logger on integration unload to write the DEBUG_OFF marker
     entry.async_on_unload(debug_logger.disable)
 
+    # Set up stats store and engine BEFORE the session engine (PR-26 Fix 5,
+    # FR-011): session recovery below can fire EVENT_SESSION_COMPLETED, and the
+    # event bus has no replay — the StatsEngine listener must already exist or
+    # recovery-finalized sessions never reach user statistics.
+    stats_store = StatsStore(hass)
+    stats_engine = StatsEngine(hass, entry, stats_store)
+    await stats_engine.async_setup()
+    hass.data[DOMAIN][entry.entry_id]["stats_engine"] = stats_engine
+
     # Set up session store and load persisted sessions
     max_sessions = entry.options.get(CONF_MAX_STORED_SESSIONS, DEFAULT_MAX_STORED_SESSIONS)
     session_store = SessionStore(hass, max_sessions=max_sessions)
@@ -155,12 +164,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id]["session_store"] = session_store
     hass.data[DOMAIN][entry.entry_id]["session_engine"] = session_engine
-
-    # Set up stats store and engine
-    stats_store = StatsStore(hass)
-    stats_engine = StatsEngine(hass, entry, stats_store)
-    await stats_engine.async_setup()
-    hass.data[DOMAIN][entry.entry_id]["stats_engine"] = stats_engine
 
     # Forward setup to sensor and binary_sensor platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

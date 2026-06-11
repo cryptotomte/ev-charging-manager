@@ -1895,7 +1895,11 @@ def _make_recovery_snapshot(
 
 
 def _store_load_side_effect_for_recovery(snapshot: dict):
-    """Return an async_load side_effect that injects snapshot into SessionStore slot."""
+    """Return an async_load side_effect that injects snapshot into SessionStore slot.
+
+    Store creation order during setup (PR-26: StatsStore moved before
+    SessionStore): ConfigStore, StatsStore, SessionStore.
+    """
     call_count = 0
 
     async def side_effect():
@@ -1904,8 +1908,8 @@ def _store_load_side_effect_for_recovery(snapshot: dict):
         if call_count == 1:
             return None  # ConfigStore
         if call_count == 2:
-            return [snapshot]  # SessionStore — active snapshot
-        return None  # StatsStore
+            return None  # StatsStore
+        return [snapshot]  # SessionStore — active snapshot
 
     return side_effect
 

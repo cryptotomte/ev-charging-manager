@@ -378,7 +378,11 @@ class StatsEngine:
 
         if rolled:
             _LOGGER.info("Month rollover to %s completed for %d user(s)", new_month, rolled)
-            await self._stats_store.async_save(self._user_stats, self._guest_last)
+            # PR-26 Fix 2 (FR-005): pass unknown_session_times so the rollover
+            # save does not wipe the rolling 7-day warning window to [].
+            await self._stats_store.async_save(
+                self._user_stats, self._guest_last, self._unknown_session_times
+            )
             self._dispatch_update()
 
     @callback

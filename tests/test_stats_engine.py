@@ -706,6 +706,46 @@ async def test_second_guest_session_overwrites_guest_last(hass: HomeAssistant) -
 
 
 # ---------------------------------------------------------------------------
+# PR-26 T011 (US5): midnight rollover save retains unknown_session_times (FR-005)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.freeze_time("2026-03-31T23:00:00+00:00")
+async def test_midnight_rollover_save_retains_unknown_session_times(
+    hass: HomeAssistant,
+) -> None:
+    """FR-005: the month-rollover save persists the recorded unknown-session
+    timestamps instead of wiping them to []."""
+    engine, store, entry = await _setup_engine(hass)
+
+    # Unknown sessions recorded within the 7-day warning window
+    unknown_times = [
+        "2026-03-29T10:00:00+00:00",
+        "2026-03-30T18:30:00+00:00",
+    ]
+    engine._unknown_session_times = list(unknown_times)
+
+    # A user whose month must roll over so the midnight callback saves
+    engine._user_stats["Petra"] = UserStats(
+        user_name="Petra",
+        user_type="regular",
+        current_month=MonthStats(month="2026-03", energy_kwh=45.2, cost_kr=113.0, sessions=3),
+        previous_month=MonthStats(month="2026-02", energy_kwh=0.0, cost_kr=0.0, sessions=0),
+    )
+
+    save_mock = AsyncMock()
+    with patch.object(store._store, "async_save", save_mock):
+        async_fire_time_changed(hass, datetime(2026, 4, 1, 0, 0, 0, tzinfo=timezone.utc))
+        await hass.async_block_till_done()
+
+    save_mock.assert_called_once()
+    persisted = save_mock.call_args[0][0]
+    assert persisted["unknown_session_times"] == unknown_times, (
+        "Month-rollover save must retain unknown_session_times (FR-005)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helper function tests
 # ---------------------------------------------------------------------------
 

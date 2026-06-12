@@ -289,10 +289,20 @@ class SessionPowerSensor(_SessionSensorBase):
 
     @property
     def native_value(self) -> float | None:
+        """Return the current charging power, or None when no reading exists.
+
+        PR-29 (FR-001/002): consumes the engine's public last_power_w property.
+        None (no reading processed yet — e.g. right after a restart resume)
+        renders as 'unknown' while the session-existence availability gate
+        holds; it must never raise (the old code crashed on round(None)).
+        """
         engine = self._engine()
-        if engine is None or not self._is_tracking():
+        if engine is None or not self.available:
             return None
-        return round(engine._last_power_w, 0)
+        power = engine.last_power_w
+        if power is None:
+            return None
+        return round(power, 0)
 
 
 class SessionSocAddedSensor(_SessionSensorBase):

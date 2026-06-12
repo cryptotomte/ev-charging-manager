@@ -352,6 +352,17 @@ class PlugAnchoredSessionEngine:
         return self._last_session_rfid_index
 
     @property
+    def last_power_w(self) -> float | None:
+        """Return the most recent power reading (W), or None if no reading yet.
+
+        PR-29 (FR-001): public read-only surface for SessionPowerSensor — None
+        means "no reading processed yet" (e.g. right after a restart resume
+        while the power entity is still unavailable) and must be handled by
+        consumers instead of crashing on round(None).
+        """
+        return self._last_power_w
+
+    @property
     def window_tracker(self) -> ChargingWindowTracker:
         """Return the window tracker for the active session (for sensor reads)."""
         return self._window_tracker

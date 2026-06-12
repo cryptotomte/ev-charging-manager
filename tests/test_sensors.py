@@ -456,6 +456,117 @@ async def test_status_and_binary_sensor_unaffected_by_availability_rule(hass: Ho
     assert state.state == "off"
 
 
+# ---------------------------------------------------------------------------
+# PR-29 (US1/FR-001, FR-002): power sensor never crashes; public property
+# ---------------------------------------------------------------------------
+
+
+async def test_power_sensor_renders_unknown_without_reading_no_exception(
+    hass: HomeAssistant, caplog
+):
+    """FR-002: active session but no power reading yet → state 'unknown', no exception/error.
+
+    The no-reading-yet condition is reachable in production via restart
+    recovery: PlugAnchoredSessionEngine.async_recover() sets
+    _last_power_w = self._get_power(), which is None while the power entity
+    is still unavailable after the restart. Before PR-29 this made
+    SessionPowerSensor.native_value raise TypeError (round(None)) on every
+    update.
+    """
+    import logging
+    from unittest.mock import AsyncMock
+
+    from homeassistant.const import STATE_UNKNOWN
+    from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+    from custom_components.ev_charging_manager.const import SIGNAL_SESSION_UPDATE
+    from tests.conftest import MOCK_TRX_ENTITY
+
+    entry = await _setup_v2_engine(hass)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+
+    assert engine.active_session is not None
+
+    # Simulate the post-restart condition: no power reading processed yet
+    # (async_recover with the power entity unavailable leaves this None).
+    engine._last_power_w = None
+
+    with caplog.at_level(logging.ERROR):
+        caplog.clear()
+        async_dispatcher_send(hass, SIGNAL_SESSION_UPDATE.format(entry.entry_id))
+        await hass.async_block_till_done()
+
+    # FR-001: the public surface yields "no reading yet" distinctly
+    assert engine.last_power_w is None
+
+    # Sensor available (session exists) but value unknown — and NO error log
+    assert _state_by_uid(hass, entry, "session_power") == STATE_UNKNOWN
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+        f"FR-002: no error log expected, got: {[r.message for r in caplog.records]}"
+    )
+
+
+async def test_power_sensor_shows_rounded_value_via_public_property(hass: HomeAssistant):
+    """FR-001: with a reading present, the sensor shows the rounded value as today."""
+    from unittest.mock import AsyncMock
+
+    from tests.conftest import MOCK_TRX_ENTITY
+
+    entry = await _setup_v2_engine(hass)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_POWER_ENTITY, "3650.4")
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "1.0")
+        await hass.async_block_till_done()
+
+    # FR-001: public read-only property on the engine
+    assert engine.last_power_w == pytest.approx(3650.4)
+    assert float(_state_by_uid(hass, entry, "session_power")) == pytest.approx(3650.0, abs=0.5)
+
+
+async def test_last_power_w_property_exists_on_both_engines(hass: HomeAssistant):
+    """FR-001: both engines expose last_power_w; the sensor uses no private reach-ins."""
+    import inspect
+
+    from custom_components.ev_charging_manager.sensor import SessionPowerSensor
+
+    # Legacy engine (generic profile)
+    legacy_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Legacy")
+    await setup_session_engine(hass, legacy_entry)
+    legacy_engine = hass.data[DOMAIN][legacy_entry.entry_id]["session_engine"]
+    assert hasattr(type(legacy_engine), "last_power_w"), (
+        "FR-001: legacy SessionEngine must expose the last_power_w property"
+    )
+    assert isinstance(type(legacy_engine).last_power_w, property), (
+        "FR-001: last_power_w must be a read-only property"
+    )
+    assert legacy_engine.last_power_w is None or isinstance(legacy_engine.last_power_w, float)
+
+    # v2 engine
+    v2_entry = await _setup_v2_engine(hass)
+    v2_engine = hass.data[DOMAIN][v2_entry.entry_id]["session_engine"]
+    assert isinstance(type(v2_engine).last_power_w, property), (
+        "FR-001: PlugAnchoredSessionEngine must expose the last_power_w property"
+    )
+
+    # The sensor consumes the public property — no private access remains
+    source = inspect.getsource(SessionPowerSensor.native_value.fget)
+    assert "_last_power_w" not in source, (
+        "FR-001: SessionPowerSensor.native_value must not reach into _last_power_w"
+    )
+
+
 async def test_status_sensor_last_session_attributes_after_completed_session(
     hass: HomeAssistant,
 ):

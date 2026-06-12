@@ -202,6 +202,16 @@ class SessionEngine:
         """Return the RFID index from the last completed session."""
         return self._last_session_rfid_index
 
+    @property
+    def last_power_w(self) -> float | None:
+        """Return the most recent power reading (W), or None if no reading yet.
+
+        PR-29 (FR-001): public read-only surface for SessionPowerSensor —
+        mirror of PlugAnchoredSessionEngine.last_power_w. None means "no
+        reading processed yet" and must be handled by consumers.
+        """
+        return self._last_power_w
+
     async def async_recover(self, snapshot: dict | None) -> None:
         """Recover an active session after a system restart.
 

@@ -380,43 +380,51 @@ class DebugLogger:
             try:
                 await self._hass.async_add_executor_job(self._write_lines, write_lines)
             except OSError as err:
-                self._fail_count += 1
-                # Failed lines go back FIRST — lines buffered during the
-                # attempt keep their position after them (order preserved).
-                self._buffer[:0] = lines
-                overflow = len(self._buffer) - DEBUG_LOG_BUFFER_CAP
-                if overflow > 0:
-                    del self._buffer[:overflow]
-                    self._dropped_count += overflow
-                # Review F4: warn on the FIRST failure of a streak immediately —
-                # a single failed flush must never be silent (with a reload or
-                # stop in between, the lines would vanish traceless). Repeats
-                # stay throttled to every Nth failure.
-                if self._fail_count == 1:
-                    _LOGGER.warning(
-                        "DebugLogger: flush failed (%s) — %d lines buffered for "
-                        "retry; check file permissions for %s",
-                        err,
-                        len(self._buffer),
-                        self.file_path,
-                    )
-                elif self._fail_count % _WARN_EVERY_N_FAILURES == 0:
-                    _LOGGER.warning(
-                        "DebugLogger: %d consecutive flush failures (latest: %s) — "
-                        "check file permissions for %s",
-                        self._fail_count,
-                        err,
-                        self.file_path,
-                    )
-                # Retry via the age timer only — never an immediate task, to
-                # avoid a hot retry loop while the disk stays broken. Never
-                # re-arm on a closed instance (review F3): async_disable owns
-                # the abandonment of unwritable lines.
-                if not self._closed and self._cancel_flush_timer is None:
-                    self._arm_timer()
+                self._handle_flush_failure(err, lines)
             else:
                 self._fail_count = 0
                 self._dropped_count = 0
+
+    def _handle_flush_failure(self, err: OSError, lines: list[str]) -> None:
+        """Handle a failed flush attempt. Called only under the flush lock.
+
+        Re-prepends the failed lines, caps the buffer drop-oldest, emits a
+        throttled warning, and re-arms the age timer for retry (FR-010).
+        """
+        self._fail_count += 1
+        # Failed lines go back FIRST — lines buffered during the
+        # attempt keep their position after them (order preserved).
+        self._buffer[:0] = lines
+        overflow = len(self._buffer) - DEBUG_LOG_BUFFER_CAP
+        if overflow > 0:
+            del self._buffer[:overflow]
+            self._dropped_count += overflow
+        # Review F4: warn on the FIRST failure of a streak immediately —
+        # a single failed flush must never be silent (with a reload or
+        # stop in between, the lines would vanish traceless). Repeats
+        # stay throttled to every Nth failure.
+        if self._fail_count == 1:
+            _LOGGER.warning(
+                "DebugLogger: flush failed (%s) — %d lines buffered for "
+                "retry; check file permissions for %s",
+                err,
+                len(self._buffer),
+                self.file_path,
+            )
+        elif self._fail_count % _WARN_EVERY_N_FAILURES == 0:
+            _LOGGER.warning(
+                "DebugLogger: %d consecutive flush failures (latest: %s) — "
+                "check file permissions for %s",
+                self._fail_count,
+                err,
+                self.file_path,
+            )
+        # Retry via the age timer only — never an immediate task, to
+        # avoid a hot retry loop while the disk stays broken. Never
+        # re-arm on a closed instance (review F3): async_disable owns
+        # the abandonment of unwritable lines.
+        if not self._closed and self._cancel_flush_timer is None:
+            self._arm_timer()
 
     def _write_lines(self, lines: list[str]) -> None:
         """Executor job: rotate the active file if oversized, then append.

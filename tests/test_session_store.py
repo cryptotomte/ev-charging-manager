@@ -298,6 +298,59 @@ async def test_double_load_consumes_snapshot_once(hass: HomeAssistant):
     assert sessions2 == []
 
 
+async def test_periodic_save_does_not_resurrect_completed_session(hass: HomeAssistant):
+    """FR-011 end-to-end (T012): the periodic writer captures the active dict,
+    completion lands, THEN the periodic write fires → no incomplete snapshot of
+    the completed id reaches disk."""
+    store = SessionStore(hass, max_sessions=1000)
+    mock_save = AsyncMock()
+
+    mock_entry = MagicMock()
+    mock_entry.async_on_unload = lambda cb: cb
+
+    # The "engine": returns the active session dict until completion clears it.
+    active_holder: dict = {"session": make_active_snapshot("s1")}
+
+    def get_active() -> dict | None:
+        return active_holder["session"]
+
+    captured_interval_cb: dict = {}
+
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=None):
+        with patch.object(store._store, "async_save", mock_save):
+            await store.async_load()
+            with patch(
+                "custom_components.ev_charging_manager.session_store."
+                "async_track_time_interval"
+            ) as mock_track:
+                mock_track.return_value = MagicMock()
+                store.schedule_periodic_save(hass, mock_entry, 300, get_active)
+                captured_interval_cb["save"] = mock_track.call_args[0][1]
+
+            # The periodic _save captured `get_active` — but before the interval
+            # fires, the session COMPLETES (race window): it lands in the store…
+            completed = make_session("s1")
+            await store.add_session(completed)
+            mock_save.reset_mock()
+            # …while the engine-side dict is still momentarily the stale active one
+            # (modelled by get_active still returning it for this tick).
+
+            # The periodic write fires with the stale capture.
+            await captured_interval_cb["save"](None)
+
+    # FR-011: the guard must skip the write — nothing on disk may contain an
+    # incomplete copy of the already-completed session.
+    for call in mock_save.call_args_list:
+        envelope = call.args[0]
+        for entry in envelope["data"]:
+            if entry["id"] == "s1":
+                assert (
+                    entry.get("ended_at") is not None
+                    or entry.get("disconnected_at") is not None
+                ), "an incomplete snapshot of the completed session reached disk"
+    mock_save.assert_not_called()
+
+
 async def test_load_without_snapshot_does_not_rewrite(hass: HomeAssistant):
     """FR-007 control: a clean store (no snapshot) triggers no cleanup write."""
     stored = _envelope([make_session("done")])

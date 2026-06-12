@@ -1013,29 +1013,20 @@ class PlugAnchoredSessionEngine:
         if charging_duration_s > 0 and session.energy_kwh > 0:
             session.avg_power_w = round((session.energy_kwh * 3_600_000) / charging_duration_s, 1)
 
-        min_duration = self._entry.options.get(
-            CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
+        # PR-27 FR-018 (recovery path, review F4): mirrors the live path in
+        # _async_complete_session_impl — a corrupt timestamp must not discard
+        # real energy, since the snapshot-clear below makes it irrecoverable.
+        # Kept sessions already carry data_gap=True (set unconditionally in
+        # this path).
+        is_micro = self._is_micro_session(
+            connection_s, session.energy_kwh, duration_unreliable=connection_parse_failed
         )
-        min_energy_kwh = (
-            self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
-            / 1000.0
-        )
-        if connection_parse_failed:
-            # PR-27 FR-018 (recovery path, review F4): the duration evidence is
-            # meaningless (parse failure zeroed it) — require BOTH criteria to
-            # discard, mirroring the live path in _async_complete_session_impl.
-            # Otherwise a corrupt timestamp discards real energy AND the
-            # snapshot-clear below makes it irrecoverable. Kept sessions already
-            # carry data_gap=True (set unconditionally in this path).
-            is_micro = connection_s < min_duration and session.energy_kwh < min_energy_kwh
-            if not is_micro and self._debug_logger:
-                self._debug_logger.log(
-                    DEBUG_CAT_DATA_GAP,
-                    f"connected_at unparseable for recovered snapshot id={session.id} — "
-                    "kept (energy above micro threshold), data_gap=True (FR-018)",
-                )
-        else:
-            is_micro = connection_s < min_duration or session.energy_kwh < min_energy_kwh
+        if connection_parse_failed and not is_micro and self._debug_logger:
+            self._debug_logger.log(
+                DEBUG_CAT_DATA_GAP,
+                f"connected_at unparseable for recovered snapshot id={session.id} — "
+                "kept (energy above micro threshold), data_gap=True (FR-018)",
+            )
 
         if not is_micro:
             await self._session_store.add_session(session.to_dict())
@@ -2574,31 +2565,20 @@ class PlugAnchoredSessionEngine:
 
             # Micro-filter (FR-N04 note: fumble sessions are two separate sessions;
             # micro-filter handles them by discarding sub-threshold records)
-            min_duration = self._entry.options.get(
-                CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
+            is_micro = self._is_micro_session(
+                connection_s, session.energy_kwh, duration_unreliable=connection_parse_failed
             )
-            min_energy_kwh = (
-                self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
-                / 1000.0
-            )
-            if connection_parse_failed:
-                # PR-27 FR-018: the duration evidence is meaningless (parse
-                # failure zeroed it) — require BOTH criteria to discard, so a
-                # malformed timestamp can never throw away real energy. A
-                # genuine blip still matches (near-zero energy too). Sessions
-                # kept this way carry data_gap=True (unreliable duration).
-                is_micro = connection_s < min_duration and session.energy_kwh < min_energy_kwh
-                if not is_micro:
-                    session.data_gap = True
-                    self._data_gap = True
-                    if self._debug_logger:
-                        self._debug_logger.log(
-                            DEBUG_CAT_DATA_GAP,
-                            f"connected_at unparseable for session_id={session.id} — "
-                            "kept (energy above micro threshold), data_gap=True (FR-018)",
-                        )
-            else:
-                is_micro = connection_s < min_duration or session.energy_kwh < min_energy_kwh
+            if connection_parse_failed and not is_micro:
+                # PR-27 FR-018: sessions kept despite an unparseable
+                # connected_at carry data_gap=True (unreliable duration).
+                session.data_gap = True
+                self._data_gap = True
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        DEBUG_CAT_DATA_GAP,
+                        f"connected_at unparseable for session_id={session.id} — "
+                        "kept (energy above micro threshold), data_gap=True (FR-018)",
+                    )
 
             if self._debug_logger:
                 h = connection_s // 3600
@@ -2936,6 +2916,28 @@ class PlugAnchoredSessionEngine:
         if self._guest_pricing.method == "markup" and self._guest_pricing.markup_factor is not None:
             return round(session.cost_total_kr * self._guest_pricing.markup_factor, 2)
         return None
+
+    def _is_micro_session(
+        self, connection_s: int, energy_kwh: float, *, duration_unreliable: bool
+    ) -> bool:
+        """Decide whether a session falls below the FR-018 micro-filter thresholds.
+
+        PR-27 FR-018: when the duration evidence is meaningless (a connected_at
+        parse failure zeroed it), require BOTH criteria to discard, so a
+        malformed timestamp can never throw away real energy. A genuine blip
+        still matches (near-zero energy too). Otherwise either criterion alone
+        discards.
+        """
+        min_duration = self._entry.options.get(
+            CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
+        )
+        min_energy_kwh = (
+            self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
+            / 1000.0
+        )
+        if duration_unreliable:
+            return connection_s < min_duration and energy_kwh < min_energy_kwh
+        return connection_s < min_duration or energy_kwh < min_energy_kwh
 
     # -----------------------------------------------------------------------
     # Observation logging helpers (from legacy engine)

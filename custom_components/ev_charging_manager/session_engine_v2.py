@@ -95,7 +95,7 @@ from .const import (
     SessionSubState,
     UnknownReason,
 )
-from .debug_logger import DebugLogger
+from .debug_logger import DebugLogger, redact_tag
 from .models import GuestPricing
 from .pricing import PricingEngine, SpotConfig
 from .rfid_lookup import RfidLookup
@@ -1224,7 +1224,8 @@ class PlugAnchoredSessionEngine:
                                 DEBUG_CAT_TRX_MIDSESSION,
                                 f"trx changed mid-session: was"
                                 f" rfid_index={self._active_session.rfid_index}"
-                                f" now trx={new_val} — ignored (no attribution change)",
+                                f" now trx={redact_tag(new_val)}"
+                                f" — ignored (no attribution change)",
                             )
                 except (ValueError, TypeError):
                     pass
@@ -2052,15 +2053,16 @@ class PlugAnchoredSessionEngine:
             resolution = rfid_lookup.resolve(trx)
 
             # Debug log RFID resolution
+            # FR-004 (PR-28): tag values are masked in debug-log lines
             if self._debug_logger:
                 if resolution is not None and resolution.user_type != "unknown":
                     self._debug_logger.log(
                         "RFID_READ",
-                        f"tag={trx} matched user={resolution.user_name} "
+                        f"tag={redact_tag(trx)} matched user={resolution.user_name} "
                         f"(rfid_index={resolution.rfid_index})",
                     )
                 else:
-                    self._debug_logger.log("RFID_READ", f"tag={trx} unknown")
+                    self._debug_logger.log("RFID_READ", f"tag={redact_tag(trx)} unknown")
 
             # Snapshot energy at session start
             energy = self._get_energy() or 0.0
@@ -2149,11 +2151,12 @@ class PlugAnchoredSessionEngine:
                     f"energy_start={energy:.3f}kWh",
                 )
 
+            # FR-004 (PR-28): full tag values only at debug level in the HA log
             _LOGGER.info(
                 "PlugAnchoredSessionEngine: session started id=%s user=%s trx=%s",
                 self._active_session.id,
                 self._active_session.user_name,
-                trx,
+                redact_tag(trx),
             )
 
             # Fire session_started event (keeping started_at as backward-compat alias)
@@ -2972,9 +2975,19 @@ class PlugAnchoredSessionEngine:
             return
         if category == "ERR_STATE" and before == "-none-" and new_value == "-none-":
             return
+        display_before, display_new = before, new_value
+        if category == "TRX_STATE":
+            # FR-004 (PR-28): trx values are RFID tag values — mask them in the
+            # logged message. Absent/invalid sentinels render unchanged; the raw
+            # value is still cached below for transition detection.
+            if display_before not in _INVALID_STATES:
+                display_before = redact_tag(display_before)
+            if display_new not in _INVALID_STATES:
+                display_new = redact_tag(display_new)
         self._debug_logger.log(
             category,
-            f"{signal_token} changed: {before} → {new_value}{self._format_signal_snapshot()}",
+            f"{signal_token} changed: {display_before} → {display_new}"
+            f"{self._format_signal_snapshot()}",
         )
         if new_value not in _INVALID_STATES:
             setattr(self, last_attr_name, new_value)

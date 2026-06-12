@@ -191,8 +191,11 @@ class GoeRfidDiscovery:
 
         cards_raw = data.get("cards")
         if not isinstance(cards_raw, list):
-            _LOGGER.warning(
-                "go-e %s: unexpected cards[] format: %s",
+            # Review F9: the raw payload may carry card names/UIDs — dump it
+            # at debug level only; the WARNING stays short and payload-free.
+            _LOGGER.warning("go-e %s: unexpected cards[] format", self._host)
+            _LOGGER.debug(
+                "go-e %s: raw cards payload: %s",
                 self._host,
                 str(data)[:200],
             )

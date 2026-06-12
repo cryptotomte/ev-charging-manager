@@ -830,3 +830,69 @@ async def test_rfid_wait_trx_changes_to_zero_during_wait(
         assert engine._rfid_wait is None, (  # noqa: SLF001
             "SF6: _rfid_wait must be cleared after session starts"
         )
+
+
+# ---------------------------------------------------------------------------
+# PR-28 (024-debug-logger-overhaul) US2: RFID tag redaction in debug log
+# ---------------------------------------------------------------------------
+
+
+async def test_rfid_tag_redacted_in_all_debug_log_lines(
+    hass: HomeAssistant, tmp_path, caplog
+) -> None:
+    """FR-004: an RFID blip with a long tag value never puts the full value in
+    the debug log — RFID_READ / TRX_STATE / TRX_MIDSESSION carry ***{last2}.
+    Review F8b: the session-start _LOGGER.info line in the HA core log is
+    masked too."""
+    import logging
+
+    from custom_components.ev_charging_manager.const import CONF_DEBUG_LOGGING
+
+    hass.config.config_dir = str(tmp_path)
+    entry = await _make_engine_entry(hass, extra_options={CONF_DEBUG_LOGGING: True})
+    engine = _get_engine(hass, entry)
+
+    with (
+        patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
+        caplog.at_level(logging.INFO),
+    ):
+        # Plug on with trx=null → RFID wait; then blip with a long tag value
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+
+        hass.states.async_set(MOCK_TRX_ENTITY, "abc123f4")
+        await hass.async_block_till_done()
+
+        assert engine.active_session is not None
+
+        # Review F8b: the session-start info line reaches the HA core log
+        # with the masked tag only
+        assert "session started" in caplog.text
+        assert "trx=***f4" in caplog.text
+        assert "abc123f4" not in caplog.text, "Full RFID tag must never reach the HA core log"
+
+        # Mid-session trx change (numeric → TRX_MIDSESSION path)
+        hass.states.async_set(MOCK_TRX_ENTITY, "7")
+        await hass.async_block_till_done()
+
+        debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+        await debug_logger.async_disable()  # flush everything emitted so far
+
+    content = open(debug_logger.file_path, encoding="utf-8").read()
+    lines = content.splitlines()
+
+    # The full tag value must never appear in any line of the log file
+    assert "abc123f4" not in content, f"Full tag leaked into the debug log:\n{content}"
+
+    rfid_read = [ln for ln in lines if "RFID_READ" in ln]
+    assert rfid_read, "Expected an RFID_READ line"
+    assert "tag=***f4" in rfid_read[0]
+
+    trx_state = [ln for ln in lines if "TRX_STATE" in ln and "***f4" in ln]
+    assert trx_state, f"Expected a TRX_STATE line with the masked tag, got:\n{content}"
+
+    midsession = [ln for ln in lines if "TRX_MIDSESSION" in ln]
+    assert midsession, "Expected a TRX_MIDSESSION line for the mid-session change"
+    # Review F7: "7" is a slot index, not a UID — rendered literally
+    assert "now trx=7" in midsession[0]

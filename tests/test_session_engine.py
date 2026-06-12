@@ -975,7 +975,9 @@ async def test_session_engine_debug_logging_all_categories(hass: HomeAssistant, 
     )
     assert "SESSION_STOP" in categories, f"SESSION_STOP not found in {categories}"
 
-    # Verify log file actually has content
+    # Verify log file actually has content (PR-28: lines are buffered and
+    # flushed off-loop — drain the buffer to disk before reading)
+    await debug_logger.async_disable()
     content = open(debug_logger.file_path, encoding="utf-8").read()
     assert "CAR_STATE" in content
     assert "SESSION_START" in content

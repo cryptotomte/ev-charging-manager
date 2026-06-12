@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.helpers import device_registry as dr
 
 from .charger_profiles import CHARGER_PROFILES
@@ -22,7 +23,7 @@ from .const import (
     DOMAIN,
     PLATFORMS,
 )
-from .debug_logger import DebugLogger
+from .debug_logger import DebugLogger, async_cleanup_legacy_file
 from .lifecycle import async_migrate_observation_slots
 from .session_engine import SessionEngine
 from .session_engine_v2 import PlugAnchoredSessionEngine
@@ -83,6 +84,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {}
 
+    # PR-28 (FR-002): delete the legacy web-served www/ log file as the FIRST
+    # await of setup (review F6) — the unauthenticated /local/ exposure must
+    # end even when a later setup step (store load, migration, ...) raises and
+    # fails the entry. Never fails setup itself.
+    await async_cleanup_legacy_file(hass, hass.config.config_dir)
+
     # Initialize ConfigStore and sync from subentries
     config_store = ConfigStore(hass)
     await config_store.async_load()
@@ -111,14 +118,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Runs before SessionEngine so it can read the resolved entity IDs from entry.options.
     await async_migrate_observation_slots(hass, entry)
 
-    # Set up debug logger — instantiated before session engine
+    # Set up debug logger — instantiated before session engine. The legacy
+    # www/ file cleanup (FR-002) already ran as the first await of setup.
     debug_logging_enabled = entry.options.get(CONF_DEBUG_LOGGING, False)
-    debug_logger = DebugLogger(hass.config.config_dir)
+    debug_logger = DebugLogger(hass, hass.config.config_dir)
     if debug_logging_enabled:
-        debug_logger.enable()
+        await debug_logger.async_enable()
     hass.data[DOMAIN][entry.entry_id]["debug_logger"] = debug_logger
-    # Disable logger on integration unload to write the DEBUG_OFF marker
-    entry.async_on_unload(debug_logger.disable)
+    # Disable on unload: flushes the buffer with DEBUG_OFF as the final line
+    # (coroutine callbacks are awaited by entry.async_on_unload).
+    entry.async_on_unload(debug_logger.async_disable)
+
+    # Review F1: HA does NOT unload config entries at an orderly stop —
+    # async_on_unload fires only on reload/remove, so without this listener
+    # up to 5 s / 500 buffered lines and the DEBUG_OFF marker would silently
+    # vanish at every clean HA restart. async_disable() is idempotent, so the
+    # unload path and this listener can both call it. Registered via
+    # entry.async_on_unload so a reload does not leak one listener per setup.
+    async def _flush_debug_log_on_stop(_event: Event) -> None:
+        await debug_logger.async_disable()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _flush_debug_log_on_stop)
+    )
 
     # Set up stats store and engine BEFORE the session engine (PR-26 Fix 5,
     # FR-011): session recovery below can fire EVENT_SESSION_COMPLETED, and the

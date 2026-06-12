@@ -127,15 +127,22 @@ def _get_debug_logger(hass: HomeAssistant, entry: MockConfigEntry):
 
 
 def _read_log_lines(hass: HomeAssistant, entry: MockConfigEntry) -> list[str]:
-    """Read the debug log file and return non-empty lines."""
+    """Return all emitted non-empty log lines: on-disk plus still-buffered.
+
+    PR-28: log lines are buffered in memory and flushed off-loop, so a line
+    emitted just before this call may not have reached the file yet. These
+    tests assert WHAT was logged, not flush timing — include the buffer.
+    """
     debug_logger = _get_debug_logger(hass, entry)
     if debug_logger is None or not debug_logger.enabled:
         return []
     try:
         with open(debug_logger.file_path, encoding="utf-8") as fh:
-            return [line.rstrip("\n") for line in fh if line.strip()]
+            lines = [line.rstrip("\n") for line in fh if line.strip()]
     except FileNotFoundError:
-        return []
+        lines = []
+    lines.extend(line.rstrip("\n") for line in debug_logger._buffer if line.strip())
+    return lines
 
 
 def _count_heartbeat_lines(lines: list[str]) -> int:

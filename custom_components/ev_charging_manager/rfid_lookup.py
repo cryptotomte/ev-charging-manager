@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .debug_logger import redact_tag
 from .session import RfidResolution
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,9 +38,10 @@ class RfidLookup:
         try:
             trx_int = int(trx_value)
         except (ValueError, TypeError):
+            # FR-004 (PR-28): full tag values only at debug level in the HA log
             _LOGGER.warning(
                 "Unexpected trx value format: %r — treating as type error",
-                trx_value,
+                redact_tag(trx_value),
             )
             return RfidResolution(
                 user_name="Unknown",
@@ -74,7 +76,7 @@ class RfidLookup:
         if mapping is None:
             _LOGGER.warning(
                 "No RFID mapping found for trx=%r (index %d)",
-                trx_value,
+                redact_tag(trx_value),
                 rfid_index,
             )
             return RfidResolution(
@@ -91,7 +93,7 @@ class RfidLookup:
             _LOGGER.warning(
                 "RFID card at index %d is inactive (trx=%r)",
                 rfid_index,
-                trx_value,
+                redact_tag(trx_value),
             )
             return RfidResolution(
                 user_name="Unknown",

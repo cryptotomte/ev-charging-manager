@@ -445,9 +445,7 @@ async def test_flush_failure_retains_lines_for_retry(hass: HomeAssistant, tmp_pa
     assert content.index("retained-1") < content.index("retained-2")
 
 
-async def test_first_flush_failure_warns_immediately(
-    hass: HomeAssistant, tmp_path, caplog
-) -> None:
+async def test_first_flush_failure_warns_immediately(hass: HomeAssistant, tmp_path, caplog) -> None:
     """Review F4: the FIRST failure of a failure streak emits a warning right
     away — a single failed flush must never be silent."""
     logger = await _make_enabled_logger(hass, tmp_path)
@@ -587,11 +585,31 @@ def test_redact_tag_none() -> None:
 
 
 def test_redact_tag_short_values_fully_masked() -> None:
-    """Values of length <= 2 are fully masked."""
+    """Short NON-numeric values are fully masked — last-2 would echo the
+    whole value."""
     assert redact_tag("") == "***"
     assert redact_tag("a") == "***"
     assert redact_tag("ab") == "***"
-    assert redact_tag(2) == "***"
+    assert redact_tag("3a") == "***"
+
+
+def test_redact_tag_single_digit_slot_index_unmasked() -> None:
+    """Review F7: pure single-digit values are go-e card SLOT INDICES (0-9,
+    '0' = auth required) — not the persistent personal identifier FR-004
+    protects. They render literally so TRX_STATE transitions stay readable."""
+    assert redact_tag("0") == "0"
+    assert redact_tag("9") == "9"
+    assert redact_tag(2) == "2"
+    # Two-digit numeric values are NOT exempted — only ^\d$ passes through
+    assert redact_tag("10") == "***"
+
+
+def test_redact_tag_sentinel_boundary() -> None:
+    """Review F7 boundary pin: this function masks unconditionally — sentinel
+    values like 'null' are exempted by CALLERS via _INVALID_STATES, never
+    here. A near-sentinel like 'nullx' must stay masked."""
+    assert redact_tag("nullx") == "***lx"
+    assert redact_tag("null") == "***ll"
 
 
 def test_redact_tag_long_value_keeps_last_two() -> None:
@@ -694,9 +712,7 @@ async def test_rotation_bounds_disk_usage_to_two_generations(
     assert os.path.getsize(logger.rotated_file_path) < 400
 
 
-async def test_rotation_failure_falls_back_to_append(
-    hass: HomeAssistant, tmp_path, caplog
-) -> None:
+async def test_rotation_failure_falls_back_to_append(hass: HomeAssistant, tmp_path, caplog) -> None:
     """Review F5: a failing os.replace must not halt logging — lines are
     appended to the oversized active file (bounded unrotated growth beats
     infinite drop), ONE rotation warning names the .1 path per streak, and

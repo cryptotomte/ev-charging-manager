@@ -220,8 +220,8 @@ async def test_obs_05_err_state_real_transition(hass: HomeAssistant) -> None:
 async def test_obs_06_trx_state_transition(hass: HomeAssistant) -> None:
     """T-OBS-06: trx entity 0 → 2 emits TRX_STATE (uses existing CONF_RFID_ENTITY).
 
-    PR-28 (FR-004): trx values are RFID tag values — the TRX_STATE message
-    carries only the masked form (length <= 2 masks fully).
+    PR-28 review F7: single-digit trx values are go-e card SLOT INDICES, not
+    RFID UIDs — they render literally so transitions stay diagnosable.
     """
     entry = _make_observation_entry()
     engine, mock_log = await _setup_observation_engine(hass, entry)
@@ -236,8 +236,27 @@ async def test_obs_06_trx_state_transition(hass: HomeAssistant) -> None:
     assert trx_calls, "Expected TRX_STATE log call"
     category, message = trx_calls[-1].args
     assert category == "TRX_STATE"
-    assert "trx changed: *** → ***" in message
+    assert "trx changed: 0 → 2" in message
     assert "| wh=" in message
+
+
+async def test_obs_06c_trx_null_sentinel_rendered_literally(hass: HomeAssistant) -> None:
+    """Review F7 sentinel boundary: 'null' is exempted by the caller via
+    _INVALID_STATES and renders literally — redact_tag itself would mask it."""
+    entry = _make_observation_entry()
+    engine, mock_log = await _setup_observation_engine(hass, entry)
+
+    # Setup leaves the trx state at "null" — transition to "2" first so the
+    # following set back to "null" fires a real state_changed event.
+    hass.states.async_set(MOCK_TRX_ENTITY, "2")
+    await hass.async_block_till_done()
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    await hass.async_block_till_done()
+
+    trx_calls = [call for call in mock_log.call_args_list if call.args[0] == "TRX_STATE"]
+    assert trx_calls, "Expected TRX_STATE log call"
+    message = trx_calls[-1].args[1]
+    assert "trx changed: 2 → null" in message
 
 
 async def test_obs_06b_trx_state_long_tag_redacted(hass: HomeAssistant) -> None:
@@ -246,15 +265,16 @@ async def test_obs_06b_trx_state_long_tag_redacted(hass: HomeAssistant) -> None:
     entry = _make_observation_entry()
     engine, mock_log = await _setup_observation_engine(hass, entry)
 
-    engine._last_trx = "0"
+    engine._last_trx = "deadbeef"
     hass.states.async_set(MOCK_TRX_ENTITY, "abc123f4")
     await hass.async_block_till_done()
 
     trx_calls = [call for call in mock_log.call_args_list if call.args[0] == "TRX_STATE"]
     assert trx_calls, "Expected TRX_STATE log call"
     message = trx_calls[-1].args[1]
-    assert "trx changed: *** → ***f4" in message
+    assert "trx changed: ***ef → ***f4" in message
     assert "abc123f4" not in message
+    assert "deadbeef" not in message
 
     # The raw value is still cached for transition detection (not the mask)
     assert engine._last_trx == "abc123f4"

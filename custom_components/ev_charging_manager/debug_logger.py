@@ -92,16 +92,29 @@ def redact_tag(value: str | int | None) -> str:
     RFID tags are persistent personal identifiers — log lines may only carry
     a masked form: ``***`` plus the last two characters.
 
+    Pure single-digit values ("0"–"9") are exempt and render literally: on
+    go-e the trx entity carries a card SLOT INDEX (0-9, with "0" meaning
+    auth-required) — not the RFID UID, and not the persistent personal
+    identifier FR-004 protects. Masking them made TRX_STATE transitions
+    (``*** → ***``) useless for diagnosing the RFID-wait model. Non-numeric
+    values of length <= 2 stay fully masked, since keeping the last two
+    characters would echo the whole value. Diagnostic sentinels (unavailable,
+    null, ...) are exempted by CALLERS via ``_INVALID_STATES`` — this
+    function otherwise masks unconditionally.
+
     Args:
         value: Raw tag/trx value as read from the charger entity.
 
     Returns:
-        ``"None"`` for absent values, ``"***"`` for values of length <= 2,
-        ``"***{last2}"`` otherwise (e.g. ``"abc123f4"`` -> ``"***f4"``).
+        ``"None"`` for absent values, the literal digit for single-digit
+        values, ``"***"`` for other values of length <= 2, ``"***{last2}"``
+        otherwise (e.g. ``"abc123f4"`` -> ``"***f4"``).
     """
     if value is None:
         return "None"
     text = str(value)
+    if len(text) == 1 and text in "0123456789":
+        return text
     if len(text) <= 2:
         return "***"
     return f"***{text[-2:]}"

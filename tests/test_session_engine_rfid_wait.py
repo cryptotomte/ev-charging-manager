@@ -879,5 +879,5 @@ async def test_rfid_tag_redacted_in_all_debug_log_lines(hass: HomeAssistant, tmp
 
     midsession = [ln for ln in lines if "TRX_MIDSESSION" in ln]
     assert midsession, "Expected a TRX_MIDSESSION line for the mid-session change"
-    assert "now trx=***" in midsession[0]
-    assert "now trx=7" not in midsession[0]
+    # Review F7: "7" is a slot index, not a UID — rendered literally
+    assert "now trx=7" in midsession[0]

@@ -533,3 +533,77 @@ async def test_legacy_engine_rfid_read_redacted(hass: HomeAssistant, tmp_path) -
     rfid_lines = [ln for ln in content.splitlines() if "RFID_READ" in ln]
     assert rfid_lines, "Expected an RFID_READ line"
     assert "tag=***f4" in rfid_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# T009 (US4): rotation at DEBUG_LOG_MAX_BYTES — single .1 generation (FR-011)
+# ---------------------------------------------------------------------------
+
+
+async def test_rotation_at_size_cap_replaces_previous_generation(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """An oversized active file is rotated to .1 (replacing any previous .1)
+    at flush time; the flush's lines land in a fresh active file — no lines
+    lost across the rotation (FR-011)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)  # DEBUG_ON marker to disk
+
+    # Pre-existing .1 generation that must be REPLACED (single generation)
+    with open(logger.rotated_file_path, "w", encoding="utf-8") as fh:
+        fh.write("OLD GENERATION CONTENT\n")
+
+    # Grow the active file past the cap
+    with open(logger.file_path, "a", encoding="utf-8") as fh:
+        fh.write("x" * (debug_logger_module.DEBUG_LOG_MAX_BYTES + 1))
+
+    logger.log("CAR_STATE", "first line after rotation")
+    await _flush_by_time(hass)
+
+    # Active file restarted: contains ONLY the flushed line
+    active_lines = _read_lines(logger)
+    assert len(active_lines) == 1
+    assert "first line after rotation" in active_lines[0]
+
+    # Previous content rolled into .1; the old .1 was replaced
+    rotated = open(logger.rotated_file_path, encoding="utf-8").read()
+    assert "DEBUG_ON" in rotated
+    assert rotated.rstrip("\n").endswith("x" * 10)
+    assert "OLD GENERATION CONTENT" not in rotated
+
+
+async def test_rotation_bounds_disk_usage_to_two_generations(
+    hass: HomeAssistant, tmp_path, monkeypatch
+) -> None:
+    """Repeated flushes past the cap keep exactly two files: active + .1."""
+    monkeypatch.setattr(debug_logger_module, "DEBUG_LOG_MAX_BYTES", 200)
+    logger = await _make_enabled_logger(hass, tmp_path)
+
+    for i in range(20):
+        logger.log("CAR_STATE", f"filler line number {i} with some padding text")
+        await _flush_by_time(hass)
+
+    log_files = sorted(p.name for p in tmp_path.iterdir() if "debug.log" in p.name)
+    assert log_files == [
+        "ev_charging_manager_debug.log",
+        "ev_charging_manager_debug.log.1",
+    ]
+    # Both generations stay bounded: cap + one flush worth of lines
+    assert os.path.getsize(logger.file_path) < 400
+    assert os.path.getsize(logger.rotated_file_path) < 400
+
+
+async def test_clear_truncates_active_only_dot1_remains(hass: HomeAssistant, tmp_path) -> None:
+    """async_clear() truncates the active file only — the .1 generation remains
+    (FR-012 / US4 scenario 3)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    logger.log("CAR_STATE", "active content")
+    await _flush_by_time(hass)
+
+    with open(logger.rotated_file_path, "w", encoding="utf-8") as fh:
+        fh.write("ROTATED GENERATION\n")
+
+    await logger.async_clear()
+
+    assert open(logger.file_path, encoding="utf-8").read() == ""
+    assert open(logger.rotated_file_path, encoding="utf-8").read() == "ROTATED GENERATION\n"

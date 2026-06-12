@@ -367,7 +367,19 @@ class DebugLogger:
                 if overflow > 0:
                     del self._buffer[:overflow]
                     self._dropped_count += overflow
-                if self._fail_count % _WARN_EVERY_N_FAILURES == 0:
+                # Review F4: warn on the FIRST failure of a streak immediately —
+                # a single failed flush must never be silent (with a reload or
+                # stop in between, the lines would vanish traceless). Repeats
+                # stay throttled to every Nth failure.
+                if self._fail_count == 1:
+                    _LOGGER.warning(
+                        "DebugLogger: flush failed (%s) — %d lines buffered for "
+                        "retry; check file permissions for %s",
+                        err,
+                        len(self._buffer),
+                        self.file_path,
+                    )
+                elif self._fail_count % _WARN_EVERY_N_FAILURES == 0:
                     _LOGGER.warning(
                         "DebugLogger: %d consecutive flush failures (latest: %s) — "
                         "check file permissions for %s",

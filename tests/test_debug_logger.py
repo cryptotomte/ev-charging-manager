@@ -445,8 +445,30 @@ async def test_flush_failure_retains_lines_for_retry(hass: HomeAssistant, tmp_pa
     assert content.index("retained-1") < content.index("retained-2")
 
 
+async def test_first_flush_failure_warns_immediately(
+    hass: HomeAssistant, tmp_path, caplog
+) -> None:
+    """Review F4: the FIRST failure of a failure streak emits a warning right
+    away — a single failed flush must never be silent."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)
+
+    with (
+        patch("builtins.open", side_effect=OSError("disk full")),
+        caplog.at_level(logging.WARNING, logger=debug_logger_module.__name__),
+    ):
+        logger.log("CAR_STATE", "single failure")
+        await _flush_by_time(hass)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "Exactly one warning on the first failure"
+    assert "flush" in warnings[0].message
+    assert logger.file_path in warnings[0].message
+
+
 async def test_flush_failure_warning_throttled(hass: HomeAssistant, tmp_path, caplog) -> None:
-    """A warning is emitted every 5th consecutive flush failure — not on each one."""
+    """Repeat failures are throttled: warn on the 1st (review F4) and every
+    5th consecutive failure — not on each one."""
     logger = await _make_enabled_logger(hass, tmp_path)
     await _flush_by_time(hass)
 
@@ -456,11 +478,10 @@ async def test_flush_failure_warning_throttled(hass: HomeAssistant, tmp_path, ca
                 logger.log("CAR_STATE", f"fail {i}")
                 await _flush_by_time(hass)
 
-    warnings = [
-        r for r in caplog.records if r.levelno == logging.WARNING and "consecutive" in r.message
-    ]
-    assert len(warnings) == 1
-    assert "5" in warnings[0].message
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2  # failure #1 (immediate) + failure #5 (throttled)
+    assert "consecutive" in warnings[1].message
+    assert "5" in warnings[1].message
 
 
 async def test_failure_count_resets_on_successful_flush(hass: HomeAssistant, tmp_path) -> None:

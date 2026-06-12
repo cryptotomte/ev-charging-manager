@@ -1,473 +1,425 @@
-"""Tests for DebugLogger, options flow debug_logging toggle, and SessionEngine hooks."""
+"""Tests for the buffered off-loop DebugLogger (PR-28, 024-debug-logger-overhaul).
+
+Covers the rewritten async I/O model:
+- sync log() buffers only (no event-loop file I/O)
+- count (50 lines) and age (5 s) flush triggers, emission order preserved
+- async_disable flushes with DEBUG_OFF as the final line
+- async_clear: flush -> truncate -> DEBUG_CLEAR, off-loop
+- flush OSError: lines retained, throttled warning, buffer cap drop-oldest,
+  dropped-count note on recovery
+- line format byte-identical to the pre-PR-28 logger (SC-006)
+
+Line-format and category pins are carried over from the old test suite so
+content compatibility is proven, not assumed.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
+from datetime import timedelta
 from unittest.mock import patch
 
-import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
-from custom_components.ev_charging_manager.const import DOMAIN
+from custom_components.ev_charging_manager import debug_logger as debug_logger_module
+from custom_components.ev_charging_manager.const import DEBUG_LOG_FLUSH_LINES
 from custom_components.ev_charging_manager.debug_logger import DebugLogger
-from tests.conftest import (
-    MOCK_CAR_STATUS_ENTITY,
-    MOCK_CHARGER_DATA,
-    MOCK_TRX_ENTITY,
-    setup_session_engine,
-)
 
 # ---------------------------------------------------------------------------
-# T004: Unit tests for DebugLogger.enable()
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def test_enable_creates_www_dir(tmp_path):
-    """enable() creates www/ directory if it does not exist."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-
-    logger.enable()
-
-    www_dir = os.path.join(config_dir, "www")
-    assert os.path.isdir(www_dir), "www/ directory should be created by enable()"
+async def _make_enabled_logger(hass: HomeAssistant, tmp_path) -> DebugLogger:
+    """Return a DebugLogger at tmp_path with logging enabled (DEBUG_ON buffered)."""
+    logger = DebugLogger(hass, str(tmp_path))
+    await logger.async_enable()
+    return logger
 
 
-def test_enable_writes_debug_on_line(tmp_path):
-    """enable() writes a DEBUG_ON line to the log file."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
+async def _flush_by_time(hass: HomeAssistant) -> None:
+    """Advance past the age-flush threshold and drain pending tasks."""
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=6))
+    await hass.async_block_till_done()
 
-    logger.enable()
 
+def _read_lines(logger: DebugLogger) -> list[str]:
+    with open(logger.file_path, encoding="utf-8") as fh:
+        return fh.read().splitlines()
+
+
+# ---------------------------------------------------------------------------
+# T003 (h) + carried-over pins: file location and line format (SC-006)
+# ---------------------------------------------------------------------------
+
+
+async def test_file_path_at_config_root(hass: HomeAssistant, tmp_path) -> None:
+    """The log file lives in the config root — never under www/ (FR-001)."""
+    logger = DebugLogger(hass, str(tmp_path))
+
+    assert logger.file_path == os.path.join(str(tmp_path), "ev_charging_manager_debug.log")
+    assert f"{os.sep}www{os.sep}" not in logger.file_path
+
+
+async def test_log_line_format_byte_identical(hass: HomeAssistant, tmp_path) -> None:
+    """Line format is unchanged: 'YYYY-MM-DDTHH:MM:SS.mmm | CAT<15 | msg' (SC-006)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+
+    logger.log("CAR_STATE", "test message")
+    await logger.async_disable()
+
+    lines = _read_lines(logger)
+    car_line = next(ln for ln in lines if "CAR_STATE" in ln)
+
+    parts = car_line.split(" | ")
+    assert len(parts) == 3
+    assert len(parts[0]) == 23  # ISO timestamp with milliseconds
+    assert parts[1] == "CAR_STATE      "  # padded to 15 chars (left-aligned)
+    assert parts[2] == "test message"
+
+
+async def test_enable_buffers_debug_on_marker(hass: HomeAssistant, tmp_path) -> None:
+    """async_enable() sets the flag and buffers the DEBUG_ON marker line."""
+    logger = DebugLogger(hass, str(tmp_path))
+
+    assert not logger.enabled
+    await logger.async_enable()
+    assert logger.enabled
+
+    await _flush_by_time(hass)
     content = open(logger.file_path, encoding="utf-8").read()
     assert "DEBUG_ON" in content
     assert "Debug logging enabled" in content
 
 
-def test_enable_sets_enabled_flag(tmp_path):
-    """enable() sets _enabled = True."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
+async def test_log_noop_before_enable(hass: HomeAssistant, tmp_path) -> None:
+    """log() is a no-op when async_enable() has not been called."""
+    logger = DebugLogger(hass, str(tmp_path))
 
-    assert not logger.enabled
-    logger.enable()
-    assert logger.enabled
+    logger.log("CAR_STATE", "should not be buffered")
+    await _flush_by_time(hass)
+
+    assert logger._buffer == []
+    assert not os.path.exists(logger.file_path)
 
 
-def test_log_appends_after_enable(tmp_path):
-    """log() appends lines to the file after enable() is called."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
+# ---------------------------------------------------------------------------
+# T003 (a): log() from sync context performs NO file I/O on the loop
+# ---------------------------------------------------------------------------
 
-    logger.enable()
-    logger.log("CAR_STATE", "car_value changed: Idle → Charging")
-    logger.log("SESSION_START", "session_id=abc123 user=Petra charger=goe_409787")
+
+async def test_log_performs_no_file_io(hass: HomeAssistant, tmp_path) -> None:
+    """log() only appends to the in-memory buffer — no open/stat/rename (FR-005/006)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+
+    with (
+        patch("builtins.open") as mock_open,
+        patch("os.replace") as mock_replace,
+        patch("os.path.getsize") as mock_getsize,
+    ):
+        logger.log("CAR_STATE", "buffered only")
+
+        mock_open.assert_not_called()
+        mock_replace.assert_not_called()
+        mock_getsize.assert_not_called()
+
+    assert any("buffered only" in ln for ln in logger._buffer)
+    assert not os.path.exists(logger.file_path)
+
+
+# ---------------------------------------------------------------------------
+# T003 (b): 50-line threshold triggers an immediate flush
+# ---------------------------------------------------------------------------
+
+
+async def test_count_threshold_triggers_flush(hass: HomeAssistant, tmp_path) -> None:
+    """Reaching DEBUG_LOG_FLUSH_LINES buffered lines flushes immediately (FR-007)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)  # flush the DEBUG_ON marker out of the way
+
+    for i in range(DEBUG_LOG_FLUSH_LINES - 1):
+        logger.log("CAR_STATE", f"line {i}")
+    await hass.async_block_till_done()
+
+    # 49 buffered lines: below threshold, timer not fired — nothing new on disk
+    assert len(_read_lines(logger)) == 1  # DEBUG_ON only
+
+    logger.log("CAR_STATE", f"line {DEBUG_LOG_FLUSH_LINES - 1}")
+    await hass.async_block_till_done()
+
+    assert len(_read_lines(logger)) == 1 + DEBUG_LOG_FLUSH_LINES
+    assert logger._buffer == []
+
+
+# ---------------------------------------------------------------------------
+# T003 (c): 5 s age trigger flushes a partial buffer
+# ---------------------------------------------------------------------------
+
+
+async def test_age_threshold_triggers_flush(hass: HomeAssistant, tmp_path) -> None:
+    """Buffered lines reach disk 5 s after the first buffered line (FR-007)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)
+
+    logger.log("CAR_STATE", "first")
+    logger.log("PLUG_STATE", "second")
+    await hass.async_block_till_done()
+
+    # No count trigger, timer not fired yet — still buffered
+    assert len(_read_lines(logger)) == 1
+    assert len(logger._buffer) == 2
+
+    await _flush_by_time(hass)
+
+    lines = _read_lines(logger)
+    assert any("first" in ln for ln in lines)
+    assert any("second" in ln for ln in lines)
+    assert logger._buffer == []
+
+
+async def test_timestamp_taken_at_buffer_time(hass: HomeAssistant, tmp_path, freezer) -> None:
+    """Line timestamps reflect log() call time, not flush time."""
+    freezer.move_to("2026-06-12T10:00:00+00:00")
+    logger = await _make_enabled_logger(hass, tmp_path)
+
+    logger.log("CAR_STATE", "buffered at ten")
+    freezer.tick(timedelta(seconds=30))
+    await _flush_by_time(hass)
+
+    line = next(ln for ln in _read_lines(logger) if "buffered at ten" in ln)
+    assert line.startswith("2026-06-12T10:00:00"), line
+
+
+# ---------------------------------------------------------------------------
+# T003 (d): emission order preserved across flushes
+# ---------------------------------------------------------------------------
+
+
+async def test_emission_order_preserved_across_flushes(hass: HomeAssistant, tmp_path) -> None:
+    """Lines land on disk in emission order across multiple flush cycles (FR-007)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+
+    logger.log("CAR_STATE", "order-1")
+    logger.log("CAR_STATE", "order-2")
+    await _flush_by_time(hass)
+    logger.log("CAR_STATE", "order-3")
+    logger.log("CAR_STATE", "order-4")
+    await _flush_by_time(hass)
 
     content = open(logger.file_path, encoding="utf-8").read()
-    lines = content.strip().splitlines()
-
-    # DEBUG_ON + 2 log lines
-    assert len(lines) == 3
-    assert "CAR_STATE" in lines[1]
-    assert "car_value changed: Idle → Charging" in lines[1]
-    assert "SESSION_START" in lines[2]
+    positions = [content.index(f"order-{i}") for i in (1, 2, 3, 4)]
+    assert positions == sorted(positions)
 
 
-def test_log_noop_before_enable(tmp_path):
-    """log() is a no-op when enable() has not been called."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
+# ---------------------------------------------------------------------------
+# T003 (e): async_disable flushes with DEBUG_OFF as the final line
+# ---------------------------------------------------------------------------
 
-    logger.log("CAR_STATE", "car_value changed: Idle → Charging")
+
+async def test_disable_flushes_with_debug_off_final(hass: HomeAssistant, tmp_path) -> None:
+    """async_disable() flushes the buffer; the DEBUG_OFF marker is the last line (FR-008)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+
+    logger.log("SESSION_START", "session_id=abc123")
+    await logger.async_disable()
+
+    lines = _read_lines(logger)
+    assert any("SESSION_START" in ln for ln in lines)
+    assert "DEBUG_OFF" in lines[-1]
+    assert "Debug logging disabled" in lines[-1]
+    assert not logger.enabled
+    assert logger._buffer == []
+
+
+async def test_log_noop_after_disable(hass: HomeAssistant, tmp_path) -> None:
+    """log() after async_disable() adds nothing — even after a flush window."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await logger.async_disable()
+
+    count_before = len(_read_lines(logger))
+    logger.log("CAR_STATE", "should not be written")
+    await _flush_by_time(hass)
+
+    assert len(_read_lines(logger)) == count_before
+
+
+async def test_disable_noop_when_never_enabled(hass: HomeAssistant, tmp_path) -> None:
+    """async_disable() without prior enable creates no file and does not raise."""
+    logger = DebugLogger(hass, str(tmp_path))
+
+    await logger.async_disable()
 
     assert not os.path.exists(logger.file_path)
 
 
-def test_log_line_format(tmp_path):
-    """log() writes lines with the correct format: timestamp | category | message."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
+async def test_disable_preserves_file_content(hass: HomeAssistant, tmp_path) -> None:
+    """async_disable() appends — it never truncates existing content."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    logger.log("SESSION_START", "session_id=abc123")
+    logger.log("ENGINE_DECISION", "IDLE → TRACKING")
 
-    logger.enable()
-    logger.log("CAR_STATE", "test message")
+    await logger.async_disable()
 
-    lines = open(logger.file_path, encoding="utf-8").read().strip().splitlines()
-    # Find a CAR_STATE line
-    car_line = next(ln for ln in lines if "CAR_STATE" in ln)
-
-    # Should match: YYYY-MM-DDTHH:MM:SS.mmm | CATEGORY        | message
-    parts = car_line.split(" | ")
-    assert len(parts) == 3
-    assert len(parts[0]) == 23  # timestamp with milliseconds
-    assert parts[1] == "CAR_STATE      "  # padded to 15 chars (left-aligned)
-    assert parts[2] == "test message"
+    content = open(logger.file_path, encoding="utf-8").read()
+    assert "DEBUG_ON" in content
+    assert "SESSION_START" in content
+    assert "ENGINE_DECISION" in content
+    assert "DEBUG_OFF" in content
 
 
-def test_enable_idempotent_www_dir(tmp_path):
-    """enable() does not fail if www/ already exists (exist_ok=True)."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    www_dir = os.path.join(config_dir, "www")
-    os.makedirs(www_dir)  # pre-create
-    logger = DebugLogger(config_dir)
+async def test_reenable_appends_not_overwrites(hass: HomeAssistant, tmp_path) -> None:
+    """Re-enabling after disable appends new events; old content is preserved."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    logger.log("SESSION_START", "session_id=first")
+    await logger.async_disable()
 
-    # Should not raise
-    logger.enable()
-    assert logger.enabled
+    await logger.async_enable()
+    logger.log("SESSION_START", "session_id=second")
+    await logger.async_disable()
+
+    content = open(logger.file_path, encoding="utf-8").read()
+    assert "session_id=first" in content
+    assert "session_id=second" in content
+    assert content.index("session_id=first") < content.index("session_id=second")
 
 
 # ---------------------------------------------------------------------------
-# T005: Unit tests for DebugLogger.log() fail-counter
+# T003 (f): async_clear — flush, truncate, DEBUG_CLEAR marker, off-loop
 # ---------------------------------------------------------------------------
 
 
-def test_log_silent_on_oserror(tmp_path):
-    """log() does not raise on OSError — failure is silent (count < 5)."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-    logger.enable()
+async def test_clear_flushes_then_truncates(hass: HomeAssistant, tmp_path) -> None:
+    """async_clear() flushes pending lines, truncates, then buffers DEBUG_CLEAR (FR-012)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    logger.log("CAR_STATE", "on-disk event")
+    await _flush_by_time(hass)
+    logger.log("PLUG_STATE", "still-buffered event")
 
-    # Patch open to raise OSError
+    await logger.async_clear()
+
+    # Active file truncated; pre-clear content gone (flushed first, then truncated)
+    assert open(logger.file_path, encoding="utf-8").read() == ""
+    assert logger._buffer != []  # DEBUG_CLEAR marker buffered
+
+    await _flush_by_time(hass)
+    content = open(logger.file_path, encoding="utf-8").read()
+    assert "DEBUG_CLEAR" in content
+    assert "Log cleared by user" in content
+    assert "on-disk event" not in content
+    assert "still-buffered event" not in content
+
+
+async def test_clear_no_marker_when_disabled(hass: HomeAssistant, tmp_path) -> None:
+    """async_clear() with logging off truncates but writes no DEBUG_CLEAR marker."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    logger.log("CAR_STATE", "some event")
+    await logger.async_disable()
+
+    await logger.async_clear()
+    await _flush_by_time(hass)
+
+    assert open(logger.file_path, encoding="utf-8").read() == ""
+
+
+async def test_clear_noop_when_file_missing(hass: HomeAssistant, tmp_path) -> None:
+    """async_clear() with no file and nothing buffered is a silent no-op."""
+    logger = DebugLogger(hass, str(tmp_path))
+
+    await logger.async_clear()
+    await _flush_by_time(hass)
+
+    assert not os.path.exists(logger.file_path)
+
+
+# ---------------------------------------------------------------------------
+# T003 (g): flush OSError — retry, throttled warning, buffer cap, recovery note
+# ---------------------------------------------------------------------------
+
+
+async def test_flush_failure_retains_lines_for_retry(hass: HomeAssistant, tmp_path) -> None:
+    """On flush OSError the lines stay buffered and land on the next attempt (FR-010)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)
+
     with patch("builtins.open", side_effect=OSError("disk full")):
-        # Should not raise
-        for _ in range(4):
-            logger.log("CAR_STATE", "test")
+        logger.log("CAR_STATE", "retained-1")
+        logger.log("CAR_STATE", "retained-2")
+        await _flush_by_time(hass)
+        # Flush failed — both lines still buffered, in order
+        assert len(logger._buffer) == 2
+        assert "retained-1" in logger._buffer[0]
+        assert "retained-2" in logger._buffer[1]
 
-    assert logger._fail_count == 4
+    await _flush_by_time(hass)
+
+    content = open(logger.file_path, encoding="utf-8").read()
+    assert "retained-1" in content
+    assert "retained-2" in content
+    assert content.index("retained-1") < content.index("retained-2")
 
 
-def test_log_warns_every_5th_failure(tmp_path, caplog):
-    """log() emits a warning exactly on every 5th consecutive failure."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-    logger.enable()
-
-    import logging
+async def test_flush_failure_warning_throttled(hass: HomeAssistant, tmp_path, caplog) -> None:
+    """A warning is emitted every 5th consecutive flush failure — not on each one."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)
 
     with patch("builtins.open", side_effect=OSError("disk full")):
-        with caplog.at_level(logging.WARNING):
-            for _ in range(10):
-                logger.log("CAR_STATE", "test")
+        with caplog.at_level(logging.WARNING, logger=debug_logger_module.__name__):
+            for i in range(5):
+                logger.log("CAR_STATE", f"fail {i}")
+                await _flush_by_time(hass)
 
-    # Warnings should appear at failures 5 and 10
-    warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warning_messages) == 2
-    assert "5" in warning_messages[0] or "consecutive" in warning_messages[0]
+    warnings = [
+        r for r in caplog.records if r.levelno == logging.WARNING and "consecutive" in r.message
+    ]
+    assert len(warnings) == 1
+    assert "5" in warnings[0].message
 
 
-def test_log_resets_fail_count_on_success(tmp_path, caplog):
-    """_fail_count resets to 0 after a successful write."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-    logger.enable()
+async def test_failure_count_resets_on_successful_flush(hass: HomeAssistant, tmp_path) -> None:
+    """The consecutive-failure counter resets after a successful flush."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)
 
-    # Force 3 failures
     with patch("builtins.open", side_effect=OSError("disk full")):
-        for _ in range(3):
-            logger.log("CAR_STATE", "test")
-
+        for i in range(3):
+            logger.log("CAR_STATE", f"fail {i}")
+            await _flush_by_time(hass)
     assert logger._fail_count == 3
 
-    # Successful write should reset counter
-    logger.log("CAR_STATE", "success")
+    await _flush_by_time(hass)
     assert logger._fail_count == 0
 
 
-# ---------------------------------------------------------------------------
-# T015: Unit tests for DebugLogger.clear()
-# ---------------------------------------------------------------------------
+async def test_buffer_capped_drop_oldest_with_recovery_note(
+    hass: HomeAssistant, tmp_path, monkeypatch
+) -> None:
+    """Persistent flush failure caps the buffer drop-oldest; a dropped-count note
+    is written on the next successful flush (FR-010)."""
+    monkeypatch.setattr(debug_logger_module, "DEBUG_LOG_BUFFER_CAP", 10)
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)
 
+    with patch("builtins.open", side_effect=OSError("disk full")):
+        for i in range(15):
+            logger.log("CAR_STATE", f"cap-line-{i:02d}")
+        await _flush_by_time(hass)
 
-def test_clear_noop_when_file_missing(tmp_path):
-    """clear() is a no-op when the file does not exist — no error raised."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
+    # Capped at 10: the 5 oldest dropped, the 10 newest retained in order
+    assert len(logger._buffer) == 10
+    assert "cap-line-05" in logger._buffer[0]
+    assert "cap-line-14" in logger._buffer[-1]
 
-    # Should not raise, even though file and www/ dir don't exist
-    logger.clear()
-
-
-def test_clear_truncates_file_with_logging_on(tmp_path):
-    """clear() truncates file and writes DEBUG_CLEAR when enabled."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-
-    logger.enable()
-    logger.log("CAR_STATE", "some event")
-    logger.log("SESSION_START", "session started")
-
-    # Verify content before clear
-    content_before = open(logger.file_path, encoding="utf-8").read()
-    assert "CAR_STATE" in content_before
-
-    logger.clear()
-
-    content_after = open(logger.file_path, encoding="utf-8").read()
-    assert "CAR_STATE" not in content_after
-    assert "DEBUG_CLEAR" in content_after
-    assert "Log cleared by user" in content_after
-
-
-def test_clear_truncates_file_with_logging_off(tmp_path):
-    """clear() truncates file but does NOT write DEBUG_CLEAR when disabled."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-
-    # Enable, write content, then disable
-    logger.enable()
-    logger.log("SESSION_START", "started")
-    logger.disable()
-
-    # File exists at this point (has DEBUG_ON, SESSION_START, DEBUG_OFF)
-    content_before = open(logger.file_path, encoding="utf-8").read()
-    assert "SESSION_START" in content_before
-
-    logger.clear()
-
-    content_after = open(logger.file_path, encoding="utf-8").read()
-    assert "SESSION_START" not in content_after
-    assert "DEBUG_CLEAR" not in content_after
-    # File should be empty after clear with logging off
-    assert content_after == ""
-
-
-# ---------------------------------------------------------------------------
-# T020: Unit tests for DebugLogger.disable()
-# ---------------------------------------------------------------------------
-
-
-def test_disable_writes_debug_off_when_enabled(tmp_path):
-    """disable() writes a DEBUG_OFF line when logging is active."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-
-    logger.enable()
-    logger.disable()
+    await _flush_by_time(hass)
 
     content = open(logger.file_path, encoding="utf-8").read()
-    assert "DEBUG_OFF" in content
-    assert "Debug logging disabled" in content
-
-
-def test_disable_clears_enabled_flag(tmp_path):
-    """disable() sets _enabled = False."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-
-    logger.enable()
-    assert logger.enabled
-
-    logger.disable()
-    assert not logger.enabled
-
-
-def test_log_noop_after_disable(tmp_path):
-    """log() is a no-op after disable() — no new lines added."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-
-    logger.enable()
-    logger.disable()
-
-    lines_before = open(logger.file_path, encoding="utf-8").read().strip().splitlines()
-    count_before = len(lines_before)
-
-    logger.log("CAR_STATE", "should not be written")
-
-    lines_after = open(logger.file_path, encoding="utf-8").read().strip().splitlines()
-    assert len(lines_after) == count_before
-
-
-def test_disable_preserves_file_content(tmp_path):
-    """disable() does not truncate or delete existing file content."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-
-    logger.enable()
-    logger.log("SESSION_START", "session_id=abc123 user=Petra charger=goe")
-    logger.log("ENGINE_DECISION", "IDLE → TRACKING (trigger: car_state=Charging)")
-
-    content_before_disable = open(logger.file_path, encoding="utf-8").read()
-
-    logger.disable()
-
-    content_after_disable = open(logger.file_path, encoding="utf-8").read()
-
-    # All original lines must still be present
-    assert "SESSION_START" in content_after_disable
-    assert "ENGINE_DECISION" in content_after_disable
-    # DEBUG_ON line preserved
-    assert "DEBUG_ON" in content_after_disable
-    # Content only grew (DEBUG_OFF appended)
-    assert len(content_after_disable) >= len(content_before_disable)
-
-
-def test_disable_noop_when_already_disabled(tmp_path):
-    """disable() is a no-op when already disabled — no error, no file created."""
-    config_dir = str(tmp_path / "config")
-    os.makedirs(config_dir)
-    logger = DebugLogger(config_dir)
-
-    # Never enabled — file should not be created
-    logger.disable()
-
-    assert not os.path.exists(logger.file_path)
-
-
-# ---------------------------------------------------------------------------
-# T014: Integration test — debug_logging=True → log file contains CAR_STATE
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_integration_car_state_logged(hass, tmp_path):
-    """With debug_logging=True, a car_value state change produces a CAR_STATE log line."""
-    # Point HA config_dir to tmp_path so the log file lands there
-    hass.config.config_dir = str(tmp_path)
-
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=MOCK_CHARGER_DATA,
-        options={"debug_logging": True},
-        title="My go-e Charger",
-    )
-
-    await setup_session_engine(hass, entry)
-
-    # Simulate car state change to Charging (with a valid trx to start a session)
-    hass.states.async_set(MOCK_TRX_ENTITY, "2")
-    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
-    await hass.async_block_till_done()
-
-    # Retrieve the debug_logger from hass.data
-    debug_logger = hass.data[DOMAIN][entry.entry_id].get("debug_logger")
-    assert debug_logger is not None, "debug_logger should be stored in hass.data"
-
-    log_path = debug_logger.file_path
-    assert os.path.exists(log_path), "Log file should be created"
-
-    content = open(log_path, encoding="utf-8").read()
-    assert "CAR_STATE" in content, f"Expected CAR_STATE in log:\n{content}"
-    assert "DEBUG_ON" in content
-
-
-# ---------------------------------------------------------------------------
-# T021: Integration test — debug_logging=False → no new lines added after disable
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_integration_no_logging_when_disabled(hass, tmp_path):
-    """With debug_logging=False (default), no log file is created."""
-    hass.config.config_dir = str(tmp_path)
-
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=MOCK_CHARGER_DATA,
-        # options not set → debug_logging defaults to False
-        title="My go-e Charger",
-    )
-
-    await setup_session_engine(hass, entry)
-
-    # Simulate state changes
-    hass.states.async_set(MOCK_TRX_ENTITY, "2")
-    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
-    await hass.async_block_till_done()
-
-    debug_logger = hass.data[DOMAIN][entry.entry_id].get("debug_logger")
-    assert debug_logger is not None
-
-    # File should not exist since logging is disabled
-    assert not os.path.exists(debug_logger.file_path), (
-        "Log file should NOT be created when debug_logging=False"
-    )
-
-
-# ---------------------------------------------------------------------------
-# T022: Integration test — enable → log → disable → enable → log → append
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_integration_reenable_appends_not_overwrites(hass, tmp_path):
-    """Re-enabling after disable appends new events; old content is preserved."""
-    config_dir = str(tmp_path)
-    logger = DebugLogger(config_dir)
-
-    # First enable/log/disable cycle
-    logger.enable()
-    logger.log("SESSION_START", "session_id=first")
-    logger.disable()
-
-    content_after_first = open(logger.file_path, encoding="utf-8").read()
-    assert "SESSION_START" in content_after_first
-    assert "session_id=first" in content_after_first
-
-    # Second enable/log cycle
-    logger.enable()
-    logger.log("SESSION_START", "session_id=second")
-
-    content_after_second = open(logger.file_path, encoding="utf-8").read()
-    # Both batches should be present
-    assert "session_id=first" in content_after_second, (
-        "First batch must be preserved after re-enable"
-    )
-    assert "session_id=second" in content_after_second, (
-        "Second batch must be present after re-enable"
-    )
-    # Second appears after first in the file
-    assert content_after_second.index("session_id=first") < content_after_second.index(
-        "session_id=second"
-    )
-
-
-# ---------------------------------------------------------------------------
-# T023: Integration test — reload preserves logging across options update
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_integration_reload_continues_logging(hass, tmp_path):
-    """After entry reload with debug_logging=True, DEBUG_ON is present and logging works."""
-    hass.config.config_dir = str(tmp_path)
-
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=MOCK_CHARGER_DATA,
-        options={"debug_logging": True},
-        title="My go-e Charger",
-    )
-
-    await setup_session_engine(hass, entry)
-
-    # Reload the entry (simulates options update)
-    await hass.config_entries.async_reload(entry.entry_id)
-    await hass.async_block_till_done()
-
-    debug_logger = hass.data[DOMAIN][entry.entry_id].get("debug_logger")
-    assert debug_logger is not None
-    assert debug_logger.enabled, "Logger should be enabled after reload with debug_logging=True"
-
-    log_path = debug_logger.file_path
-    assert os.path.exists(log_path), "Log file should exist after reload"
-
-    content = open(log_path, encoding="utf-8").read()
-    assert "DEBUG_ON" in content
+    assert "5 lines dropped" in content
+    assert "cap-line-04" not in content
+    assert "cap-line-05" in content
+    assert "cap-line-14" in content
+    # The note precedes the retained lines (chronological position of the gap)
+    assert content.index("lines dropped") < content.index("cap-line-05")
+    assert logger._buffer == []

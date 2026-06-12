@@ -414,9 +414,7 @@ class PlugAnchoredSessionEngine:
         # completion just finished.
         if self._active_session is not None:
             try:
-                await self._session_store.async_save_active_session(
-                    self._active_session.to_dict()
-                )
+                await self._session_store.async_save_active_session(self._active_session.to_dict())
                 _LOGGER.debug(
                     "PlugAnchoredSessionEngine: final active-session snapshot "
                     "persisted at unload (id=%s)",
@@ -531,9 +529,7 @@ class PlugAnchoredSessionEngine:
         current_power = self._get_power() or 0.0
 
         if self._debug_logger:
-            energy_str = (
-                f"{current_energy:.3f}kWh" if current_energy is not None else "unavailable"
-            )
+            energy_str = f"{current_energy:.3f}kWh" if current_energy is not None else "unavailable"
             self._debug_logger.log(
                 DEBUG_CAT_HA_RESTART_DETECTED,
                 f"restart detected — snapshot id={snapshot.get('id', '?')} "
@@ -545,8 +541,7 @@ class PlugAnchoredSessionEngine:
         # PR-27 FR-002: only an available reading measurably below the session's
         # start value is a reset; the epsilon kills float jitter false positives.
         energy_counter_reset = (
-            current_energy is not None
-            and current_energy < energy_start - ENERGY_RESET_EPSILON_KWH
+            current_energy is not None and current_energy < energy_start - ENERGY_RESET_EPSILON_KWH
         )
 
         # Effective energy for downstream use: when the live reading is missing,
@@ -564,9 +559,7 @@ class PlugAnchoredSessionEngine:
 
         if plug_on and not energy_counter_reset:
             # Cable still in — resume the session (FR-026)
-            await self._resume_session_from_snapshot(
-                snapshot, effective_energy, current_power, now
-            )
+            await self._resume_session_from_snapshot(snapshot, effective_energy, current_power, now)
         else:
             # Cable removed or energy counter reset — complete the old session (FR-027)
             reason = "energy counter reset" if energy_counter_reset else "plug was off at restart"

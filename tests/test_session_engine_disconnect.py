@@ -334,8 +334,7 @@ async def test_failed_session_start_does_not_double_arm_hourly(hass: HomeAssista
     with (
         patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
         patch(
-            "custom_components.ev_charging_manager.session_engine_v2."
-            "async_track_utc_time_change",
+            "custom_components.ev_charging_manager.session_engine_v2.async_track_utc_time_change",
             side_effect=_fake_track,
         ),
         patch(

@@ -320,8 +320,7 @@ async def test_periodic_save_does_not_resurrect_completed_session(hass: HomeAssi
         with patch.object(store._store, "async_save", mock_save):
             await store.async_load()
             with patch(
-                "custom_components.ev_charging_manager.session_store."
-                "async_track_time_interval"
+                "custom_components.ev_charging_manager.session_store.async_track_time_interval"
             ) as mock_track:
                 mock_track.return_value = MagicMock()
                 store.schedule_periodic_save(hass, mock_entry, 300, get_active)
@@ -345,8 +344,7 @@ async def test_periodic_save_does_not_resurrect_completed_session(hass: HomeAssi
         for entry in envelope["data"]:
             if entry["id"] == "s1":
                 assert (
-                    entry.get("ended_at") is not None
-                    or entry.get("disconnected_at") is not None
+                    entry.get("ended_at") is not None or entry.get("disconnected_at") is not None
                 ), "an incomplete snapshot of the completed session reached disk"
     mock_save.assert_not_called()
 

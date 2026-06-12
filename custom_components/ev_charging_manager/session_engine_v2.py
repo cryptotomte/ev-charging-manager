@@ -1822,25 +1822,34 @@ class PlugAnchoredSessionEngine:
         except (ValueError, TypeError):
             return
 
+        # Review F3: capture the previous reading BEFORE overwriting the cache —
+        # reset detection must compare against it, not against energy_start_kwh.
+        prev_energy_kwh = self._last_energy_kwh
         self._last_energy_kwh = energy_kwh
         session = self._active_session
 
         # PR-27 FR-015: live counter-reset detection. A reading measurably below
-        # the session's start reference means the charger rebooted and its
-        # counter restarted from ~0. Rebase the start reference so the energy
+        # the PREVIOUS reading means the charger rebooted and its counter
+        # restarted from ~0. Rebase the start reference so the energy
         # accumulated so far is preserved and subsequent deltas add on top
         # (previously the delta clamped to 0 for the rest of the session).
-        if energy_kwh < session.energy_start_kwh - ENERGY_RESET_EPSILON_KWH:
+        # Comparing against energy_start_kwh would miss a SECOND reset in the
+        # same session: the first rebase can push energy_start_kwh negative,
+        # so no later near-zero reading would ever undercut it (review F3).
+        reference_kwh = (
+            prev_energy_kwh if prev_energy_kwh is not None else session.energy_start_kwh
+        )
+        if energy_kwh < reference_kwh - ENERGY_RESET_EPSILON_KWH:
             old_start = session.energy_start_kwh
             session.energy_start_kwh = energy_kwh - session.energy_kwh
             session.data_gap = True
             self._data_gap = True
             _LOGGER.warning(
                 "PlugAnchoredSessionEngine: mid-session energy counter reset detected "
-                "(reading=%.3f kWh < start=%.3f kWh) — rebased start to %.3f kWh, "
+                "(reading=%.3f kWh < previous=%.3f kWh) — rebased start to %.3f kWh, "
                 "accumulated %.3f kWh preserved, session flagged data_gap",
                 energy_kwh,
-                old_start,
+                reference_kwh,
                 session.energy_start_kwh,
                 session.energy_kwh,
             )

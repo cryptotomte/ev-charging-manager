@@ -321,3 +321,58 @@ async def test_v2_energy_jitter_below_start_no_rebase(hass: HomeAssistant) -> No
     )
     assert session.data_gap is False, "jitter must not flag a data gap"
     assert DEBUG_CAT_DATA_GAP not in capture.categories
+
+
+async def test_v2_double_counter_reset_in_one_session_preserves_energy(
+    hass: HomeAssistant,
+) -> None:
+    """Review F3: a SECOND reset in the same session must also be detected.
+
+    Boot-looping charger: start=100, +5 kWh, reset→0.2, +2.8 kWh, reset→0.05,
+    +1 kWh → 8.8 kWh total preserved, two DATA_GAP log entries. Previously the
+    detection compared against the (rebased, now negative) energy_start_kwh,
+    so the second reset went undetected and silently dropped inter-reset energy.
+    """
+    _entry, engine = await _make_v2_session(hass, start_energy="100.0")
+    capture = _CaptureLogger()
+    engine._debug_logger = capture
+    session = engine.active_session
+    assert session.energy_start_kwh == pytest.approx(100.0)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # +5 kWh of normal charging.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "105.0")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(5.0, abs=0.001)
+
+        # First reset: charger reboots, counter restarts near zero.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.2")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(5.0, abs=0.001), (
+            "first reset must preserve the 5 kWh accumulated so far"
+        )
+
+        # +2.8 kWh after the first reset (counter 0.2 → 3.0).
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "3.0")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(7.8, abs=0.001)
+
+        # Second reset in the SAME session: counter drops 3.0 → 0.05.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.05")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(7.8, abs=0.001), (
+            "F3: the second reset must be detected against the PREVIOUS reading "
+            "— inter-reset energy must not be silently dropped"
+        )
+
+        # +1 kWh after the second reset (counter 0.05 → 1.05).
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "1.05")
+        await hass.async_block_till_done()
+
+    assert session.energy_kwh == pytest.approx(8.8, abs=0.001), (
+        "total energy across two resets must be 5 + 2.8 + 1 = 8.8 kWh"
+    )
+    assert session.data_gap is True
+    assert capture.categories.count(DEBUG_CAT_DATA_GAP) == 2, (
+        f"each reset must log one DATA_GAP entry; saw {capture.categories}"
+    )

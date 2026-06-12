@@ -805,10 +805,7 @@ class PlugAnchoredSessionEngine:
         if self._pricing.mode == "spot" and self._hourly_unsub is None:
             self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
             self._hour_energy_snapshot = max(0.0, current_energy - session.energy_start_kwh)
-            self._hourly_unsub = async_track_utc_time_change(
-                self._hass, self._async_hourly_snapshot, minute=0, second=0
-            )
-            self._engine_unsubs.append(self._hourly_unsub)
+            self._arm_hourly_spot_callback()
             if self._debug_logger:
                 self._debug_logger.log(
                     DEBUG_CAT_SESSION_RESUMED,
@@ -2142,18 +2139,7 @@ class PlugAnchoredSessionEngine:
                 self._active_session.price_details = []
                 self._hour_energy_snapshot = 0.0
                 self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-                # PR-27 FR-017: arm only when no hourly callback is active —
-                # overwriting a live handle would leak it (never cancelled)
-                # and duplicate every hourly price entry.
-                if self._hourly_unsub is None:
-                    self._hourly_unsub = async_track_utc_time_change(
-                        self._hass, self._async_hourly_snapshot, minute=0, second=0
-                    )
-                    # BUG-6 fix: do NOT call entry.async_on_unload here. Each session
-                    # would leak a stale callback into the entry's unload list because
-                    # _async_complete_session cancels the handle but cannot remove it
-                    # from the list. Manage lifecycle ourselves via async_unload() below.
-                    self._engine_unsubs.append(self._hourly_unsub)
+                self._arm_hourly_spot_callback()
 
             # Story 07: check for unmapped RFID and trigger passive notification if needed
             if session_user_type == "unknown" and resolution is not None:
@@ -2645,11 +2631,7 @@ class PlugAnchoredSessionEngine:
             #    pricing exactly once (no duplicate final price_details entry).
             if spot_final_appended and session.price_details:
                 session.price_details.pop()
-                if self._hourly_unsub is None:
-                    self._hourly_unsub = async_track_utc_time_change(
-                        self._hass, self._async_hourly_snapshot, minute=0, second=0
-                    )
-                    self._engine_unsubs.append(self._hourly_unsub)
+                self._arm_hourly_spot_callback()
             self._active_session = session
             raise
 
@@ -2799,6 +2781,23 @@ class PlugAnchoredSessionEngine:
     # -----------------------------------------------------------------------
     # Spot pricing hourly callback
     # -----------------------------------------------------------------------
+
+    def _arm_hourly_spot_callback(self) -> None:
+        """Arm the spot-pricing hourly snapshot callback.
+
+        PR-27 FR-017: arm only when no hourly callback is active —
+        overwriting a live handle would leak it (never cancelled)
+        and duplicate every hourly price entry.
+        """
+        if self._hourly_unsub is None:
+            self._hourly_unsub = async_track_utc_time_change(
+                self._hass, self._async_hourly_snapshot, minute=0, second=0
+            )
+            # BUG-6 fix: do NOT call entry.async_on_unload here. Each session
+            # would leak a stale callback into the entry's unload list because
+            # _async_complete_session cancels the handle but cannot remove it
+            # from the list. Manage lifecycle ourselves via async_unload().
+            self._engine_unsubs.append(self._hourly_unsub)
 
     @callback
     def _async_hourly_snapshot(self, now: datetime) -> None:

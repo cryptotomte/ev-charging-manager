@@ -241,6 +241,11 @@ class PlugAnchoredSessionEngine:
         # Offline state tracking (FR-028: all-entities-unavailable must NOT trigger grace timer)
         self._charger_offline: bool = False
         self._offline_entities_count: int = 0
+        # PR-27 FR-020: True when a transient-disconnect grace was pending at
+        # the moment a full charger outage was detected (or expired suppressed
+        # during one). At outage resolution a FRESH full grace is re-armed and
+        # the normal triggers (re-plug absorption, unlock confirmation) decide.
+        self._grace_pending_at_outage: bool = False
 
         # Guest pricing snapshot (PR-06 — snapshotted at SESSION_START)
         self._guest_pricing: GuestPricing | None = None
@@ -402,6 +407,27 @@ class PlugAnchoredSessionEngine:
         Called from __init__.async_unload_entry. Listeners registered via
         entry.async_on_unload are torn down by HA itself.
         """
+        # PR-27 FR-019: persist a final active-session snapshot so a reload
+        # mid-session loses at most seconds — not up to a full periodic-save
+        # interval — of tracked state. The FR-011 completed-id guard inside
+        # the store prevents this write from resurrecting a session whose
+        # completion just finished.
+        if self._active_session is not None:
+            try:
+                await self._session_store.async_save_active_session(
+                    self._active_session.to_dict()
+                )
+                _LOGGER.debug(
+                    "PlugAnchoredSessionEngine: final active-session snapshot "
+                    "persisted at unload (id=%s)",
+                    self._active_session.id,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "PlugAnchoredSessionEngine: final snapshot write at unload failed: %s",
+                    err,
+                )
+
         # Cancel idle/grace timers if still pending.
         self._cancel_idle_timer()
         self._cancel_grace_timer()
@@ -1223,6 +1249,25 @@ class PlugAnchoredSessionEngine:
                     DEBUG_CAT_CHARGER_BACK_ONLINE,
                     f"plug entity back online (value={new_val})",
                 )
+            # PR-27 FR-020: the outage interrupted an open grace question.
+            # Re-arm a FRESH full grace and let the normal triggers decide
+            # (re-plug absorption, cable-lock unlock confirmation). The
+            # boot-sequence plug=off itself is swallowed — entities flap while
+            # the charger restarts, exactly when not to take irreversible
+            # action (research R5; clarification 2026-06-11).
+            if self._grace_pending_at_outage:
+                self._grace_pending_at_outage = False
+                if self._active_session is not None and new_val == "off":
+                    self._start_grace_timer()
+                    if self._debug_logger:
+                        self._debug_logger.log(
+                            DEBUG_CAT_DISCONNECT_DETECTED,
+                            "fresh full grace timer armed at outage resolution "
+                            "(plug=off) — normal triggers will decide (FR-020)",
+                        )
+                    return
+                # plug == "on": fall through — _handle_plug_on absorbs the
+                # disconnect as transient (existing behavior).
 
         if new_val == "on":
             self._handle_plug_on()
@@ -1447,6 +1492,20 @@ class PlugAnchoredSessionEngine:
             # PR-27 FR-009: a fired timer clears its handle immediately, so
             # "grace pending" guards can never be satisfied by a stale handle.
             self._disconnect_grace_cancel = None
+            if self._charger_offline:
+                # PR-27 FR-020: a timer that expired while every signal was
+                # absent has no evidence to act on — never force-complete
+                # mid-outage. Keep the grace question open; the outage
+                # resolution path arms a fresh full grace.
+                self._grace_pending_at_outage = True
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        DEBUG_CAT_CHARGER_OFFLINE,
+                        f"grace timer expired during full charger outage after {grace_min} min "
+                        "— completion suppressed; a fresh grace will be armed at "
+                        "outage resolution (FR-020)",
+                    )
+                return
             if self._state != SessionEngineState.TRACKING:
                 return
             if self._debug_logger:
@@ -1634,9 +1693,11 @@ class PlugAnchoredSessionEngine:
             self._open_window(now)
 
         elif not is_charging and tracker.is_open():
-            # Power dropped to 0 within an open window — start idle timer
-            self._cancel_idle_timer()
-            self._start_idle_timer(now)
+            # Power dropped to 0 within an open window — arm the idle timer.
+            # PR-27 FR-016: only when none is pending — repeated zero-power
+            # events must not push the deadline out indefinitely.
+            if self._idle_timer_cancel is None:
+                self._start_idle_timer(now)
 
         elif is_charging and tracker.is_open() and not was_charging:
             # Power resumed within an open window (was 0, now > 0, window already open)
@@ -1944,14 +2005,18 @@ class PlugAnchoredSessionEngine:
                 self._active_session.price_details = []
                 self._hour_energy_snapshot = 0.0
                 self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-                self._hourly_unsub = async_track_utc_time_change(
-                    self._hass, self._async_hourly_snapshot, minute=0, second=0
-                )
-                # BUG-6 fix: do NOT call entry.async_on_unload here. Each session would
-                # leak a stale callback into the entry's unload list because
-                # _async_complete_session cancels the handle but cannot remove it from
-                # the list. Manage lifecycle ourselves via async_unload() below.
-                self._engine_unsubs.append(self._hourly_unsub)
+                # PR-27 FR-017: arm only when no hourly callback is active —
+                # overwriting a live handle would leak it (never cancelled)
+                # and duplicate every hourly price entry.
+                if self._hourly_unsub is None:
+                    self._hourly_unsub = async_track_utc_time_change(
+                        self._hass, self._async_hourly_snapshot, minute=0, second=0
+                    )
+                    # BUG-6 fix: do NOT call entry.async_on_unload here. Each session
+                    # would leak a stale callback into the entry's unload list because
+                    # _async_complete_session cancels the handle but cannot remove it
+                    # from the list. Manage lifecycle ourselves via async_unload() below.
+                    self._engine_unsubs.append(self._hourly_unsub)
 
             # Story 07: check for unmapped RFID and trigger passive notification if needed
             if session_user_type == "unknown" and resolution is not None:
@@ -2010,6 +2075,19 @@ class PlugAnchoredSessionEngine:
             self._state = SessionEngineState.IDLE
             self._active_session = None
             self._rfid_wait = None
+            # PR-27 FR-017: a failed start must cancel the hourly spot callback
+            # it may have armed, or the next spot session would run with a
+            # leaked duplicate (double hourly price entries).
+            if self._hourly_unsub is not None:
+                try:
+                    self._engine_unsubs.remove(self._hourly_unsub)
+                except ValueError:
+                    pass
+                try:
+                    self._hourly_unsub()
+                except Exception as unsub_err:  # noqa: BLE001
+                    _LOGGER.debug("hourly_unsub cancel failed after start failure: %s", unsub_err)
+                self._hourly_unsub = None
             # Surface to the user via persistent notification (mirror BUG-4 pattern).
             try:
                 persistent_notification.async_create(
@@ -2227,11 +2305,13 @@ class PlugAnchoredSessionEngine:
 
             # Compute final durations
             connected_at_str = session.connected_at or session.started_at
+            connection_parse_failed = False
             try:
                 connected_at = datetime.fromisoformat(connected_at_str)
                 connection_s = max(0, int((disconnect_time - connected_at).total_seconds()))
             except (ValueError, TypeError):
                 connection_s = 0
+                connection_parse_failed = True
                 # A malformed connected_at silently zeroes connection_duration and can push
                 # the session under the micro-filter threshold, discarding it without trace.
                 # Log it so a silently-dropped session is auditable.
@@ -2308,7 +2388,24 @@ class PlugAnchoredSessionEngine:
                 self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
                 / 1000.0
             )
-            is_micro = connection_s < min_duration or session.energy_kwh < min_energy_kwh
+            if connection_parse_failed:
+                # PR-27 FR-018: the duration evidence is meaningless (parse
+                # failure zeroed it) — require BOTH criteria to discard, so a
+                # malformed timestamp can never throw away real energy. A
+                # genuine blip still matches (near-zero energy too). Sessions
+                # kept this way carry data_gap=True (unreliable duration).
+                is_micro = connection_s < min_duration and session.energy_kwh < min_energy_kwh
+                if not is_micro:
+                    session.data_gap = True
+                    self._data_gap = True
+                    if self._debug_logger:
+                        self._debug_logger.log(
+                            DEBUG_CAT_DATA_GAP,
+                            f"connected_at unparseable for session_id={session.id} — "
+                            "kept (energy above micro threshold), data_gap=True (FR-018)",
+                        )
+            else:
+                is_micro = connection_s < min_duration or session.energy_kwh < min_energy_kwh
 
             if self._debug_logger:
                 h = connection_s // 3600
@@ -2428,6 +2525,8 @@ class PlugAnchoredSessionEngine:
             # cannot be applied to a later, unrelated completion (D7).
             self._plug_off_at = None
             self._data_gap_before_disconnect = None
+            # PR-27 FR-020: the grace question (if any) is settled by this completion.
+            self._grace_pending_at_outage = False
             self._eto_start = None
             self._state = SessionEngineState.IDLE
 
@@ -2520,6 +2619,9 @@ class PlugAnchoredSessionEngine:
 
         if all_offline and not self._charger_offline:
             self._charger_offline = True
+            # PR-27 FR-020: remember whether a grace question was open when the
+            # outage began — resolution re-arms a fresh full grace in that case.
+            self._grace_pending_at_outage = self._disconnect_grace_cancel is not None
             if self._active_session is not None:
                 self._active_session.data_gap = True
                 self._data_gap = True

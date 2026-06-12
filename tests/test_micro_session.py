@@ -372,3 +372,84 @@ async def test_v2_recovery_as_micro_clears_snapshot_once(hass: HomeAssistant):
         sessions2, snapshot2 = await store2.async_load()
     assert sessions2 == []
     assert snapshot2 is None, "second restart must not recover the discarded micro session"
+
+
+# ---------------------------------------------------------------------------
+# PR-27 US5 / FR-018: micro filter uses AND semantics when the connection
+# timestamp cannot be parsed (duration evidence is meaningless)
+# ---------------------------------------------------------------------------
+
+
+async def test_v2_unparseable_connected_at_with_substantial_energy_kept(
+    hass: HomeAssistant,
+):
+    """FR-018: malformed connected_at + 30 kWh → session KEPT, persisted with
+    data_gap=True. Previously the zeroed duration alone discarded it as micro."""
+    entry = await _make_v2_entry(hass)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Start a session and deliver substantial energy.
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_POWER_ENTITY, "7200.0")
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "30.0")
+        await hass.async_block_till_done()
+        assert engine.active_session is not None
+        assert engine.active_session.energy_kwh > 1.0
+
+        # Corrupt the connection timestamp (e.g. storage corruption / clock bug).
+        engine.active_session.connected_at = "not-a-timestamp"
+        engine.active_session.started_at = "not-a-timestamp"
+
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert len(session_store.sessions) == 1, (
+        "FR-018: a 30 kWh session must NOT be discarded as micro on a malformed timestamp"
+    )
+    assert session_store.sessions[0]["data_gap"] is True, (
+        "FR-018: a session kept despite an unparseable connected_at carries data_gap=True"
+    )
+    assert len(completed_events) == 1
+
+
+async def test_v2_unparseable_connected_at_with_near_zero_energy_discarded(
+    hass: HomeAssistant,
+):
+    """FR-018 control: malformed connected_at + near-zero energy → still a
+    micro discard (AND semantics: both criteria met)."""
+    entry = await _make_v2_entry(hass)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.001")  # ~1 Wh
+        await hass.async_block_till_done()
+        assert engine.active_session is not None
+
+        engine.active_session.connected_at = "not-a-timestamp"
+        engine.active_session.started_at = "not-a-timestamp"
+
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert len(session_store.sessions) == 0, (
+        "FR-018: a genuine blip (near-zero energy) stays discarded even on parse failure"
+    )
+    assert len(completed_events) == 0

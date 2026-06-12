@@ -359,9 +359,7 @@ async def test_legacy_cleanup_runs_even_when_setup_fails_early(
         await hass.async_block_till_done()
 
     assert entry.state is not ConfigEntryState.LOADED, "Setup must fail in this scenario"
-    assert not legacy.exists(), (
-        "Legacy www/ cleanup must run before anything that can fail setup"
-    )
+    assert not legacy.exists(), "Legacy www/ cleanup must run before anything that can fail setup"
 
 
 async def test_legacy_file_missing_is_noop(hass: HomeAssistant, tmp_path) -> None:

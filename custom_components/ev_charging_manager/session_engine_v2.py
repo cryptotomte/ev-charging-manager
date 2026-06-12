@@ -925,11 +925,20 @@ class PlugAnchoredSessionEngine:
         connected_at_str = snapshot.get("connected_at") or snapshot.get(
             "started_at", now.isoformat()
         )
+        connection_parse_failed = False
         try:
             connected_at = datetime.fromisoformat(connected_at_str)
             connection_s = max(0, int((now - connected_at).total_seconds()))
         except (ValueError, TypeError):
             connection_s = 0
+            connection_parse_failed = True
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine recovery: malformed connected_at=%r for "
+                "snapshot id=%s — connection_duration_s set to 0; micro filter "
+                "falls back to AND semantics (FR-018)",
+                connected_at_str,
+                snapshot.get("id", "?"),
+            )
 
         charging_duration_s = int(
             snapshot.get("charging_duration_s") or snapshot.get("duration_seconds", 0)
@@ -975,7 +984,22 @@ class PlugAnchoredSessionEngine:
             self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
             / 1000.0
         )
-        is_micro = connection_s < min_duration or session.energy_kwh < min_energy_kwh
+        if connection_parse_failed:
+            # PR-27 FR-018 (recovery path, review F4): the duration evidence is
+            # meaningless (parse failure zeroed it) — require BOTH criteria to
+            # discard, mirroring the live path in _async_complete_session_impl.
+            # Otherwise a corrupt timestamp discards real energy AND the
+            # snapshot-clear below makes it irrecoverable. Kept sessions already
+            # carry data_gap=True (set unconditionally in this path).
+            is_micro = connection_s < min_duration and session.energy_kwh < min_energy_kwh
+            if not is_micro and self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_DATA_GAP,
+                    f"connected_at unparseable for recovered snapshot id={session.id} — "
+                    "kept (energy above micro threshold), data_gap=True (FR-018)",
+                )
+        else:
+            is_micro = connection_s < min_duration or session.energy_kwh < min_energy_kwh
 
         if not is_micro:
             await self._session_store.add_session(session.to_dict())
@@ -1836,9 +1860,7 @@ class PlugAnchoredSessionEngine:
         # Comparing against energy_start_kwh would miss a SECOND reset in the
         # same session: the first rebase can push energy_start_kwh negative,
         # so no later near-zero reading would ever undercut it (review F3).
-        reference_kwh = (
-            prev_energy_kwh if prev_energy_kwh is not None else session.energy_start_kwh
-        )
+        reference_kwh = prev_energy_kwh if prev_energy_kwh is not None else session.energy_start_kwh
         if energy_kwh < reference_kwh - ENERGY_RESET_EPSILON_KWH:
             old_start = session.energy_start_kwh
             session.energy_start_kwh = energy_kwh - session.energy_kwh

@@ -421,6 +421,67 @@ async def test_v2_unparseable_connected_at_with_substantial_energy_kept(
     assert len(completed_events) == 1
 
 
+async def test_v2_recovery_unparseable_connected_at_with_substantial_energy_kept(
+    hass: HomeAssistant,
+):
+    """FR-018 (recovery path): a recovery snapshot with a corrupt connected_at
+    and 30 kWh must be persisted (data_gap=True) — not discarded as micro.
+
+    Previously the parse failure zeroed connection_s, the OR-filter classified
+    the session as micro regardless of energy, and the snapshot-clear made the
+    30 kWh irrecoverable (review F4)."""
+    snapshot = _make_micro_snapshot("not-a-timestamp", energy_kwh=30.0)
+    completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    # plug=off at restart → snapshot is finalized via _complete_snapshot_as_session.
+    entry = await _make_v2_entry(
+        hass,
+        snapshot=snapshot,
+        plug_state="off",
+        energy_state="30.0",
+    )
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1, (
+        "FR-018 (recovery): a 30 kWh snapshot must NOT be discarded as micro "
+        "on a malformed connected_at"
+    )
+    stored = session_store.sessions[0]
+    assert stored["id"] == "micro-snap-001"
+    assert stored["data_gap"] is True, (
+        "FR-018 (recovery): a session kept despite an unparseable timestamp carries data_gap=True"
+    )
+    assert len(completed_events) == 1
+
+
+async def test_v2_recovery_unparseable_connected_at_with_near_zero_energy_discarded(
+    hass: HomeAssistant,
+):
+    """FR-018 control (recovery path): corrupt connected_at + near-zero energy
+    → still a micro discard (AND semantics: both criteria met)."""
+    snapshot = _make_micro_snapshot("not-a-timestamp", energy_kwh=0.001)
+    completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    entry = await _make_v2_entry(
+        hass,
+        snapshot=snapshot,
+        plug_state="off",
+        energy_state="0.001",
+    )
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 0, (
+        "FR-018 control (recovery): a genuine blip stays discarded on parse failure"
+    )
+    assert len(completed_events) == 0
+
+
 async def test_v2_unparseable_connected_at_with_near_zero_energy_discarded(
     hass: HomeAssistant,
 ):

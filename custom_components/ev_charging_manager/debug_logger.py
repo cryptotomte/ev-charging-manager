@@ -7,6 +7,9 @@ location ``{config_dir}/www/`` (served unauthenticated at ``/local/``) is the
 removed legacy location; :func:`async_cleanup_legacy_file` deletes any file
 left there.
 
+All FR-NNN/SC-NNN references in this module refer to PR-28
+(specs/024-debug-logger-overhaul).
+
 I/O model (PR-28)
 -----------------
 ``log()`` is synchronous and MUST only be called from the Home Assistant
@@ -46,7 +49,8 @@ constants live in const.py (``DEBUG_CAT_*``). Current set:
   Sessions:     SESSION_START, SESSION_STOP, ENGINE_DECISION, RFID_READ
   Observation:  CAR_STATE, CAR_STATE_UNAVAIL, PLUG_STATE, CABLE_LOCK,
                 MODEL_STATUS, ERR_STATE, TRX_STATE
-  PR-22 model:  CHARGING_WINDOW_OPEN, CHARGING_WINDOW_CLOSE,
+  v2 engine (PR-22+):
+                CHARGING_WINDOW_OPEN, CHARGING_WINDOW_CLOSE,
                 DISCONNECT_DETECTED, DISCONNECT_RESOLVED,
                 HA_RESTART_DETECTED, SESSION_RESUMED,
                 SESSION_FORCE_ENDED_BY_RESTART,
@@ -243,7 +247,8 @@ class DebugLogger:
         (buffer time), not at flush time. Performs NO file I/O (FR-005/006).
 
         Args:
-            category: Short event category, padded to 15 chars in the output line.
+            category: Short event category, padded to a minimum of 15 chars in
+                the output line (longer categories are not truncated).
             message:  Free-form human-readable event description.
         """
         if not self._enabled or self._closed:

@@ -252,6 +252,11 @@ class DebugLogger:
             try:
                 truncated = await self._hass.async_add_executor_job(_flush_and_truncate)
             except OSError as err:
+                # Review F2: the drained lines must not be lost — the truncation
+                # failed anyway, so re-buffer them for the next regular flush.
+                self._buffer[:0] = lines
+                if self._buffer and not self._closed and self._cancel_flush_timer is None:
+                    self._arm_timer()
                 _LOGGER.warning("DebugLogger: could not clear log file: %s", err)
                 return
 

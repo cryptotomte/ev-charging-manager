@@ -342,6 +342,28 @@ async def test_clear_no_marker_when_disabled(hass: HomeAssistant, tmp_path) -> N
     assert open(logger.file_path, encoding="utf-8").read() == ""
 
 
+async def test_clear_failure_rebuffers_pending_lines(hass: HomeAssistant, tmp_path) -> None:
+    """Review F2: when the clear's executor write fails, the drained lines go
+    back into the buffer (the truncation failed anyway) and reach the file on
+    a later successful flush instead of being silently lost."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)
+    logger.log("CAR_STATE", "pending-at-clear")
+
+    with patch("builtins.open", side_effect=OSError("disk full")):
+        await logger.async_clear()
+
+    assert any("pending-at-clear" in ln for ln in logger._buffer), (
+        "Drained lines must be re-buffered when the clear write fails"
+    )
+
+    await _flush_by_time(hass)
+
+    content = open(logger.file_path, encoding="utf-8").read()
+    assert "pending-at-clear" in content
+    assert logger._buffer == []
+
+
 async def test_clear_noop_when_file_missing(hass: HomeAssistant, tmp_path) -> None:
     """async_clear() with no file and nothing buffered is a silent no-op."""
     logger = DebugLogger(hass, str(tmp_path))

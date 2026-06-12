@@ -204,6 +204,19 @@ class DebugLogger:
             self._enabled = False
         self._closed = True
         await self._async_flush()
+        # Review F3: terminal state — if the final flush failed, the retained
+        # lines can never be written (no further flushes run on a closed
+        # instance). Abandon them with ONE unconditional warning and make sure
+        # no retry timer survives on the abandoned instance.
+        self._cancel_timer()
+        if self._buffer:
+            _LOGGER.warning(
+                "DebugLogger: final flush failed — %d buffered debug log lines "
+                "were abandoned (file: %s)",
+                len(self._buffer),
+                self.file_path,
+            )
+            self._buffer.clear()
 
     def log(self, category: str, message: str) -> None:
         """Buffer one timestamped line if enabled. Sync, EVENT-LOOP ONLY.
@@ -217,7 +230,7 @@ class DebugLogger:
             category: Short event category, padded to 15 chars in the output line.
             message:  Free-form human-readable event description.
         """
-        if not self._enabled:
+        if not self._enabled or self._closed:
             return
         self._buffer.append(self._format_line(category, message))
         self._schedule_flush()
@@ -363,8 +376,10 @@ class DebugLogger:
                         self.file_path,
                     )
                 # Retry via the age timer only — never an immediate task, to
-                # avoid a hot retry loop while the disk stays broken.
-                if self._cancel_flush_timer is None:
+                # avoid a hot retry loop while the disk stays broken. Never
+                # re-arm on a closed instance (review F3): async_disable owns
+                # the abandonment of unwritable lines.
+                if not self._closed and self._cancel_flush_timer is None:
                     self._arm_timer()
             else:
                 self._fail_count = 0

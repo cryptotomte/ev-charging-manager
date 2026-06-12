@@ -264,6 +264,50 @@ async def test_double_disable_writes_single_debug_off(hass: HomeAssistant, tmp_p
     assert "DEBUG_OFF" in lines[-1]
 
 
+async def test_failed_final_flush_abandons_lines_terminally(
+    hass: HomeAssistant, tmp_path, caplog
+) -> None:
+    """Review F3: when the final flush in async_disable() fails, the instance
+    closes terminally — buffer abandoned with ONE unconditional WARNING naming
+    the line count, retry timer cancelled and never re-armed (no zombie 5 s
+    loop on the abandoned instance)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)  # DEBUG_ON to disk
+
+    logger.log("CAR_STATE", "doomed-line")
+    with (
+        patch("builtins.open", side_effect=OSError("disk full")),
+        caplog.at_level(logging.WARNING, logger=debug_logger_module.__name__),
+    ):
+        await logger.async_disable()
+
+    abandoned = [r for r in caplog.records if "abandoned" in r.message]
+    assert len(abandoned) == 1, "Exactly one unconditional abandonment warning"
+    assert "2" in abandoned[0].message  # doomed-line + DEBUG_OFF marker
+
+    # Terminal state: buffer cleared, no timer armed, no flush pending
+    assert logger._buffer == []
+    assert logger._cancel_flush_timer is None
+    assert not logger._flush_scheduled
+
+    # Time passing produces no zombie writes (disk is healthy again here)
+    count_before = len(_read_lines(logger))
+    await _flush_by_time(hass)
+    assert len(_read_lines(logger)) == count_before
+    assert "doomed-line" not in open(logger.file_path, encoding="utf-8").read()
+
+
+async def test_log_after_disable_no_buffer_growth(hass: HomeAssistant, tmp_path) -> None:
+    """Review F3: log() on a closed instance never grows the buffer."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await logger.async_disable()
+
+    logger.log("CAR_STATE", "after close")
+
+    assert logger._buffer == []
+    assert logger._cancel_flush_timer is None
+
+
 async def test_disable_noop_when_never_enabled(hass: HomeAssistant, tmp_path) -> None:
     """async_disable() without prior enable creates no file and does not raise."""
     logger = DebugLogger(hass, str(tmp_path))

@@ -1,17 +1,29 @@
-"""Tests for session recovery after HA restart (PR-03 US1, FR-001 to FR-006, FR-020)."""
+"""Tests for session recovery after HA restart (PR-03 US1, FR-001 to FR-006, FR-020).
+
+PR-27 (023-recovery-hardening) adds a v2-engine section at the bottom:
+recovery energy guard (FR-001/FR-002) — unavailable energy is "no evidence",
+counter-reset detection uses ENERGY_RESET_EPSILON_KWH.
+"""
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_capture_events,
+    async_fire_time_changed,
 )
 
 from custom_components.ev_charging_manager.const import (
+    CONF_CHARGING_IDLE_TIMEOUT_MIN,
+    CONF_DISCONNECT_GRACE_MIN,
+    DEFERRED_RECOVERY_TIMEOUT_MIN,
     DOMAIN,
     EVENT_SESSION_COMPLETED,
     SessionEngineState,
@@ -386,3 +398,239 @@ async def test_no_snapshot_normal_startup(hass: HomeAssistant) -> None:
     engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
     assert engine.state == SessionEngineState.IDLE
     assert engine.active_session is None
+
+
+# ===========================================================================
+# PR-27 (023-recovery-hardening) US1: recovery energy guard on the
+# plug-anchored engine (FR-001, FR-002)
+# ===========================================================================
+
+MOCK_PLUG_ENTITY = "binary_sensor.goe_abc123_car_0"
+MOCK_CABLE_LOCK_ENTITY = "sensor.goe_abc123_cus_value"
+
+
+async def _setup_v2_with_snapshot(
+    hass: HomeAssistant,
+    snapshot: dict,
+    *,
+    plug_state: str = "on",
+    cable_lock_state: str = "Locked",
+    energy_state: str = "13.5",
+    power_state: str = "0.0",
+) -> MockConfigEntry:
+    """Set up the goe_gemini (plug-anchored) engine with a recovery snapshot."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"},
+        options={
+            "plug_entity": MOCK_PLUG_ENTITY,
+            "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
+            CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
+            CONF_DISCONNECT_GRACE_MIN: 10,
+        },
+        title="Test go-e Charger (v2 recovery)",
+    )
+
+    hass.states.async_set(MOCK_PLUG_ENTITY, plug_state)
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, cable_lock_state)
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, energy_state)
+    hass.states.async_set(MOCK_POWER_ENTITY, power_state)
+
+    raw_store_data = {
+        "version": 1,
+        "minor_version": 2,
+        "key": "ev_charging_manager_sessions",
+        "data": [snapshot],
+    }
+    with (
+        patch(
+            "homeassistant.helpers.storage.Store.async_load",
+            new_callable=AsyncMock,
+            return_value=raw_store_data,
+        ),
+        patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
+    ):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    return entry
+
+
+async def test_v2_recovery_energy_unavailable_resumes_with_data_gap(
+    hass: HomeAssistant,
+) -> None:
+    """FR-001: unavailable energy at recovery is 'no evidence' — session RESUMES.
+
+    Previously the unavailable reading collapsed to 0.0 (`or 0.0`), was misread
+    as a counter reset, and the session was force-completed while the cable was
+    still plugged in.
+    """
+    snapshot = make_active_snapshot(
+        session_id="v2-resume-001",
+        energy_start_kwh=10.0,
+        energy_kwh=3.0,
+    )
+    events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    entry = await _setup_v2_with_snapshot(
+        hass,
+        snapshot,
+        plug_state="on",
+        energy_state=STATE_UNAVAILABLE,  # energy sensor not yet loaded at recovery
+        power_state="0.0",
+    )
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING, (
+        "session must RESUME when energy evidence is missing — not complete as a reset"
+    )
+    assert engine.active_session is not None
+    assert engine.active_session.id == "v2-resume-001"
+    assert engine.active_session.data_gap is True, "missing evidence must flag a data gap"
+    # Snapshot energy is carried over while the sensor is away.
+    assert engine.active_session.energy_kwh == pytest.approx(3.0, abs=0.001)
+    assert len(events) == 0, "no completion event may fire on resume"
+
+    # Energy tracking continues once the sensor returns.
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "13.5")
+        await hass.async_block_till_done()
+    assert engine.active_session.energy_kwh == pytest.approx(3.5, abs=0.001), (
+        "energy accumulation must continue from the live counter after the gap"
+    )
+
+
+async def test_v2_recovery_genuine_counter_reset_still_completes(
+    hass: HomeAssistant,
+) -> None:
+    """FR-002 control: a genuine reset (energy available, measurably lower)
+    preserves the existing counter-reset completion behavior."""
+    snapshot = make_active_snapshot(
+        session_id="v2-reset-001",
+        energy_start_kwh=100.0,
+        energy_kwh=5.0,
+    )
+    events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    entry = await _setup_v2_with_snapshot(
+        hass,
+        snapshot,
+        plug_state="on",
+        energy_state="0.3",  # measurably below energy_start=100.0
+        power_state="0.0",
+    )
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.IDLE, (
+        "a genuine counter reset must complete the old session (FR-027 preserved)"
+    )
+    assert len(events) == 1, "exactly one completion event for the reset session"
+    assert events[0].data["session_id"] == "v2-reset-001"
+    assert events[0].data["reconstructed"] is True
+
+
+async def test_v2_recovery_energy_jitter_below_start_is_not_a_reset(
+    hass: HomeAssistant,
+) -> None:
+    """FR-002: a reading lower than start by less than the epsilon is jitter."""
+    snapshot = make_active_snapshot(
+        session_id="v2-jitter-001",
+        energy_start_kwh=10.0,
+        energy_kwh=3.0,
+    )
+    events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    entry = await _setup_v2_with_snapshot(
+        hass,
+        snapshot,
+        plug_state="on",
+        energy_state="9.995",  # 5 Wh below start — within ENERGY_RESET_EPSILON_KWH
+        power_state="0.0",
+    )
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING, (
+        "float jitter below energy_start must not be treated as a counter reset"
+    )
+    assert engine.active_session is not None
+    assert engine.active_session.id == "v2-jitter-001"
+    assert len(events) == 0
+
+
+async def test_v2_deferred_recovery_energy_unavailable_resumes(
+    hass: HomeAssistant,
+) -> None:
+    """FR-001 (deferred path): plug deferred at boot, then plug valid while
+    energy is STILL unavailable → the deferred recovery run must also resume."""
+    snapshot = make_active_snapshot(
+        session_id="v2-deferred-001",
+        energy_start_kwh=10.0,
+        energy_kwh=3.0,
+    )
+    events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    entry = await _setup_v2_with_snapshot(
+        hass,
+        snapshot,
+        plug_state=STATE_UNAVAILABLE,  # defers recovery (BUG-3 path)
+        energy_state=STATE_UNAVAILABLE,
+        power_state="0.0",
+    )
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.active_session is None, "recovery must still be deferred"
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING, (
+        "deferred recovery with unavailable energy must resume, not complete"
+    )
+    assert engine.active_session is not None
+    assert engine.active_session.id == "v2-deferred-001"
+    assert engine.active_session.data_gap is True
+    assert len(events) == 0
+
+
+async def test_v2_recovery_timeout_completes_with_snapshot_energy(
+    hass: HomeAssistant, freezer
+) -> None:
+    """Deferred-timeout path: plug never valid, energy unavailable → snapshot is
+    force-completed using the snapshot's energy values (no crash, no zeroing)."""
+    snapshot = make_active_snapshot(
+        session_id="v2-timeout-001",
+        energy_start_kwh=10.0,
+        energy_kwh=3.0,
+    )
+
+    entry = await _setup_v2_with_snapshot(
+        hass,
+        snapshot,
+        plug_state=STATE_UNAVAILABLE,
+        energy_state=STATE_UNAVAILABLE,
+        power_state="0.0",
+    )
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    assert engine.active_session is None, "recovery must be deferred at boot"
+
+    with (
+        patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
+        patch(
+            "custom_components.ev_charging_manager.session_engine_v2."
+            "persistent_notification.async_create"
+        ),
+    ):
+        freezer.tick(timedelta(minutes=DEFERRED_RECOVERY_TIMEOUT_MIN + 1))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1, "snapshot must be force-completed on timeout"
+    forced = session_store.sessions[0]
+    assert forced["id"] == "v2-timeout-001"
+    assert forced["energy_kwh"] == pytest.approx(3.0, abs=0.001), (
+        "force-completed session must keep the snapshot's energy when no live reading exists"
+    )

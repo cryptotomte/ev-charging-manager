@@ -82,6 +82,7 @@ from .const import (
     DEFAULT_STATIC_PRICE_KWH,
     DEFAULT_UI_DISPATCH_INTERVAL_S,
     DEFERRED_RECOVERY_TIMEOUT_MIN,
+    ENERGY_RESET_EPSILON_KWH,
     EVENT_CHARGING_CHARGED,
     EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
@@ -490,19 +491,38 @@ class PlugAnchoredSessionEngine:
             return
 
         current_cable_lock = self._get_cable_lock()
-        current_energy = self._get_energy() or 0.0
+        # PR-27 FR-001: keep None when the energy entity is unavailable — an
+        # absent reading is "no evidence", never a counter reset.
+        current_energy = self._get_energy()
         current_power = self._get_power() or 0.0
 
         if self._debug_logger:
+            energy_str = (
+                f"{current_energy:.3f}kWh" if current_energy is not None else "unavailable"
+            )
             self._debug_logger.log(
                 DEBUG_CAT_HA_RESTART_DETECTED,
                 f"restart detected — snapshot id={snapshot.get('id', '?')} "
                 f"current_plug={current_plug} cable_lock={current_cable_lock} "
-                f"power={current_power:.0f}W energy={current_energy:.3f}kWh",
+                f"power={current_power:.0f}W energy={energy_str}",
             )
 
         energy_start = float(snapshot.get("energy_start_kwh", 0.0))
-        energy_counter_reset = current_energy < energy_start
+        # PR-27 FR-002: only an available reading measurably below the session's
+        # start value is a reset; the epsilon kills float jitter false positives.
+        energy_counter_reset = (
+            current_energy is not None
+            and current_energy < energy_start - ENERGY_RESET_EPSILON_KWH
+        )
+
+        # Effective energy for downstream use: when the live reading is missing,
+        # reconstruct it from the snapshot (start + accumulated) so the session
+        # resumes/completes with its last known values (FR-001).
+        effective_energy = (
+            current_energy
+            if current_energy is not None
+            else energy_start + float(snapshot.get("energy_kwh", 0.0))
+        )
 
         # Determine whether plug is currently on (explicit string compare;
         # None was handled by the early return above).
@@ -510,7 +530,9 @@ class PlugAnchoredSessionEngine:
 
         if plug_on and not energy_counter_reset:
             # Cable still in — resume the session (FR-026)
-            await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
+            await self._resume_session_from_snapshot(
+                snapshot, effective_energy, current_power, now
+            )
         else:
             # Cable removed or energy counter reset — complete the old session (FR-027)
             reason = "energy counter reset" if energy_counter_reset else "plug was off at restart"
@@ -519,7 +541,7 @@ class PlugAnchoredSessionEngine:
                 reason,
                 snapshot.get("id", "?"),
             )
-            await self._complete_snapshot_as_session(snapshot, current_energy, now)
+            await self._complete_snapshot_as_session(snapshot, effective_energy, now)
 
             if self._debug_logger:
                 self._debug_logger.log(
@@ -626,9 +648,13 @@ class PlugAnchoredSessionEngine:
             # path but with restart-time as disconnected_at).
             try:
                 now = dt_util.utcnow()
-                current_energy = self._get_energy() or float(
-                    snapshot.get("energy_start_kwh", 0.0)
-                ) + float(snapshot.get("energy_kwh", 0.0))
+                # PR-27 FR-001: explicit None check — a genuine 0.0 reading is
+                # evidence and must not fall through to the snapshot fallback.
+                current_energy = self._get_energy()
+                if current_energy is None:
+                    current_energy = float(snapshot.get("energy_start_kwh", 0.0)) + float(
+                        snapshot.get("energy_kwh", 0.0)
+                    )
                 await self._complete_snapshot_as_session(snapshot, current_energy, now)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error(
@@ -694,6 +720,10 @@ class PlugAnchoredSessionEngine:
         self._last_energy_kwh = current_energy
         self._last_power_w = current_power
         self._state = SessionEngineState.TRACKING
+        # PR-27: mirror the session-level flag (FR-026 sets data_gap=True on every
+        # restart resume) on the engine flag, so completion's
+        # `session.data_gap = self._data_gap` transfer cannot wipe it later.
+        self._data_gap = True
 
         # BUG-2 fix: re-arm the spot-pricing hourly snapshot callback after restart.
         # Without this, _hourly_unsub stays None, the hourly callback never fires,

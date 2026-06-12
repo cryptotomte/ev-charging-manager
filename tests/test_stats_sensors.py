@@ -147,10 +147,16 @@ async def test_sensor_unique_ids_follow_entry_slug_metric_pattern(
         assert entity is not None
 
 
-async def test_sensor_values_zero_before_any_session(
+async def test_sensor_unavailable_before_first_session_bucket_absent(
     hass: HomeAssistant, stats_entry_with_user: MockConfigEntry
 ) -> None:
-    """Stats sensors show 0 for totals before any session (not unavailable)."""
+    """PR-29 (FR-007): a configured user with NO stored bucket → unavailable, never 0.
+
+    Petra's bucket is created at her FIRST completed session. Until then her
+    statistics are indeterminable — reporting 0 would arm HA's long-term-
+    statistics meter-reset detection (the LTS double-count vector). Before
+    PR-29 these sensors reported 0/0.0 here.
+    """
     entry = stats_entry_with_user
     registry = er.async_get(hass)
 
@@ -164,6 +170,32 @@ async def test_sensor_values_zero_before_any_session(
         assert entity_id is not None
         state = hass.states.get(entity_id)
         assert state is not None
+        assert state.state == STATE_UNAVAILABLE, (
+            f"FR-007: {metric} must be unavailable while Petra's bucket is absent, "
+            f"got {state.state!r}"
+        )
+
+
+async def test_sensor_values_zero_for_fresh_existing_bucket(
+    hass: HomeAssistant, stats_entry: MockConfigEntry
+) -> None:
+    """FR-007: a bucket that EXISTS with zero totals reports 0/0.0 (unchanged).
+
+    The 'Unknown' bucket is force-created at StatsEngine setup with zero
+    totals — the canonical fresh-existing-bucket case.
+    """
+    entry = stats_entry
+    registry = er.async_get(hass)
+
+    for metric in ["total_energy", "total_cost", "session_count"]:
+        uid = f"{entry.entry_id}_unknown_{metric}"
+        entity_id = registry.async_get_entity_id("sensor", DOMAIN, uid)
+        assert entity_id is not None
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state != STATE_UNAVAILABLE, (
+            f"FR-007: Unknown's {metric} bucket exists (zero totals) — must report 0"
+        )
         assert float(state.state) == 0.0
 
 
@@ -608,3 +640,167 @@ async def test_guest_total_sensors_ignore_regular_users(
     state = hass.states.get(cost_id)
     # Only guest cost: 25.0
     assert float(state.state) == pytest.approx(25.0, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# PR-29 (US4/FR-007): unavailable instead of 0 when stats are indeterminable
+# ---------------------------------------------------------------------------
+
+
+def _all_stats_uids(entry_id: str, user_slug: str) -> list[str]:
+    """Return the unique_ids of every stats sensor for one user + all guest sensors."""
+    per_user = [
+        f"{entry_id}_{user_slug}_{metric}"
+        for metric in [
+            "total_energy",
+            "total_cost",
+            "session_count",
+            "avg_session_energy",
+            "last_session",
+        ]
+    ]
+    guest = [
+        f"{entry_id}_guest_last_energy",
+        f"{entry_id}_guest_last_charge_price",
+        f"{entry_id}_guest_total_energy",
+        f"{entry_id}_guest_total_cost",
+    ]
+    return per_user + guest
+
+
+def _dispatch_stats(hass: HomeAssistant, entry_id: str) -> None:
+    """Fire SIGNAL_STATS_UPDATE to force a stats-sensor re-render."""
+    from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+    from custom_components.ev_charging_manager.const import SIGNAL_STATS_UPDATE
+
+    async_dispatcher_send(hass, SIGNAL_STATS_UPDATE.format(entry_id))
+
+
+async def test_all_stats_sensors_unavailable_when_engine_absent(
+    hass: HomeAssistant, stats_entry_with_user: MockConfigEntry
+) -> None:
+    """FR-007: stats engine removed from hass.data → EVERY stats sensor unavailable (not 0).
+
+    Simulates the teardown/reload race where sensors render while the engine
+    is gone. Before PR-29 the total sensors reported 0/0.0 here — the exact
+    LTS meter-reset precondition.
+    """
+    from homeassistant.util import slugify
+
+    entry = stats_entry_with_user
+    registry = er.async_get(hass)
+
+    # Remove the stats engine (teardown race simulation)
+    del hass.data[DOMAIN][entry.entry_id]["stats_engine"]
+    _dispatch_stats(hass, entry.entry_id)
+    await hass.async_block_till_done()
+
+    for uid in _all_stats_uids(entry.entry_id, slugify("Petra")):
+        entity_id = registry.async_get_entity_id("sensor", DOMAIN, uid)
+        assert entity_id is not None, f"Missing sensor: {uid}"
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_UNAVAILABLE, (
+            f"FR-007: {uid} must be unavailable with the stats engine absent, "
+            f"got {state.state!r}"
+        )
+
+
+async def test_stats_sensors_flip_available_when_bucket_appears(
+    hass: HomeAssistant, stats_entry_with_user: MockConfigEntry
+) -> None:
+    """FR-007 (T008d): a new user's first session creates the bucket and the
+    dispatcher signal flips the sensors from unavailable to available."""
+    from homeassistant.util import slugify
+
+    entry = stats_entry_with_user
+    registry = er.async_get(hass)
+    slug = slugify("Petra")
+
+    energy_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_{slug}_total_energy"
+    )
+
+    # Before the first session: bucket absent → unavailable
+    assert hass.states.get(energy_id).state == STATE_UNAVAILABLE
+
+    # First session creates the bucket; the engine dispatches SIGNAL_STATS_UPDATE
+    hass.bus.async_fire(
+        EVENT_SESSION_COMPLETED,
+        {
+            "user_name": "Petra",
+            "user_type": "regular",
+            "energy_kwh": 12.4,
+            "cost_kr": 31.0,
+            "started_at": "2026-06-12T10:00:00+00:00",
+            "ended_at": "2026-06-12T10:30:00+00:00",
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(energy_id)
+    assert state.state != STATE_UNAVAILABLE, (
+        "FR-007: total_energy must flip to available on the dispatcher signal "
+        "after the bucket is created"
+    )
+    assert float(state.state) == 12.4
+
+
+async def test_sc004_no_zero_between_real_totals_across_engine_absence(
+    hass: HomeAssistant, stats_entry_with_user: MockConfigEntry
+) -> None:
+    """SC-004 pin: real total → engine absent → real total NEVER passes through 0.
+
+    The observed state sequence across the engine-absent episode must be
+    12.4 → unavailable → 12.4. A 0 anywhere in between would make HA's
+    long-term statistics record a meter reset and double-count the user's
+    lifetime energy in the Energy dashboard.
+    """
+    from homeassistant.util import slugify
+
+    entry = stats_entry_with_user
+    registry = er.async_get(hass)
+    slug = slugify("Petra")
+
+    energy_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_{slug}_total_energy"
+    )
+
+    # Establish a real total
+    hass.bus.async_fire(
+        EVENT_SESSION_COMPLETED,
+        {
+            "user_name": "Petra",
+            "user_type": "regular",
+            "energy_kwh": 12.4,
+            "cost_kr": 31.0,
+            "started_at": "2026-06-12T10:00:00+00:00",
+            "ended_at": "2026-06-12T10:30:00+00:00",
+        },
+    )
+    await hass.async_block_till_done()
+
+    observed: list[str] = [hass.states.get(energy_id).state]
+    assert float(observed[0]) == 12.4
+
+    # Engine disappears (teardown race) — sensor re-renders
+    engine = hass.data[DOMAIN][entry.entry_id].pop("stats_engine")
+    _dispatch_stats(hass, entry.entry_id)
+    await hass.async_block_till_done()
+    observed.append(hass.states.get(energy_id).state)
+
+    # Engine returns — sensor re-renders with the real total again
+    hass.data[DOMAIN][entry.entry_id]["stats_engine"] = engine
+    _dispatch_stats(hass, entry.entry_id)
+    await hass.async_block_till_done()
+    observed.append(hass.states.get(energy_id).state)
+
+    assert observed[1] == STATE_UNAVAILABLE, (
+        f"SC-004: engine-absent render must be unavailable, got {observed[1]!r}"
+    )
+    assert float(observed[2]) == 12.4
+    assert "0" not in observed and "0.0" not in observed, (
+        f"SC-004: the LTS meter-reset precondition (a 0 between two real totals) "
+        f"must be unconstructable — observed sequence: {observed}"
+    )

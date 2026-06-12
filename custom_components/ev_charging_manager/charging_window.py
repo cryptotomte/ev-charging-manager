@@ -110,10 +110,35 @@ class ChargingWindowTracker:
         """Initialize with empty window lists."""
         self._closed_windows: list[ChargingWindow] = []
         self._active_window: ChargingWindow | None = None
+        # PR-27 FR-012: pre-restart base offsets, seeded at snapshot resume.
+        # Added to the live totals so window-close and completion accumulate on
+        # top of pre-restart charging time instead of overwriting it (A1 fix).
+        self._base_duration_s: int = 0
+        self._base_window_count: int = 0
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def seed_base(self, duration_s: int, window_count: int) -> None:
+        """Seed pre-restart charging aggregates as a base offset (PR-27 FR-012).
+
+        Called at most once, during restart-recovery resume, with the
+        snapshot's persisted ``charging_duration_s`` / ``charging_window_count``
+        (or the closed-window remainder when a synthetic window already covers
+        the open pre-restart window — see session_engine_v2 resume logic).
+
+        ``total_charging_duration_s()`` and ``window_count()`` include the
+        base; ``closed_window_count()`` and the window lists stay live-only
+        (they index per-window events and attributes for windows actually
+        observed by this tracker instance).
+
+        Args:
+            duration_s: Pre-restart charging seconds to carry forward (>= 0).
+            window_count: Pre-restart window count to carry forward (>= 0).
+        """
+        self._base_duration_s = max(0, int(duration_s))
+        self._base_window_count = max(0, int(window_count))
 
     def open_window(self, now: datetime, energy_kwh: float) -> ChargingWindow:
         """Open a new charging window at the given time and counter reading.
@@ -228,9 +253,12 @@ class ChargingWindowTracker:
         return None
 
     def window_count(self) -> int:
-        """Return total number of windows opened (closed + potentially open)."""
+        """Return total number of windows (base + closed + potentially open).
+
+        Includes the pre-restart base seeded via seed_base() (PR-27 FR-012).
+        """
         open_count = 1 if self.is_open() else 0
-        return len(self._closed_windows) + open_count
+        return self._base_window_count + len(self._closed_windows) + open_count
 
     def closed_window_count(self) -> int:
         """Return number of fully closed windows."""
@@ -240,8 +268,9 @@ class ChargingWindowTracker:
         """Return total charging duration in seconds across all windows.
 
         For the open window (if any), uses `now` as the current time.
+        Includes the pre-restart base seeded via seed_base() (PR-27 FR-012).
         """
-        total = sum(w.duration_s() for w in self._closed_windows)
+        total = self._base_duration_s + sum(w.duration_s() for w in self._closed_windows)
         if self._active_window is not None and self._active_window.is_open:
             total += self._active_window.duration_s(now)
         return total

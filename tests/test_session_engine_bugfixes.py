@@ -135,6 +135,54 @@ def test_bug5_charging_window_tracker_open_close_uses_tz_aware() -> None:
 
 
 # ---------------------------------------------------------------------------
+# PR-27 (023-recovery-hardening) US3 / FR-012: ChargingWindowTracker base
+# offsets — pre-restart aggregates seeded at resume, additive with live windows
+# ---------------------------------------------------------------------------
+
+
+def test_tracker_zero_seed_behaves_like_today() -> None:
+    """A tracker without (or with a zero) seed behaves exactly like before."""
+    tracker = ChargingWindowTracker()
+    now = dt_util.utcnow()
+    tracker.open_window(now, energy_kwh=0.0)
+    tracker.close_window(now + timedelta(minutes=10), energy_kwh=3.0)
+
+    assert tracker.total_charging_duration_s() == 600
+    assert tracker.window_count() == 1
+    assert tracker.closed_window_count() == 1
+
+    # Explicit zero seed must be a no-op as well.
+    tracker2 = ChargingWindowTracker()
+    tracker2.seed_base(0, 0)
+    assert tracker2.total_charging_duration_s() == 0
+    assert tracker2.window_count() == 0
+
+
+def test_tracker_seed_base_adds_to_live_windows() -> None:
+    """FR-012: seeded pre-restart aggregates are ADDED to live window totals."""
+    tracker = ChargingWindowTracker()
+    tracker.seed_base(3600, 2)  # 1 h of charging across 2 closed pre-restart windows
+
+    # Base only — no live windows yet.
+    assert tracker.total_charging_duration_s() == 3600
+    assert tracker.window_count() == 2
+    # closed_window_count stays live-only: it feeds the per-window event index
+    # and the no-synthetic-window assertions (tc020f), not the session totals.
+    assert tracker.closed_window_count() == 0
+
+    # A live post-restart window adds on top of the base.
+    now = dt_util.utcnow()
+    tracker.open_window(now, energy_kwh=5.0)
+    assert tracker.window_count() == 3  # 2 base + 1 open
+    assert tracker.total_charging_duration_s(now + timedelta(minutes=5)) == 3600 + 300
+
+    tracker.close_window(now + timedelta(minutes=10), energy_kwh=6.0)
+    assert tracker.total_charging_duration_s() == 3600 + 600
+    assert tracker.window_count() == 3
+    assert tracker.closed_window_count() == 1
+
+
+# ---------------------------------------------------------------------------
 # BUG-7: STATE_UNAVAILABLE on plug entity treated as offline, not "on"
 # ---------------------------------------------------------------------------
 

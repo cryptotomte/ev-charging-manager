@@ -837,16 +837,25 @@ async def test_rfid_wait_trx_changes_to_zero_during_wait(
 # ---------------------------------------------------------------------------
 
 
-async def test_rfid_tag_redacted_in_all_debug_log_lines(hass: HomeAssistant, tmp_path) -> None:
+async def test_rfid_tag_redacted_in_all_debug_log_lines(
+    hass: HomeAssistant, tmp_path, caplog
+) -> None:
     """FR-004: an RFID blip with a long tag value never puts the full value in
-    the debug log — RFID_READ / TRX_STATE / TRX_MIDSESSION carry ***{last2}."""
+    the debug log — RFID_READ / TRX_STATE / TRX_MIDSESSION carry ***{last2}.
+    Review F8b: the session-start _LOGGER.info line in the HA core log is
+    masked too."""
+    import logging
+
     from custom_components.ev_charging_manager.const import CONF_DEBUG_LOGGING
 
     hass.config.config_dir = str(tmp_path)
     entry = await _make_engine_entry(hass, extra_options={CONF_DEBUG_LOGGING: True})
     engine = _get_engine(hass, entry)
 
-    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+    with (
+        patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
+        caplog.at_level(logging.INFO),
+    ):
         # Plug on with trx=null → RFID wait; then blip with a long tag value
         hass.states.async_set(MOCK_PLUG_ENTITY, "on")
         hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
@@ -856,6 +865,12 @@ async def test_rfid_tag_redacted_in_all_debug_log_lines(hass: HomeAssistant, tmp
         await hass.async_block_till_done()
 
         assert engine.active_session is not None
+
+        # Review F8b: the session-start info line reaches the HA core log
+        # with the masked tag only
+        assert "session started" in caplog.text
+        assert "trx=***f4" in caplog.text
+        assert "abc123f4" not in caplog.text, "Full RFID tag must never reach the HA core log"
 
         # Mid-session trx change (numeric → TRX_MIDSESSION path)
         hass.states.async_set(MOCK_TRX_ENTITY, "7")

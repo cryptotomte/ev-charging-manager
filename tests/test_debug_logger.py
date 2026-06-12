@@ -297,6 +297,42 @@ async def test_failed_final_flush_abandons_lines_terminally(
     assert "doomed-line" not in open(logger.file_path, encoding="utf-8").read()
 
 
+async def test_debug_off_final_under_concurrent_log(hass: HomeAssistant, tmp_path, caplog) -> None:
+    """Review F8a: a log() call arriving mid-flush while async_disable() is
+    writing the final lines is discarded AT THE SOURCE by the _closed flag
+    (review F3) — that line never reaches the file or the buffer (so it is
+    not even "abandoned"), and DEBUG_OFF stays the final line (FR-008)."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    logger.log("CAR_STATE", "before disable")
+
+    original_write = logger._write_lines
+
+    def write_with_concurrent_log(lines: list[str]) -> None:
+        # Fires inside the executor job of the FINAL flush — simulates a
+        # callback racing the shutdown. _closed is already True here.
+        logger.log("CAR_STATE", "late line during final flush")
+        original_write(lines)
+
+    with (
+        patch.object(logger, "_write_lines", side_effect=write_with_concurrent_log),
+        caplog.at_level(logging.WARNING, logger=debug_logger_module.__name__),
+    ):
+        await logger.async_disable()
+
+    lines = _read_lines(logger)
+    assert not any("late line during final flush" in ln for ln in lines), (
+        "A log() call during the final flush must never reach the file"
+    )
+    assert "DEBUG_OFF" in lines[-1]
+    assert logger._buffer == [], "The racing line must never enter the buffer"
+    # Discarded at log(), not abandoned by async_disable's post-flush sweep
+    assert not any("abandoned" in r.message for r in caplog.records)
+
+    # Nothing pending that could write after close
+    await _flush_by_time(hass)
+    assert "DEBUG_OFF" in _read_lines(logger)[-1]
+
+
 async def test_log_after_disable_no_buffer_growth(hass: HomeAssistant, tmp_path) -> None:
     """Review F3: log() on a closed instance never grows the buffer."""
     logger = await _make_enabled_logger(hass, tmp_path)
@@ -528,6 +564,42 @@ async def test_buffer_capped_drop_oldest_with_recovery_note(
     assert logger._buffer == []
 
 
+async def test_dropped_count_sums_across_multiple_capped_cycles(
+    hass: HomeAssistant, tmp_path, monkeypatch
+) -> None:
+    """Review F8c: two capped failure cycles before recovery — the single
+    DEBUG_DROPPED note on the next successful flush counts the SUM of all
+    lines dropped across both cycles (FR-010)."""
+    monkeypatch.setattr(debug_logger_module, "DEBUG_LOG_BUFFER_CAP", 10)
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)  # DEBUG_ON to disk
+
+    with patch("builtins.open", side_effect=OSError("disk full")):
+        # Cycle 1: 15 lines, failed flush drops the 5 oldest
+        for i in range(15):
+            logger.log("CAR_STATE", f"c1-line-{i:02d}")
+        await _flush_by_time(hass)
+        assert logger._dropped_count == 5
+
+        # Cycle 2: 5 more lines (buffer back at 15), failed flush drops 5 more
+        for i in range(5):
+            logger.log("CAR_STATE", f"c2-line-{i:02d}")
+        await _flush_by_time(hass)
+        assert logger._dropped_count == 10
+
+    # Recovery: one note carrying the summed count
+    await _flush_by_time(hass)
+
+    content = open(logger.file_path, encoding="utf-8").read()
+    assert "10 lines dropped" in content
+    assert content.count("DEBUG_DROPPED") == 1
+    # Survivors: c1-10..c1-14 + all of cycle 2; c1-09 and older are gone
+    assert "c1-line-09" not in content
+    assert "c1-line-10" in content
+    assert "c2-line-04" in content
+    assert logger._dropped_count == 0
+
+
 # ---------------------------------------------------------------------------
 # T005 (US1): async_cleanup_legacy_file unit tests (FR-002)
 # ---------------------------------------------------------------------------
@@ -618,9 +690,10 @@ def test_redact_tag_long_value_keeps_last_two() -> None:
     assert redact_tag("04:B7:C8:D2:E1:F3:A2") == "***A2"
 
 
-async def test_legacy_engine_rfid_read_redacted(hass: HomeAssistant, tmp_path) -> None:
+async def test_legacy_engine_rfid_read_redacted(hass: HomeAssistant, tmp_path, caplog) -> None:
     """Legacy SessionEngine: RFID_READ log lines carry the masked tag,
-    never the full value (FR-004 crosses the engine freeze)."""
+    never the full value (FR-004 crosses the engine freeze). Review F8b: the
+    session-start _LOGGER.info line in the HA core log is masked too."""
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
     from custom_components.ev_charging_manager.const import DOMAIN
@@ -640,9 +713,10 @@ async def test_legacy_engine_rfid_read_redacted(hass: HomeAssistant, tmp_path) -
     )
     await setup_session_engine(hass, entry)
 
-    hass.states.async_set(MOCK_TRX_ENTITY, "abc123f4")
-    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
-    await hass.async_block_till_done()
+    with caplog.at_level(logging.INFO):
+        hass.states.async_set(MOCK_TRX_ENTITY, "abc123f4")
+        hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+        await hass.async_block_till_done()
 
     debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
     await debug_logger.async_disable()  # flush everything emitted so far
@@ -652,6 +726,12 @@ async def test_legacy_engine_rfid_read_redacted(hass: HomeAssistant, tmp_path) -
     rfid_lines = [ln for ln in content.splitlines() if "RFID_READ" in ln]
     assert rfid_lines, "Expected an RFID_READ line"
     assert "tag=***f4" in rfid_lines[0]
+
+    # Review F8b: the session-start info line reaches the HA core log with
+    # the masked tag only
+    assert "Session started" in caplog.text
+    assert "trx=***f4" in caplog.text
+    assert "abc123f4" not in caplog.text, "Full RFID tag must never reach the HA core log"
 
 
 # ---------------------------------------------------------------------------

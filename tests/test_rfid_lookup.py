@@ -157,6 +157,59 @@ def test_unexpected_format_returns_unknown(caplog):
     assert "Unexpected trx value format" in caplog.text
 
 
+def test_type_error_warning_redacts_tag(caplog):
+    """Review F8b: the type-error warning carries the masked form only —
+    the full tag value never reaches the HA core log (FR-004). Single digits
+    are exempt per F7, so a multi-char tag is used here."""
+    import logging
+
+    lookup = make_lookup()
+    with caplog.at_level(logging.WARNING):
+        result = lookup.resolve("abc123f4")
+    assert result is not None
+    assert result.reason == "type_error"
+    assert "abc123f4" not in caplog.text
+    assert "***f4" in caplog.text
+
+
+def test_unmapped_warning_redacts_tag(caplog):
+    """Review F8b: the unmapped warning masks the trx value (multi-char
+    numeric — single digits are exempt per F7)."""
+    import logging
+
+    lookup = make_lookup()
+    with caplog.at_level(logging.WARNING):
+        result = lookup.resolve("123")  # index 122 — no mapping
+    assert result is not None
+    assert result.reason == "unmapped"
+    assert "'123'" not in caplog.text
+    assert "***23" in caplog.text
+
+
+def test_inactive_warning_redacts_tag(caplog):
+    """Review F8b: the inactive-card warning masks the trx value (multi-char
+    numeric — single digits are exempt per F7)."""
+    import logging
+
+    mapping_inactive_high = {
+        "card_index": 122,  # trx=123 → index 122
+        "user_id": "u_petra",
+        "vehicle_id": "v_peugeot",
+        "active": False,
+    }
+    lookup = make_lookup(
+        mappings=[mapping_inactive_high],
+        users=[USER_PETRA],
+        vehicles=[VEHICLE_PEUGEOT],
+    )
+    with caplog.at_level(logging.WARNING):
+        result = lookup.resolve("123")
+    assert result is not None
+    assert result.reason == "rfid_inactive"
+    assert "'123'" not in caplog.text
+    assert "***23" in caplog.text
+
+
 def test_user_with_no_vehicle():
     """Mapping with no vehicle_id → user resolved, vehicle=None."""
     mapping_no_vehicle = {

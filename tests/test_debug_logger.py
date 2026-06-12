@@ -694,6 +694,50 @@ async def test_rotation_bounds_disk_usage_to_two_generations(
     assert os.path.getsize(logger.rotated_file_path) < 400
 
 
+async def test_rotation_failure_falls_back_to_append(
+    hass: HomeAssistant, tmp_path, caplog
+) -> None:
+    """Review F5: a failing os.replace must not halt logging — lines are
+    appended to the oversized active file (bounded unrotated growth beats
+    infinite drop), ONE rotation warning names the .1 path per streak, and
+    rotation is retried on subsequent flushes."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    await _flush_by_time(hass)  # DEBUG_ON to disk
+
+    with open(logger.file_path, "a", encoding="utf-8") as fh:
+        fh.write("x" * (debug_logger_module.DEBUG_LOG_MAX_BYTES + 1))
+
+    with (
+        patch(
+            "custom_components.ev_charging_manager.debug_logger.os.replace",
+            side_effect=OSError("permission denied"),
+        ),
+        caplog.at_level(logging.WARNING, logger=debug_logger_module.__name__),
+    ):
+        logger.log("CAR_STATE", "after rotation failure 1")
+        await _flush_by_time(hass)
+        logger.log("CAR_STATE", "after rotation failure 2")
+        await _flush_by_time(hass)
+
+    # Lines still landed in the (oversized) active file — no drop mode
+    content = open(logger.file_path, encoding="utf-8").read()
+    assert "after rotation failure 1" in content
+    assert "after rotation failure 2" in content
+
+    # ONE warning per streak, naming the rotated (.1) path — not the active file
+    warnings = [r for r in caplog.records if "rotate" in r.message]
+    assert len(warnings) == 1
+    assert logger.rotated_file_path in warnings[0].message
+
+    # Rotation is retried: with os.replace healthy again the next flush rotates
+    logger.log("CAR_STATE", "after rotation recovery")
+    await _flush_by_time(hass)
+    assert os.path.exists(logger.rotated_file_path)
+    active_lines = _read_lines(logger)
+    assert len(active_lines) == 1
+    assert "after rotation recovery" in active_lines[0]
+
+
 async def test_clear_truncates_active_only_dot1_remains(hass: HomeAssistant, tmp_path) -> None:
     """async_clear() truncates the active file only — the .1 generation remains
     (FR-012 / US4 scenario 3)."""

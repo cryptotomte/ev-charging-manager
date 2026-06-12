@@ -160,6 +160,9 @@ class DebugLogger:
         self._closed: bool = False
         self._fail_count: int = 0
         self._dropped_count: int = 0
+        # Set/read only inside _write_lines (executor, serialized by the
+        # flush lock): one rotation warning per failure streak (review F5).
+        self._rotation_warned: bool = False
 
     @property
     def file_path(self) -> str:
@@ -406,6 +409,22 @@ class DebugLogger:
         """
         path = self.file_path
         if os.path.exists(path) and os.path.getsize(path) > DEBUG_LOG_MAX_BYTES:
-            os.replace(path, self.rotated_file_path)
+            # Review F5: a failing rotation must not halt logging entirely —
+            # fall back to appending to the oversized active file (bounded
+            # unrotated growth beats dropping every subsequent line) and retry
+            # the rotation on the next flush. One warning per failure streak.
+            try:
+                os.replace(path, self.rotated_file_path)
+                self._rotation_warned = False
+            except OSError as err:
+                if not self._rotation_warned:
+                    self._rotation_warned = True
+                    _LOGGER.warning(
+                        "DebugLogger: could not rotate debug log to %s: %s — "
+                        "appending to the oversized active file; rotation is "
+                        "retried on the next flush",
+                        self.rotated_file_path,
+                        err,
+                    )
         with open(path, "a", encoding="utf-8") as fh:
             fh.writelines(lines)

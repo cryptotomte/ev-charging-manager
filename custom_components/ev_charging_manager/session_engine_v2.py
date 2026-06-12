@@ -57,6 +57,7 @@ from .const import (
     DEBUG_CAT_CHARGER_OFFLINE,
     DEBUG_CAT_CHARGING_WINDOW_CLOSE,
     DEBUG_CAT_CHARGING_WINDOW_OPEN,
+    DEBUG_CAT_DATA_GAP,
     DEBUG_CAT_DISCONNECT_DETECTED,
     DEBUG_CAT_DISCONNECT_RESOLVED,
     DEBUG_CAT_HA_RESTART_DETECTED,
@@ -1769,6 +1770,33 @@ class PlugAnchoredSessionEngine:
 
         self._last_energy_kwh = energy_kwh
         session = self._active_session
+
+        # PR-27 FR-015: live counter-reset detection. A reading measurably below
+        # the session's start reference means the charger rebooted and its
+        # counter restarted from ~0. Rebase the start reference so the energy
+        # accumulated so far is preserved and subsequent deltas add on top
+        # (previously the delta clamped to 0 for the rest of the session).
+        if energy_kwh < session.energy_start_kwh - ENERGY_RESET_EPSILON_KWH:
+            old_start = session.energy_start_kwh
+            session.energy_start_kwh = energy_kwh - session.energy_kwh
+            session.data_gap = True
+            self._data_gap = True
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: mid-session energy counter reset detected "
+                "(reading=%.3f kWh < start=%.3f kWh) — rebased start to %.3f kWh, "
+                "accumulated %.3f kWh preserved, session flagged data_gap",
+                energy_kwh,
+                old_start,
+                session.energy_start_kwh,
+                session.energy_kwh,
+            )
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_DATA_GAP,
+                    f"mid-session counter reset: reading={energy_kwh:.3f}kWh "
+                    f"old_start={old_start:.3f}kWh new_start={session.energy_start_kwh:.3f}kWh "
+                    f"accumulated={session.energy_kwh:.3f}kWh preserved (FR-015)",
+                )
 
         # Energy delta from session start
         session.energy_kwh = max(0.0, energy_kwh - session.energy_start_kwh)

@@ -276,6 +276,10 @@ DEBUG_CAT_HEARTBEAT = "HEARTBEAT"
 # PR-24: RFID wait lifecycle events (renamed from RFID_GRACE; event-driven model, no timer).
 DEBUG_CAT_RFID_WAIT = "RFID_WAIT"
 
+# PR-27 (023-recovery-hardening): data-quality events — currently the
+# mid-session energy counter reset (FR-015 rebase).
+DEBUG_CAT_DATA_GAP = "DATA_GAP"
+
 # New HA events (PR-22)
 EVENT_CHARGING_CHARGED = "ev_charging_charged"
 EVENT_UNKNOWN_RFID_DETECTED = "ev_charging_unknown_rfid_detected"

@@ -771,6 +771,32 @@ class PlugAnchoredSessionEngine:
                     f" hour_energy_snapshot={self._hour_energy_snapshot:.3f}kWh)",
                 )
 
+        # PR-27 FR-012 (A1): carry pre-restart charging aggregates forward as a
+        # tracker base offset, so window-close and completion ADD to them
+        # instead of overwriting with post-restart-only totals. Seed split
+        # (research R3):
+        #   - CHARGED at restart (charging_ended_at set): no synthetic window is
+        #     injected below, so the FULL snapshot aggregate is seeded — this is
+        #     the A1 wipe case (hours of charging previously reset to zero and
+        #     avg_power_w to 0.0 at completion).
+        #   - CHARGING at restart (open pre-restart window): the synthetic
+        #     window below spans charging_started_at → now, a SUPERSET of every
+        #     pre-restart window (charging_started_at is the FIRST window's
+        #     start, per IC-6 gap absorption) — seeding any remainder on top
+        #     would double-count, so nothing is seeded.
+        #   - Never charged: aggregates are zero; seeding is a no-op.
+        if session.charging_started_at is not None and session.charging_ended_at is not None:
+            self._window_tracker.seed_base(
+                session.charging_duration_s, session.charging_window_count
+            )
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_SESSION_RESUMED,
+                    f"pre-restart charging aggregates seeded as tracker base — "
+                    f"duration={session.charging_duration_s}s "
+                    f"windows={session.charging_window_count} (A1 fix)",
+                )
+
         # Inject a synthetic closed window for any pre-restart open window whose close event
         # was never observed (IC-6: absorb all gap-period energy into this window).
         #
@@ -817,12 +843,19 @@ class PlugAnchoredSessionEngine:
                     session.charging_started_at,
                     exc,
                 )
+                # PR-27 FR-012: without the synthetic window, fall back to
+                # seeding the snapshot aggregates so the pre-restart charging
+                # time still survives (previously it was silently undercounted).
+                self._window_tracker.seed_base(
+                    session.charging_duration_s, session.charging_window_count
+                )
                 if self._debug_logger:
                     self._debug_logger.log(
                         DEBUG_CAT_HA_RESTART_DETECTED,
                         f"synthetic-window injection failed ({type(exc).__name__}: {exc}) — "
-                        f"continuing without pre-restart window in tracker; "
-                        f"charging_duration_s will be undercounted for this session",
+                        f"seeded snapshot aggregates as tracker base instead "
+                        f"(duration={session.charging_duration_s}s "
+                        f"windows={session.charging_window_count})",
                     )
         # else: session has no pre-restart open window — either INITIALIZING (no window had
         # opened yet) or already finalized (charging_ended_at set); nothing to inject.

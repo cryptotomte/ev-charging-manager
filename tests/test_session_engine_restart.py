@@ -1300,3 +1300,175 @@ async def test_recovery_resume_and_timeout_mutually_exclusive(
     )
     assert completed_count == 0, "the late timeout must not force-complete the resumed session"
     assert len(completion_events) == 0, "no completion event may fire for the resumed session"
+
+
+# ===========================================================================
+# PR-27 (023-recovery-hardening) US3: A1 — charging duration survives restarts
+# (FR-012, FR-013, FR-014)
+# ===========================================================================
+
+
+async def test_a1_charged_at_restart_preserves_duration_and_avg_power(
+    hass: HomeAssistant,
+) -> None:
+    """FR-013 (the A1 wipe case): CHARGED-at-restart with no further charging →
+    final charging_duration_s and avg_power_w equal the pre-restart values
+    EXACTLY (previously wiped to 0 / 0.0 by the empty post-restart tracker)."""
+    pre_restart_duration_s = 3600
+    energy_total = 7.0
+    now_utc = dt_util.utcnow()
+
+    snapshot = _make_snapshot(
+        energy_start_kwh=0.0,
+        energy_kwh=energy_total,
+        charging_started_at=(now_utc - timedelta(hours=2)).isoformat(),
+        charging_duration_s=pre_restart_duration_s,
+        charging_window_count=1,
+    )
+    # 'charged' sub-state at shutdown: the window was already closed.
+    snapshot["charging_ended_at"] = (now_utc - timedelta(hours=1)).isoformat()
+
+    entry, _save = await _make_engine_entry_with_restart(
+        hass,
+        snapshot,
+        plug_state="on",
+        cable_lock_state="Locked",
+        power_state="0.0",  # no further charging after restart
+        energy_state=str(energy_total),
+    )
+    engine = _get_engine(hass, entry)
+    assert engine.state == SessionEngineState.TRACKING
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1
+    completed = session_store.sessions[0]
+
+    assert completed["charging_duration_s"] == pre_restart_duration_s, (
+        f"A1: charging_duration_s must equal the pre-restart value exactly "
+        f"({pre_restart_duration_s}s), got {completed['charging_duration_s']}s"
+    )
+    expected_avg = round((energy_total * 3_600_000) / pre_restart_duration_s, 1)
+    assert completed["avg_power_w"] == expected_avg, (
+        f"A1: avg_power_w must equal the pre-restart value exactly "
+        f"({expected_avg}W), got {completed['avg_power_w']}W"
+    )
+    assert completed["charging_window_count"] == 1, "window count must carry forward"
+
+
+async def test_a1_closed_plus_open_window_at_restart_no_double_count(
+    hass: HomeAssistant,
+    freezer,
+) -> None:
+    """FR-012: one closed + one open window at restart, charging continues →
+    total = synthetic window (which spans ALL pre-restart windows from the
+    first window's start) + post-restart windows; the closed-window time must
+    NOT additionally be seeded on top (no double-count against the tc020f
+    synthetic-window semantics)."""
+    # Pre-restart: closed window 0:00–0:30 (1800 s), open window since 1:00,
+    # restart at 1:30 → snapshot aggregate = 1800 + 1800 = 3600 s.
+    now_utc = dt_util.utcnow()
+    first_window_start = now_utc - timedelta(minutes=90)
+    synthetic_span_s = 5400  # first_window_start → recovery time
+    post_restart_charge_s = 300
+
+    snapshot = _make_snapshot(
+        energy_start_kwh=0.0,
+        energy_kwh=5.0,
+        charging_started_at=first_window_start.isoformat(),
+        charging_duration_s=3600,  # closed 1800 + open-elapsed 1800 at save time
+        charging_window_count=2,
+    )
+
+    entry, _save = await _make_engine_entry_with_restart(
+        hass,
+        snapshot,
+        plug_state="on",
+        cable_lock_state="Locked",
+        power_state="7200.0",  # charging continues at restart
+        energy_state="5.0",
+    )
+    engine = _get_engine(hass, entry)
+    assert engine.state == SessionEngineState.TRACKING
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Post-restart charging, then idle-close, then unplug.
+        freezer.tick(timedelta(seconds=post_restart_charge_s))
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+        await hass.async_block_till_done()
+        freezer.tick(timedelta(minutes=6))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "6.0")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1
+    completed = session_store.sessions[0]
+    duration = completed["charging_duration_s"]
+
+    # Lower bound: synthetic window + actual post-restart charging.
+    assert duration >= synthetic_span_s + post_restart_charge_s, (
+        f"duration {duration}s must cover the synthetic window ({synthetic_span_s}s) "
+        f"plus post-restart charging ({post_restart_charge_s}s)"
+    )
+    # Upper bound (the double-count guard): the synthetic window already spans
+    # every pre-restart window — seeding the snapshot aggregate (3600 s) on top
+    # would push the total past this bound.
+    assert duration <= synthetic_span_s + post_restart_charge_s + 600, (
+        f"duration {duration}s indicates pre-restart time was double-counted "
+        f"(synthetic window + seeded aggregate)"
+    )
+    # Window count carries forward: 2 pre-restart + 1 post-restart.
+    assert completed["charging_window_count"] == 3, (
+        f"window count must carry forward (2 pre + 1 post), "
+        f"got {completed['charging_window_count']}"
+    )
+
+
+async def test_a1_zero_seed_snapshot_behaves_like_today(hass: HomeAssistant) -> None:
+    """FR-012 edge: a snapshot that never charged (zero aggregates) resumes and
+    completes exactly as today — zero duration, zero average power."""
+    snapshot = _make_snapshot(
+        energy_start_kwh=0.0,
+        energy_kwh=5.0,
+        charging_started_at=None,
+        charging_duration_s=0,
+        charging_window_count=0,
+    )
+
+    entry, _save = await _make_engine_entry_with_restart(
+        hass,
+        snapshot,
+        plug_state="on",
+        cable_lock_state="Locked",
+        power_state="0.0",
+        energy_state="5.0",
+    )
+    engine = _get_engine(hass, entry)
+    assert engine.state == SessionEngineState.TRACKING
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1
+    completed = session_store.sessions[0]
+    assert completed["charging_duration_s"] == 0
+    assert completed["avg_power_w"] == 0.0
+    assert completed["charging_window_count"] == 0

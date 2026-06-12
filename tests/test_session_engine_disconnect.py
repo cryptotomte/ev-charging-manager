@@ -381,6 +381,81 @@ async def test_failed_session_start_does_not_double_arm_hourly(hass: HomeAssista
         )
 
 
+async def test_hourly_arm_skipped_when_callback_already_active(hass: HomeAssistant) -> None:
+    """Review F6 / FR-017: when an hourly spot callback is already armed,
+    a session start must NOT arm a second one — the skip-arming guard
+    (`if self._hourly_unsub is None`) keeps exactly one active callback."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            **MOCK_CHARGER_DATA,
+            "charger_profile": "goe_gemini",
+            "pricing_mode": "spot",
+            "spot_price_entity": "sensor.fake_spot_price",
+            "spot_additional_cost_kwh": 0.85,
+            "spot_vat_multiplier": 1.25,
+            "spot_fallback_price_kwh": 2.50,
+        },
+        options={
+            "plug_entity": MOCK_PLUG_ENTITY,
+            "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
+            CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
+            CONF_DISCONNECT_GRACE_MIN: GRACE_TIMEOUT_MIN,
+        },
+        title="Test go-e Charger (spot, F6)",
+    )
+    hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+    hass.states.async_set("sensor.fake_spot_price", "1.50")
+
+    # Count live hourly registrations: each fake registration returns a cancel
+    # that removes itself — len(active_hourly) == callbacks currently armed.
+    active_hourly: list[object] = []
+
+    def _fake_track(*_args, **_kwargs):
+        handle = object()
+        active_hourly.append(handle)
+
+        def _cancel() -> None:
+            if handle in active_hourly:
+                active_hourly.remove(handle)
+
+        return _cancel
+
+    with (
+        patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
+        patch(
+            "custom_components.ev_charging_manager.session_engine_v2.async_track_utc_time_change",
+            side_effect=_fake_track,
+        ),
+    ):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        engine = _get_engine(hass, entry)
+
+        # A live hourly callback is already armed (e.g. left active by a
+        # restart resume) — simulate it directly via the counting fake.
+        engine._hourly_unsub = _fake_track()
+        assert len(active_hourly) == 1, "precondition: one hourly callback armed"
+
+        # Session start in spot mode — the second arm attempt must be a no-op.
+        hass.states.async_set(MOCK_TRX_ENTITY, "0")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+
+        assert engine.active_session is not None, "session must start"
+        assert len(active_hourly) == 1, (
+            "FR-017: with a callback already armed, session start must not arm a "
+            f"second hourly callback — got {len(active_hourly)} active"
+        )
+
+
 async def test_unload_with_active_session_writes_final_snapshot(hass: HomeAssistant) -> None:
     """FR-019: unload with an active session persists one final snapshot."""
     entry = await _make_engine_entry(hass)

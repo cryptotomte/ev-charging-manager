@@ -462,35 +462,43 @@ class ChargingDurationSensor(_SessionSensorBase):
         self._attr_unique_id = f"{entry.entry_id}_charging_duration"
         self._attr_translation_key = "charging_duration"
 
-    @property
-    def available(self) -> bool:
-        """Return True only when an active session exists (IC-3 row 3).
+    def _window_tracker(self):
+        """Return the engine's public window-tracking surface, or None.
 
-        The base class returns True for any TRACKING state, but TRACKING without
-        an active session means waiting_for_rfid — no session yet.  Returning
-        True there would cause HA to show "00:00:00" instead of "unavailable".
+        PR-29 (FR-005): only PlugAnchoredSessionEngine exposes the
+        `window_tracker` property — the legacy engine has no charging-window
+        tracking, so this returns None there (→ sensor unavailable).
         """
         engine = self._engine()
-        return engine is not None and engine.active_session is not None
+        if engine is None:
+            return None
+        return getattr(engine, "window_tracker", None)
+
+    @property
+    def available(self) -> bool:
+        """Return True only with an active session AND window tracking (FR-005).
+
+        Layers the window-tracking requirement on the base active-session gate
+        (IC-3 row 3): TRACKING without a session means waiting_for_rfid — no
+        session yet; and the legacy engine (no window tracking) is permanently
+        unavailable instead of available-but-unknown forever.
+        """
+        return self._active_session() is not None and self._window_tracker() is not None
 
     @property
     def native_value(self) -> str | None:
-        """Return the live charging duration as HH:MM:SS, or None when no session.
+        """Return the live charging duration as HH:MM:SS, or None when gated.
 
         Computation (IC-5):
           total_closed_s + (utcnow() - open_window.start_at).total_seconds() if open else 0
         Formatted as zero-padded HH:MM:SS for parity with SessionDurationSensor.
+        Gate identical to `available` and `extra_state_attributes` (FR-006).
         """
-        engine = self._engine()
-        # IC-3 row 3: no active session → unavailable (never "00:00:00")
-        if engine is None or engine.active_session is None:
+        if not self.available:
             return None
+        tracker = self._window_tracker()
 
         from homeassistant.util import dt as dt_util
-
-        tracker = getattr(engine, "_window_tracker", None)
-        if tracker is None:
-            return None
 
         now = dt_util.utcnow()
         total_s = tracker.total_charging_duration_s(now)
@@ -504,24 +512,21 @@ class ChargingDurationSensor(_SessionSensorBase):
     def extra_state_attributes(self) -> _ChargingDurationAttributes | dict[str, Any]:
         """Return per-window detail for the active session.
 
-        Returns {} when no session is active (FR-021).
+        Returns {} exactly when the value is absent — the SAME availability
+        gate as native_value (PR-29 / FR-006; previously this used
+        _is_tracking(), making attributes vanish during COMPLETING while the
+        value still rendered).
 
         Schema per contracts/sensor-attributes.md:
             window_count: int         — session.charging_window_count
             current_window_open: bool — tracker.is_open()
             windows: list             — index/started_at/ended_at/duration_s/energy_kwh
         """
-        engine = self._engine()
-        if engine is None or not self._is_tracking():
+        if not self.available:
             return {}
 
         session = self._active_session()
-        if session is None:
-            return {}
-
-        tracker = getattr(engine, "_window_tracker", None)
-        if tracker is None:
-            return {}
+        tracker = self._window_tracker()
 
         from homeassistant.util import dt as dt_util
 

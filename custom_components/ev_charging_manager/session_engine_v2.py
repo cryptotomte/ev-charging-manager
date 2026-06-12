@@ -266,6 +266,13 @@ class PlugAnchoredSessionEngine:
         # plug entity never reports a valid state within DEFERRED_RECOVERY_TIMEOUT_MIN,
         # the engine fires a persistent notification and force-completes the snapshot.
         self._deferred_recovery_timeout_unsub: Any = None
+        # PR-27 FR-005: mutual-exclusion flag between the deferred-recovery
+        # plug-ready resume and its timeout. Whichever callback runs first sets
+        # it (check-and-set before any await — atomic on the single-threaded
+        # event loop, research R2); the other becomes a no-op. Cancelling the
+        # other's handle is not sufficient when both were dispatched in the
+        # same loop iteration.
+        self._recovery_resolved: bool = False
 
         # Build pricing engine from entry data (immutable at runtime)
         pricing_mode = entry.data.get("pricing_mode", "static")
@@ -562,6 +569,8 @@ class PlugAnchoredSessionEngine:
         engine fires a persistent notification and force-completes the snapshot
         rather than staying deferred forever.
         """
+        # PR-27 FR-005: fresh mutual-exclusion flag for this deferral round.
+        self._recovery_resolved = False
 
         async def _on_plug_ready(event: Event) -> None:
             new_state = event.data.get("new_state")
@@ -569,6 +578,11 @@ class PlugAnchoredSessionEngine:
                 return
             if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                 return
+            # PR-27 FR-005: check-and-set before any await — if the timeout
+            # already resolved the recovery, this callback is a no-op.
+            if self._recovery_resolved:
+                return
+            self._recovery_resolved = True
             # Plug entity now has a valid state — cancel listener + timeout and resume recovery.
             if self._deferred_recovery_unsub is not None:
                 self._deferred_recovery_unsub()
@@ -593,6 +607,11 @@ class PlugAnchoredSessionEngine:
                 self._active_session = None
 
         async def _on_recovery_timeout(_now: datetime) -> None:
+            # PR-27 FR-005: check-and-set before any await — if the plug-ready
+            # resume already resolved the recovery, this callback is a no-op.
+            if self._recovery_resolved:
+                return
+            self._recovery_resolved = True
             # Cancel the plug-state listener (it will no longer be needed).
             if self._deferred_recovery_unsub is not None:
                 try:
@@ -686,6 +705,13 @@ class PlugAnchoredSessionEngine:
         now: datetime,
     ) -> None:
         """Resume an active session after HA restart with plug still connected."""
+        # PR-27 FR-003: clear any armed RFID wait BEFORE installing the session.
+        # The deferred-resume path can race the engine's own plug-on handling,
+        # which arms a wait when trx is null; a leftover wait would make the
+        # next unplug silently discard the recovered session via the wait-exit
+        # branch instead of completing it.
+        self._cancel_rfid_wait()
+
         # Restore session object
         session = Session(
             id=snapshot["id"],
@@ -1228,7 +1254,10 @@ class PlugAnchoredSessionEngine:
 
         # PR-24 FR-004: if RFID wait is active, a session has not been committed
         # yet — cancel the wait and return to IDLE without starting any session.
-        if self._rfid_wait is not None:
+        # PR-27 FR-004: only when NO active session exists — with both present
+        # (stale wait left by a racing resume) the session path takes precedence;
+        # the unplug must complete the session, not strand it.
+        if self._rfid_wait is not None and self._active_session is None:
             self._cancel_rfid_wait()
             self._state = SessionEngineState.IDLE
             if self._debug_logger:

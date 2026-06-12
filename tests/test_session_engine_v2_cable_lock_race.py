@@ -12,6 +12,7 @@ All HA entities are mocked — no real hardware.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -20,6 +21,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
+    async_capture_events,
     async_fire_time_changed,
 )
 
@@ -29,6 +31,7 @@ from custom_components.ev_charging_manager.const import (
     DEBUG_CAT_SESSION_ENDED_BY_CABLE_UNLOCK,
     DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT,
     DOMAIN,
+    EVENT_SESSION_COMPLETED,
     SessionEngineState,
 )
 from custom_components.ev_charging_manager.session_engine_v2 import (
@@ -811,6 +814,215 @@ async def test_cable_unlock_noop_during_rfid_wait(hass: HomeAssistant, freezer) 
         assert engine._disconnect_grace_cancel is None, "no grace timer may be started"
 
     assert len(session_store.sessions) == 0, "no completion during RFID wait"
+
+
+# ===========================================================================
+# PR-27 (023-recovery-hardening) US2: completion idempotency under trigger
+# flapping (FR-008/FR-009/FR-010)
+# ===========================================================================
+
+
+def _make_add_session_with_injection(session_store, inject):
+    """Wrap session_store.add_session: yield once, run `inject`, then persist.
+
+    AsyncMock awaits complete synchronously and HA dispatches state-change
+    listeners only when the loop settles, so flapping driven via
+    ``hass.states.async_set`` can never land inside the completion's first
+    await in tests. The injection models exactly that production window: the
+    completion task is parked at the persist await and a trigger handler runs
+    in the meantime. ``inject`` runs at most once.
+    """
+    real_add = session_store.add_session
+    fired = {"done": False}
+
+    async def _add(session_dict):
+        await asyncio.sleep(0)
+        if not fired["done"]:
+            fired["done"] = True
+            inject()
+        return await real_add(session_dict)
+
+    return _add
+
+
+async def test_plug_flap_during_completion_completes_once(hass: HomeAssistant, freezer) -> None:
+    """FR-008/FR-010: plug off→unavailable→off flapping landing during the
+    completion's first await → exactly one stored session, one event."""
+    entry = await _make_engine_entry(hass)
+    engine = _get_engine(hass, entry)
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    def _flap() -> None:
+        # The completion is parked at its persist await; the plug entity flaps
+        # off→unavailable→off (cable_lock already reads Unlocked), re-entering
+        # the plug-off handler mid-completion.
+        engine._handle_plug_change("unavailable")
+        engine._handle_plug_change("off")
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        await _plug_in_and_charge(hass, energy_kwh=6.0)
+        freezer.tick(timedelta(minutes=5))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+        session_id = engine.active_session.id
+
+        with patch.object(
+            session_store,
+            "add_session",
+            side_effect=_make_add_session_with_injection(session_store, _flap),
+        ):
+            # Clean unplug → completion task starts and suspends at the persist.
+            hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+            await hass.async_block_till_done()
+            hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+            await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert engine.active_session is None
+    assert len(session_store.sessions) == 1, (
+        f"plug flapping during completion must store exactly one session, "
+        f"got {len(session_store.sessions)}"
+    )
+    assert session_store.sessions[0]["id"] == session_id
+    assert len(events) == 1, f"exactly one EVENT_SESSION_COMPLETED expected, got {len(events)}"
+
+
+async def test_late_unlock_after_grace_expiry_no_second_completion(
+    hass: HomeAssistant, freezer
+) -> None:
+    """FR-008/FR-009: cable_lock→Unlocked arriving after grace expiry (state
+    COMPLETING, completion in flight) must not run a second completion.
+
+    The injection also restores a stale (already-fired) grace handle before
+    the confirmation runs — the exact FR-009 enabler: a stale handle makes the
+    'grace pending' guard lie, so only the FR-008 state guard stands between
+    the late Unlocked and a duplicate completion.
+    """
+    entry = await _make_engine_entry(hass)
+    engine = _get_engine(hass, entry)
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    def _late_unlock() -> None:
+        engine._disconnect_grace_cancel = lambda: None  # stale fired handle
+        engine._handle_cable_lock_confirmation("Unlocked")
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        await _plug_in_and_charge(hass, energy_kwh=6.0)
+        freezer.tick(timedelta(minutes=5))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+        session_id = engine.active_session.id
+
+        await _transient_plug_off(hass)  # grace timer armed (cable still Locked)
+        assert engine._disconnect_grace_cancel is not None
+
+        with patch.object(
+            session_store,
+            "add_session",
+            side_effect=_make_add_session_with_injection(session_store, _late_unlock),
+        ):
+            # Grace expires → force-end completion task starts (suspends at the
+            # persist); the lagging Unlocked lands inside that window.
+            freezer.tick(timedelta(minutes=GRACE_TIMEOUT_MIN + 1))
+            async_fire_time_changed(hass, dt_util.utcnow())
+            await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1, (
+        f"late Unlocked after grace expiry must not double-complete, "
+        f"got {len(session_store.sessions)} sessions"
+    )
+    assert session_store.sessions[0]["id"] == session_id
+    assert len(events) == 1, f"exactly one completion event expected, got {len(events)}"
+
+
+async def test_grace_expiry_and_plug_trigger_race_one_completion(
+    hass: HomeAssistant, freezer
+) -> None:
+    """FR-008/FR-009/FR-010: grace-expiry and a plug-event completion trigger
+    racing in the same window → exactly one completion."""
+    entry = await _make_engine_entry(hass)
+    engine = _get_engine(hass, entry)
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    def _plug_trigger() -> None:
+        # While the grace-expiry completion is in flight, the charger's signals
+        # settle: cable_lock now reads Unlocked and the plug bounces
+        # unavailable→off — the synchronous plug-off path would see
+        # cable_lock == Unlocked and fire a second completion.
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        engine._handle_plug_change("unavailable")
+        engine._handle_plug_change("off")
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        await _plug_in_and_charge(hass, energy_kwh=6.0)
+        freezer.tick(timedelta(minutes=5))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+        session_id = engine.active_session.id
+
+        await _transient_plug_off(hass)  # grace timer armed
+
+        with patch.object(
+            session_store,
+            "add_session",
+            side_effect=_make_add_session_with_injection(session_store, _plug_trigger),
+        ):
+            # Grace expires → completion task in flight (suspended at persist);
+            # the plug trigger lands inside that window.
+            freezer.tick(timedelta(minutes=GRACE_TIMEOUT_MIN + 1))
+            async_fire_time_changed(hass, dt_util.utcnow())
+            await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1, (
+        f"racing grace/plug completion triggers must collapse to one completion, "
+        f"got {len(session_store.sessions)} sessions"
+    )
+    assert session_store.sessions[0]["id"] == session_id
+    assert len(events) == 1, f"exactly one completion event expected, got {len(events)}"
+
+
+async def test_fired_timers_clear_their_handles(hass: HomeAssistant, freezer) -> None:
+    """FR-009: fired grace and idle timers null their cancel handles, so
+    'timer pending' checks reflect reality."""
+    # --- idle timer ---
+    entry = await _make_engine_entry(hass)
+    engine = _get_engine(hass, entry)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        await _plug_in_and_charge(hass, energy_kwh=6.0)
+        # Power drops to 0 → idle timer armed.
+        hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+        await hass.async_block_till_done()
+        assert engine._idle_timer_cancel is not None, "idle timer must be armed"
+
+        # Idle timeout fires → window closes AND the handle must be cleared.
+        freezer.tick(timedelta(minutes=6))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+        assert not engine.window_tracker.is_open(), "idle expiry must close the window"
+        assert engine._idle_timer_cancel is None, (
+            "FR-009: a fired idle timer must clear its cancel handle"
+        )
+
+        # --- grace timer ---
+        await _transient_plug_off(hass)
+        assert engine._disconnect_grace_cancel is not None, "grace timer must be armed"
+
+        freezer.tick(timedelta(minutes=GRACE_TIMEOUT_MIN + 1))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        # Assert BEFORE settling the loop: the handle must be nulled by the
+        # fired callback itself, not by the completion task's cleanup.
+        assert engine._disconnect_grace_cancel is None, (
+            "FR-009: a fired grace timer must clear its cancel handle immediately"
+        )
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
 
 
 if __name__ == "__main__":

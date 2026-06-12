@@ -23,10 +23,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
+from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
+    async_capture_events,
     async_fire_time_changed,
 )
 
@@ -36,11 +38,13 @@ from custom_components.ev_charging_manager.const import (
     CONF_DISCONNECT_GRACE_MIN,
     DEBUG_CAT_CHARGING_WINDOW_CLOSE,
     DOMAIN,
+    EVENT_SESSION_COMPLETED,
     SESSION_STORE_VERSION,
     SessionEngineState,
 )
 from custom_components.ev_charging_manager.session_engine_v2 import (
     PlugAnchoredSessionEngine,
+    _RfidWaitState,
 )
 from tests.conftest import (
     MOCK_CHARGER_DATA,
@@ -1056,3 +1060,414 @@ async def test_tc020f_no_synthetic_window_when_pre_restart_was_charged(
     assert completed.get("charging_window_count", 0) <= 1, (
         "TC-020(f): session window count should not be inflated by a synthetic window"
     )
+
+
+# ===========================================================================
+# PR-27 (023-recovery-hardening) US1: RFID-wait residue on deferred resume
+# (FR-003/FR-004) and recovery wait/timeout mutual exclusion (FR-005)
+# ===========================================================================
+
+
+async def _setup_deferred_recovery(
+    hass: HomeAssistant,
+    snapshot: dict,
+    *,
+    energy_state: str = "5.0",
+    power_state: str = "0.0",
+) -> MockConfigEntry:
+    """Set up the engine with a snapshot while the plug entity is unavailable.
+
+    Recovery defers (BUG-3 path) — the deferred listener and the timeout are
+    both armed when this returns.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"},
+        options={
+            "plug_entity": MOCK_PLUG_ENTITY,
+            "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
+            CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
+            CONF_DISCONNECT_GRACE_MIN: 10,
+        },
+        title="Test go-e Charger (deferred recovery)",
+    )
+
+    hass.states.async_set(MOCK_PLUG_ENTITY, STATE_UNAVAILABLE)
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, energy_state)
+    hass.states.async_set(MOCK_POWER_ENTITY, power_state)
+
+    raw_store_data = {
+        "version": 1,
+        "minor_version": 2,
+        "key": "ev_charging_manager_sessions",
+        "data": [snapshot],
+    }
+    with (
+        patch(
+            "homeassistant.helpers.storage.Store.async_load",
+            new_callable=AsyncMock,
+            return_value=raw_store_data,
+        ),
+        patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
+    ):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    return entry
+
+
+async def test_deferred_resume_clears_rfid_wait_and_session_survives(
+    hass: HomeAssistant,
+) -> None:
+    """FR-003: a deferred resume racing the engine's own plug handling must not
+    leave an RFID wait armed — the next unplug completes AND persists the
+    session, and a subsequent plug-in starts a new session.
+
+    Adversarial ordering: the engine's plug handler arms the RFID wait
+    (plug=on, trx=null) BEFORE the deferred-recovery resume installs the
+    recovered session. HA's eager-task semantics normally hide this ordering
+    (the resume runs synchronously first); per plan.md the fix must not RELY
+    on eager semantics, so the ordering is driven explicitly here.
+    """
+    snapshot = _make_snapshot(energy_start_kwh=0.0, energy_kwh=5.0)
+    snap_id = snapshot["id"]
+    entry = await _setup_deferred_recovery(hass, snapshot, energy_state="5.0")
+    engine = _get_engine(hass, entry)
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    assert engine._deferred_recovery_unsub is not None, "recovery must be deferred"
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Adversarial step 1: the engine's own plug handler sees plug=on first
+        # (trx is null) and arms the event-driven RFID wait.
+        engine._handle_plug_change("on")
+        assert engine._rfid_wait is not None, "precondition: RFID wait armed before resume"
+
+        # Adversarial step 2: the plug entity state becomes valid — the deferred
+        # resume runs and installs the recovered session over the armed wait.
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is not None and engine.active_session.id == snap_id
+    assert engine._rfid_wait is None, (
+        "FR-003: resume must clear any armed RFID wait before installing the session"
+    )
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Next unplug must complete AND persist the recovered session.
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.active_session is None, "unplug must complete the recovered session"
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1, (
+        "the recovered session must be persisted on unplug — not silently discarded"
+    )
+    assert session_store.sessions[0]["id"] == snap_id
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # A subsequent plug-in (with a known trx) starts a NEW session.
+        hass.states.async_set(MOCK_TRX_ENTITY, "5")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+
+    assert engine.active_session is not None, "subsequent plug-in must start a new session"
+    assert engine.active_session.id != snap_id
+
+
+async def test_plug_off_with_rfid_wait_and_active_session_completes_session(
+    hass: HomeAssistant, freezer
+) -> None:
+    """FR-004: the plug-off RFID-wait exit branch must NOT run when an active
+    session exists — the session path takes precedence."""
+    entry = await _make_engine_entry(
+        hass,
+        plug_state="off",
+        cable_lock_state="Unlocked",
+        power_state="0.0",
+        energy_state="0.0",
+    )
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    engine = _get_engine(hass, entry)
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Normal session: plug in with a non-null trx, charge a bit.
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_POWER_ENTITY, "7200.0")
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "5.0")
+        await hass.async_block_till_done()
+        assert engine.active_session is not None
+        session_id = engine.active_session.id
+
+        freezer.tick(timedelta(minutes=5))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+        # Adversarial residue: an RFID wait is (incorrectly) armed while a
+        # session is active — e.g. left behind by a racing resume path.
+        engine._rfid_wait = _RfidWaitState(plug_on_at=dt_util.utcnow())
+
+        # Unplug: the session path must win over the wait-exit path.
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.active_session is None, (
+        "FR-004: unplug with an active session must complete it — "
+        "not be swallowed by the RFID-wait exit branch"
+    )
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1, "the session must be persisted"
+    assert session_store.sessions[0]["id"] == session_id
+
+
+async def test_recovery_resume_and_timeout_mutually_exclusive(
+    hass: HomeAssistant,
+) -> None:
+    """FR-005: plug-ready and recovery-timeout scheduled in the same loop
+    iteration → exactly one of resume / timeout-completion runs.
+
+    The race is driven explicitly: the timeout callback is captured at arming
+    time and invoked AFTER the resume has already run — modelling a timeout
+    that was scheduled in the same iteration and whose cancellation came too
+    late (cancel handles cannot un-schedule an already-dispatched callback).
+    """
+    snapshot = _make_snapshot(energy_start_kwh=0.0, energy_kwh=5.0)
+    snap_id = snapshot["id"]
+
+    captured: dict = {}
+
+    def _capturing_call_later(hass_, delay, action):
+        # Capture the deferred-recovery timeout action; return a no-op cancel
+        # handle so a later cancel() cannot prevent the already-dispatched call.
+        captured["timeout_action"] = action
+        return lambda: None
+
+    with patch(
+        "custom_components.ev_charging_manager.session_engine_v2.async_call_later",
+        side_effect=_capturing_call_later,
+    ):
+        entry = await _setup_deferred_recovery(hass, snapshot, energy_state="5.0")
+        engine = _get_engine(hass, entry)
+        assert engine._deferred_recovery_unsub is not None
+        assert "timeout_action" in captured, "deferred-recovery timeout must be armed"
+
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    with (
+        patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock),
+        patch(
+            "custom_components.ev_charging_manager.session_engine_v2."
+            "persistent_notification.async_create"
+        ),
+    ):
+        # The plug becomes valid → the deferred resume runs.
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        await hass.async_block_till_done()
+        assert engine.active_session is not None and engine.active_session.id == snap_id
+
+        # The timeout callback — already dispatched in the same iteration —
+        # now runs anyway. FR-005: it must be a no-op.
+        await captured["timeout_action"](dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    completed_count = len([s for s in session_store.sessions if s["id"] == snap_id])
+    completion_events = [e for e in events if e.data.get("session_id") == snap_id]
+
+    assert engine.active_session is not None and engine.active_session.id == snap_id, (
+        "FR-005: the resumed session must survive the late timeout callback"
+    )
+    assert engine.state == SessionEngineState.TRACKING, (
+        "a resumed session must leave the engine in a coherent TRACKING state"
+    )
+    assert completed_count == 0, "the late timeout must not force-complete the resumed session"
+    assert len(completion_events) == 0, "no completion event may fire for the resumed session"
+
+
+# ===========================================================================
+# PR-27 (023-recovery-hardening) US3: A1 — charging duration survives restarts
+# (FR-012, FR-013, FR-014)
+# ===========================================================================
+
+
+async def test_a1_charged_at_restart_preserves_duration_and_avg_power(
+    hass: HomeAssistant,
+) -> None:
+    """FR-013 (the A1 wipe case): CHARGED-at-restart with no further charging →
+    final charging_duration_s and avg_power_w equal the pre-restart values
+    EXACTLY (previously wiped to 0 / 0.0 by the empty post-restart tracker)."""
+    pre_restart_duration_s = 3600
+    energy_total = 7.0
+    now_utc = dt_util.utcnow()
+
+    snapshot = _make_snapshot(
+        energy_start_kwh=0.0,
+        energy_kwh=energy_total,
+        charging_started_at=(now_utc - timedelta(hours=2)).isoformat(),
+        charging_duration_s=pre_restart_duration_s,
+        charging_window_count=1,
+    )
+    # 'charged' sub-state at shutdown: the window was already closed.
+    snapshot["charging_ended_at"] = (now_utc - timedelta(hours=1)).isoformat()
+
+    entry, _save = await _make_engine_entry_with_restart(
+        hass,
+        snapshot,
+        plug_state="on",
+        cable_lock_state="Locked",
+        power_state="0.0",  # no further charging after restart
+        energy_state=str(energy_total),
+    )
+    engine = _get_engine(hass, entry)
+    assert engine.state == SessionEngineState.TRACKING
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1
+    completed = session_store.sessions[0]
+
+    assert completed["charging_duration_s"] == pre_restart_duration_s, (
+        f"A1: charging_duration_s must equal the pre-restart value exactly "
+        f"({pre_restart_duration_s}s), got {completed['charging_duration_s']}s"
+    )
+    expected_avg = round((energy_total * 3_600_000) / pre_restart_duration_s, 1)
+    assert completed["avg_power_w"] == expected_avg, (
+        f"A1: avg_power_w must equal the pre-restart value exactly "
+        f"({expected_avg}W), got {completed['avg_power_w']}W"
+    )
+    assert completed["charging_window_count"] == 1, "window count must carry forward"
+
+
+async def test_a1_closed_plus_open_window_at_restart_no_double_count(
+    hass: HomeAssistant,
+    freezer,
+) -> None:
+    """FR-012: one closed + one open window at restart, charging continues →
+    total = synthetic window (which spans ALL pre-restart windows from the
+    first window's start) + post-restart windows; the closed-window time must
+    NOT additionally be seeded on top (no double-count against the tc020f
+    synthetic-window semantics)."""
+    # Pre-restart: closed window 0:00–0:30 (1800 s), open window since 1:00,
+    # restart at 1:30 → snapshot aggregate = 1800 + 1800 = 3600 s.
+    now_utc = dt_util.utcnow()
+    first_window_start = now_utc - timedelta(minutes=90)
+    synthetic_span_s = 5400  # first_window_start → recovery time
+    post_restart_charge_s = 300
+
+    snapshot = _make_snapshot(
+        energy_start_kwh=0.0,
+        energy_kwh=5.0,
+        charging_started_at=first_window_start.isoformat(),
+        charging_duration_s=3600,  # closed 1800 + open-elapsed 1800 at save time
+        charging_window_count=2,
+    )
+
+    entry, _save = await _make_engine_entry_with_restart(
+        hass,
+        snapshot,
+        plug_state="on",
+        cable_lock_state="Locked",
+        power_state="7200.0",  # charging continues at restart
+        energy_state="5.0",
+    )
+    engine = _get_engine(hass, entry)
+    assert engine.state == SessionEngineState.TRACKING
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Post-restart charging, then idle-close, then unplug.
+        freezer.tick(timedelta(seconds=post_restart_charge_s))
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+        await hass.async_block_till_done()
+        freezer.tick(timedelta(minutes=6))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "6.0")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1
+    completed = session_store.sessions[0]
+    duration = completed["charging_duration_s"]
+
+    # Lower bound: synthetic window + actual post-restart charging.
+    assert duration >= synthetic_span_s + post_restart_charge_s, (
+        f"duration {duration}s must cover the synthetic window ({synthetic_span_s}s) "
+        f"plus post-restart charging ({post_restart_charge_s}s)"
+    )
+    # Upper bound (the double-count guard): the synthetic window already spans
+    # every pre-restart window — seeding the snapshot aggregate (3600 s) on top
+    # would push the total past this bound.
+    assert duration <= synthetic_span_s + post_restart_charge_s + 600, (
+        f"duration {duration}s indicates pre-restart time was double-counted "
+        f"(synthetic window + seeded aggregate)"
+    )
+    # Window count carries forward: 2 pre-restart + 1 post-restart.
+    assert completed["charging_window_count"] == 3, (
+        f"window count must carry forward (2 pre + 1 post), "
+        f"got {completed['charging_window_count']}"
+    )
+
+
+async def test_a1_zero_seed_snapshot_behaves_like_today(hass: HomeAssistant) -> None:
+    """FR-012 edge: a snapshot that never charged (zero aggregates) resumes and
+    completes exactly as today — zero duration, zero average power."""
+    snapshot = _make_snapshot(
+        energy_start_kwh=0.0,
+        energy_kwh=5.0,
+        charging_started_at=None,
+        charging_duration_s=0,
+        charging_window_count=0,
+    )
+
+    entry, _save = await _make_engine_entry_with_restart(
+        hass,
+        snapshot,
+        plug_state="on",
+        cable_lock_state="Locked",
+        power_state="0.0",
+        energy_state="5.0",
+    )
+    engine = _get_engine(hass, entry)
+    assert engine.state == SessionEngineState.TRACKING
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1
+    completed = session_store.sessions[0]
+    assert completed["charging_duration_s"] == 0
+    assert completed["avg_power_w"] == 0.0
+    assert completed["charging_window_count"] == 0

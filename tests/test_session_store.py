@@ -170,3 +170,199 @@ async def test_save_active_session(hass: HomeAssistant):
     saved_list = saved_envelope["data"] if isinstance(saved_envelope, dict) else saved_envelope
     assert len(saved_list) == 1
     assert saved_list[0]["id"] == "active_session"
+
+
+# ---------------------------------------------------------------------------
+# PR-27 (023-recovery-hardening): snapshot lifecycle — clear, FR-011 guard,
+# FR-007 load-time cleanup (T003/T012)
+# ---------------------------------------------------------------------------
+
+
+def make_active_snapshot(session_id: str = "active", energy: float = 1.0) -> dict:
+    """Create a minimal in-progress session snapshot (no ended_at/disconnected_at)."""
+    return {
+        "id": session_id,
+        "energy_kwh": energy,
+        "user_name": "Petra",
+    }
+
+
+def _envelope(sessions: list[dict]) -> dict:
+    """Wrap a session list in a v1.2 store envelope (skips migration on load)."""
+    return {
+        "version": 1,
+        "minor_version": 2,
+        "key": "ev_charging_manager_sessions",
+        "data": sessions,
+    }
+
+
+async def test_clear_active_session_with_empty_completed_list(session_store_with_save):
+    """FR-006 edge: clearing the snapshot works on a fresh install (no sessions)."""
+    store, mock_save = session_store_with_save
+    await store.async_clear_active_session()
+
+    mock_save.assert_called_once()
+    saved_envelope = mock_save.call_args[0][0]
+    assert saved_envelope["data"] == [], "cleared envelope must contain no sessions"
+    assert store.sessions == []
+
+
+async def test_clear_active_session_preserves_completed_sessions(session_store_with_save):
+    """FR-006: clearing the snapshot rewrites the envelope from completed sessions only."""
+    store, mock_save = session_store_with_save
+    await store.add_session(make_session("s1"))
+    await store.add_session(make_session("s2"))
+    mock_save.reset_mock()
+
+    await store.async_clear_active_session()
+
+    mock_save.assert_called_once()
+    saved_envelope = mock_save.call_args[0][0]
+    saved_ids = [s["id"] for s in saved_envelope["data"]]
+    assert saved_ids == ["s1", "s2"], "completed sessions must survive the clear"
+    # No incomplete entries in the written envelope
+    assert all(
+        s.get("ended_at") is not None or s.get("disconnected_at") is not None
+        for s in saved_envelope["data"]
+    )
+
+
+async def test_save_active_session_skips_already_completed_id(session_store_with_save):
+    """FR-011: a snapshot whose session_id is already completed is NOT written."""
+    store, mock_save = session_store_with_save
+    await store.add_session(make_session("s1"))
+    mock_save.reset_mock()
+
+    # Periodic writer captured the active dict before completion landed —
+    # the late write must be skipped, not resurrect "s1" as incomplete.
+    await store.async_save_active_session(make_active_snapshot("s1"))
+
+    mock_save.assert_not_called()
+
+
+async def test_save_active_session_writes_unknown_id(session_store_with_save):
+    """FR-011 control: a snapshot for a NOT-yet-completed id is written normally."""
+    store, mock_save = session_store_with_save
+    await store.add_session(make_session("s1"))
+    mock_save.reset_mock()
+
+    await store.async_save_active_session(make_active_snapshot("s2"))
+
+    mock_save.assert_called_once()
+    saved_envelope = mock_save.call_args[0][0]
+    assert [s["id"] for s in saved_envelope["data"]] == ["s1", "s2"]
+
+
+async def test_load_does_not_erase_snapshot_from_disk(hass: HomeAssistant):
+    """Review F2 (replaces the FR-007 load-time cleanup): load extracts the
+    snapshot WITHOUT writing — the on-disk copy is the only durable one until
+    a recovery decision (resume re-persist / finalize / micro clear) lands."""
+    stored = _envelope([make_session("done"), make_active_snapshot("snap")])
+    store = SessionStore(hass)
+    with (
+        patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored),
+        patch.object(store._store, "async_save", new_callable=AsyncMock) as mock_save,
+    ):
+        sessions, snapshot = await store.async_load()
+
+    assert snapshot is not None and snapshot["id"] == "snap"
+    assert [s["id"] for s in sessions] == ["done"]
+    # Load must not rewrite the envelope — a crash before any recovery
+    # decision would otherwise lose the session permanently.
+    mock_save.assert_not_called()
+
+
+async def test_crash_during_deferred_recovery_keeps_snapshot_recoverable(hass: HomeAssistant):
+    """Review F2: a crash after load but BEFORE any recovery decision (e.g.
+    during deferred recovery, or within persistence_interval_s after resume)
+    must leave the snapshot on disk — the next boot recovers it again.
+
+    Never-consumed-twice (the old FR-007 goal) is now pinned per decision
+    path: micro discards clear explicitly, finalize rewrites via add_session,
+    resume re-persists the session as the new active snapshot."""
+    stored = _envelope([make_active_snapshot("snap")])
+    store1 = SessionStore(hass)
+    with (
+        patch.object(store1._store, "async_load", new_callable=AsyncMock, return_value=stored),
+        patch.object(store1._store, "async_save", new_callable=AsyncMock) as mock_save,
+    ):
+        _sessions, snapshot1 = await store1.async_load()
+    assert snapshot1 is not None and snapshot1["id"] == "snap"
+    mock_save.assert_not_called()
+
+    # Crash before any decision: the next boot loads the SAME on-disk data
+    # and must still find the snapshot.
+    store2 = SessionStore(hass)
+    with (
+        patch.object(store2._store, "async_load", new_callable=AsyncMock, return_value=stored),
+        patch.object(store2._store, "async_save", new_callable=AsyncMock),
+    ):
+        _sessions2, snapshot2 = await store2.async_load()
+    assert snapshot2 is not None and snapshot2["id"] == "snap", (
+        "a crash during deferred recovery must not lose the snapshot"
+    )
+
+
+async def test_periodic_save_does_not_resurrect_completed_session(hass: HomeAssistant):
+    """FR-011 end-to-end (T012): the periodic writer captures the active dict,
+    completion lands, THEN the periodic write fires → no incomplete snapshot of
+    the completed id reaches disk."""
+    store = SessionStore(hass, max_sessions=1000)
+    mock_save = AsyncMock()
+
+    mock_entry = MagicMock()
+    mock_entry.async_on_unload = lambda cb: cb
+
+    # The "engine": returns the active session dict until completion clears it.
+    active_holder: dict = {"session": make_active_snapshot("s1")}
+
+    def get_active() -> dict | None:
+        return active_holder["session"]
+
+    captured_interval_cb: dict = {}
+
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=None):
+        with patch.object(store._store, "async_save", mock_save):
+            await store.async_load()
+            with patch(
+                "custom_components.ev_charging_manager.session_store.async_track_time_interval"
+            ) as mock_track:
+                mock_track.return_value = MagicMock()
+                store.schedule_periodic_save(hass, mock_entry, 300, get_active)
+                captured_interval_cb["save"] = mock_track.call_args[0][1]
+
+            # The periodic _save captured `get_active` — but before the interval
+            # fires, the session COMPLETES (race window): it lands in the store…
+            completed = make_session("s1")
+            await store.add_session(completed)
+            mock_save.reset_mock()
+            # …while the engine-side dict is still momentarily the stale active one
+            # (modelled by get_active still returning it for this tick).
+
+            # The periodic write fires with the stale capture.
+            await captured_interval_cb["save"](None)
+
+    # FR-011: the guard must skip the write — nothing on disk may contain an
+    # incomplete copy of the already-completed session.
+    for call in mock_save.call_args_list:
+        envelope = call.args[0]
+        for entry in envelope["data"]:
+            if entry["id"] == "s1":
+                assert (
+                    entry.get("ended_at") is not None or entry.get("disconnected_at") is not None
+                ), "an incomplete snapshot of the completed session reached disk"
+    mock_save.assert_not_called()
+
+
+async def test_load_without_snapshot_does_not_rewrite(hass: HomeAssistant):
+    """FR-007 control: a clean store (no snapshot) triggers no cleanup write."""
+    stored = _envelope([make_session("done")])
+    store = SessionStore(hass)
+    with (
+        patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored),
+        patch.object(store._store, "async_save", new_callable=AsyncMock) as mock_save,
+    ):
+        _sessions, snapshot = await store.async_load()
+    assert snapshot is None
+    mock_save.assert_not_called()

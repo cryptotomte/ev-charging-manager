@@ -1,7 +1,14 @@
-"""Tests for data gap handling during network outages (US2, FR-007, FR-008, FR-009)."""
+"""Tests for data gap handling during network outages (US2, FR-007, FR-008, FR-009).
+
+PR-27 (023-recovery-hardening) adds a v2-engine section at the bottom:
+mid-session meter-reset detection on the plug-anchored engine (FR-015).
+"""
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
+import pytest
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import (
@@ -10,6 +17,9 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.ev_charging_manager.const import (
+    CONF_CHARGING_IDLE_TIMEOUT_MIN,
+    CONF_DISCONNECT_GRACE_MIN,
+    DEBUG_CAT_DATA_GAP,
     DOMAIN,
     EVENT_SESSION_COMPLETED,
     SessionEngineState,
@@ -18,6 +28,8 @@ from tests.conftest import (
     MOCK_CAR_STATUS_ENTITY,
     MOCK_CHARGER_DATA,
     MOCK_ENERGY_ENTITY,
+    MOCK_POWER_ENTITY,
+    MOCK_TRX_ENTITY,
     setup_session_engine,
     start_charging_session,
     stop_charging_session,
@@ -188,3 +200,179 @@ async def test_data_gap_reset_after_session(hass: HomeAssistant) -> None:
     hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
     await start_charging_session(hass, trx_value="2")
     assert engine._data_gap is False, "New session must start with data_gap=False"
+
+
+# ===========================================================================
+# PR-27 (023-recovery-hardening) US4: mid-session meter reset on the
+# plug-anchored engine (FR-015)
+# ===========================================================================
+
+MOCK_PLUG_ENTITY = "binary_sensor.goe_abc123_car_0"
+MOCK_CABLE_LOCK_ENTITY = "sensor.goe_abc123_cus_value"
+
+
+class _CaptureLogger:
+    """Minimal DebugLogger stand-in recording (category, message) pairs."""
+
+    enabled = True
+
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, str]] = []
+
+    def log(self, category: str, message: str) -> None:
+        self.entries.append((category, message))
+
+    @property
+    def categories(self) -> list[str]:
+        return [c for c, _ in self.entries]
+
+
+async def _make_v2_session(hass: HomeAssistant, start_energy: str = "10.0"):
+    """Set up the plug-anchored engine and start a session at `start_energy`.
+
+    Returns (entry, engine).
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"},
+        options={
+            "plug_entity": MOCK_PLUG_ENTITY,
+            "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
+            CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
+            CONF_DISCONNECT_GRACE_MIN: 10,
+        },
+        title="Test go-e Charger (meter reset)",
+    )
+    hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, start_energy)
+    hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        # Plug in + blip → session starts with energy_start = start_energy.
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_POWER_ENTITY, "7200.0")
+        await hass.async_block_till_done()
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.active_session is not None
+    return entry, engine
+
+
+async def test_v2_mid_session_counter_reset_preserves_energy(hass: HomeAssistant) -> None:
+    """FR-015: energy 10.0 → 12.5 → 0.2 → 1.0 mid-session → 2.5 kWh preserved
+    at the drop, 3.3 kWh after the next reading; data_gap flagged; DATA_GAP
+    logged. Previously the session froze at the pre-reset total."""
+    _entry, engine = await _make_v2_session(hass, start_energy="10.0")
+    capture = _CaptureLogger()
+    engine._debug_logger = capture
+    session = engine.active_session
+    assert session.energy_start_kwh == pytest.approx(10.0)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "12.5")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(2.5, abs=0.001)
+        assert session.data_gap is False
+
+        # Charger reboots — counter restarts near zero.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.2")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(2.5, abs=0.001), (
+            "FR-015: accumulated energy must be preserved across the counter reset"
+        )
+        assert session.data_gap is True, "FR-015: the reset must flag a data gap"
+        assert DEBUG_CAT_DATA_GAP in capture.categories, (
+            f"FR-015: the reset must log a DATA_GAP entry; saw {capture.categories}"
+        )
+
+        # Subsequent deltas accumulate on the rebased reference.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "1.0")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(3.3, abs=0.001), (
+            "FR-015: post-reset deltas must accumulate on top of preserved energy"
+        )
+
+
+async def test_v2_energy_jitter_below_start_no_rebase(hass: HomeAssistant) -> None:
+    """FR-015: a reading epsilon-below the start value is jitter — no rebase,
+    no data-gap flag."""
+    _entry, engine = await _make_v2_session(hass, start_energy="10.0")
+    capture = _CaptureLogger()
+    engine._debug_logger = capture
+    session = engine.active_session
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # 5 Wh below start — within ENERGY_RESET_EPSILON_KWH (10 Wh).
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "9.995")
+        await hass.async_block_till_done()
+
+    assert session.energy_start_kwh == pytest.approx(10.0), (
+        "jitter must not rebase energy_start_kwh"
+    )
+    assert session.data_gap is False, "jitter must not flag a data gap"
+    assert DEBUG_CAT_DATA_GAP not in capture.categories
+
+
+async def test_v2_double_counter_reset_in_one_session_preserves_energy(
+    hass: HomeAssistant,
+) -> None:
+    """Review F3: a SECOND reset in the same session must also be detected.
+
+    Boot-looping charger: start=100, +5 kWh, reset→0.2, +2.8 kWh, reset→0.05,
+    +1 kWh → 8.8 kWh total preserved, two DATA_GAP log entries. Previously the
+    detection compared against the (rebased, now negative) energy_start_kwh,
+    so the second reset went undetected and silently dropped inter-reset energy.
+    """
+    _entry, engine = await _make_v2_session(hass, start_energy="100.0")
+    capture = _CaptureLogger()
+    engine._debug_logger = capture
+    session = engine.active_session
+    assert session.energy_start_kwh == pytest.approx(100.0)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # +5 kWh of normal charging.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "105.0")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(5.0, abs=0.001)
+
+        # First reset: charger reboots, counter restarts near zero.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.2")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(5.0, abs=0.001), (
+            "first reset must preserve the 5 kWh accumulated so far"
+        )
+
+        # +2.8 kWh after the first reset (counter 0.2 → 3.0).
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "3.0")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(7.8, abs=0.001)
+
+        # Second reset in the SAME session: counter drops 3.0 → 0.05.
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "0.05")
+        await hass.async_block_till_done()
+        assert session.energy_kwh == pytest.approx(7.8, abs=0.001), (
+            "F3: the second reset must be detected against the PREVIOUS reading "
+            "— inter-reset energy must not be silently dropped"
+        )
+
+        # +1 kWh after the second reset (counter 0.05 → 1.05).
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "1.05")
+        await hass.async_block_till_done()
+
+    assert session.energy_kwh == pytest.approx(8.8, abs=0.001), (
+        "total energy across two resets must be 5 + 2.8 + 1 = 8.8 kWh"
+    )
+    assert session.data_gap is True
+    assert capture.categories.count(DEBUG_CAT_DATA_GAP) == 2, (
+        f"each reset must log one DATA_GAP entry; saw {capture.categories}"
+    )

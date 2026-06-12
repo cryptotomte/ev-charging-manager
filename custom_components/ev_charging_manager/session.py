@@ -93,7 +93,23 @@ class Session:
     charger_total_before_kwh: float | None = None
     charger_total_after_kwh: float | None = None
 
-    # Data quality flags (PR-07)
+    # Data quality flags (PR-07).
+    #
+    # data_gap is the CENTRAL "this record may be incomplete or imprecise"
+    # flag (this list is the canonical definition — setters reference it):
+    #   - full charger outage detected during tracking (PR-22 FR-028),
+    #   - HA-restart resume (PR-22 FR-026 — every recovered session),
+    #   - mid-session meter reset rebase (PR-27 FR-015),
+    #   - transient disconnect in flight (plug=off with cable_lock not
+    #     Unlocked; restored to its pre-disconnect value when a lagging
+    #     cable_lock→Unlocked confirms a clean unplug, PR-25 FR-012),
+    #   - energy/power entity unavailable mid-session,
+    #   - session kept despite an unparseable connection timestamp
+    #     (PR-27 FR-018, live and recovery paths),
+    #   - degraded completion metric (spot finalize / ETO read / guest
+    #     charge price, review F1a).
+    # The engine mirrors the flag in PlugAnchoredSessionEngine._data_gap and
+    # transfers it onto the session at completion.
     data_gap: bool = False
     reconstructed: bool = False
 

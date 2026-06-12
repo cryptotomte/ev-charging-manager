@@ -231,6 +231,11 @@ MAX_CHARGING_IDLE_TIMEOUT_MIN = 30
 MIN_DISCONNECT_GRACE_MIN = 5
 MAX_DISCONNECT_GRACE_MIN = 30
 
+# PR-27 (023-recovery-hardening): epsilon for energy counter-reset detection.
+# Shared by restart recovery (FR-002) and live mid-session detection (FR-015).
+# 10 Wh — well above float/rounding jitter, far below any genuine reset.
+ENERGY_RESET_EPSILON_KWH = 0.01
+
 # Maximum time to wait for the plug entity to become available before giving up
 # on deferred restart recovery (HIGH-1 fix). If the plug entity never reports a
 # valid state within this window (e.g. user misconfigured the entity id, the
@@ -270,6 +275,10 @@ DEBUG_CAT_HEARTBEAT = "HEARTBEAT"
 
 # PR-24: RFID wait lifecycle events (renamed from RFID_GRACE; event-driven model, no timer).
 DEBUG_CAT_RFID_WAIT = "RFID_WAIT"
+
+# PR-27 (023-recovery-hardening): data-quality events — currently the
+# mid-session energy counter reset (FR-015 rebase).
+DEBUG_CAT_DATA_GAP = "DATA_GAP"
 
 # New HA events (PR-22)
 EVENT_CHARGING_CHARGED = "ev_charging_charged"

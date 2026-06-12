@@ -57,6 +57,7 @@ from .const import (
     DEBUG_CAT_CHARGER_OFFLINE,
     DEBUG_CAT_CHARGING_WINDOW_CLOSE,
     DEBUG_CAT_CHARGING_WINDOW_OPEN,
+    DEBUG_CAT_DATA_GAP,
     DEBUG_CAT_DISCONNECT_DETECTED,
     DEBUG_CAT_DISCONNECT_RESOLVED,
     DEBUG_CAT_HA_RESTART_DETECTED,
@@ -82,6 +83,7 @@ from .const import (
     DEFAULT_STATIC_PRICE_KWH,
     DEFAULT_UI_DISPATCH_INTERVAL_S,
     DEFERRED_RECOVERY_TIMEOUT_MIN,
+    ENERGY_RESET_EPSILON_KWH,
     EVENT_CHARGING_CHARGED,
     EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
@@ -108,6 +110,10 @@ _Unsub = CALLBACK_TYPE | None
 
 # States that indicate an entity has no valid value
 _INVALID_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, None, "null", ""}
+
+# Review F1(b): delay before retrying a completion whose pre-persist phase
+# failed unexpectedly (claim restored, engine back in TRACKING).
+_COMPLETION_RETRY_DELAY_S = 30
 
 # Map RfidResolution.reason → diagnostic reason constant
 _RFID_REASON_MAP: dict[str, UnknownReason] = {
@@ -194,6 +200,14 @@ class PlugAnchoredSessionEngine:
         # NOT persisted across restarts (FR-030)
         self._disconnect_grace_cancel: _Unsub = None
 
+        # Review F1(b): one-shot retry of a completion whose pre-persist phase
+        # failed unexpectedly. While armed, the engine is back in TRACKING with
+        # the restored session; the retry (or a new plug-on, which brings the
+        # completion forward) settles it. The stored disconnected_at preserves
+        # the ORIGINAL unplug moment across the retry.
+        self._completion_retry_unsub: _Unsub = None
+        self._completion_retry_disconnected_at: datetime | None = None
+
         # PR-25 (021-cable-lock-race): captured at the plug→off instant when the
         # transient-disconnect branch starts the grace timer. Used by the
         # cable_lock→Unlocked confirmation path so the completed session records the
@@ -224,7 +238,9 @@ class PlugAnchoredSessionEngine:
         self._heartbeat_log_timer_unsub: _Unsub = None
         self._ui_dispatch_timer_unsub: _Unsub = None
 
-        # Data quality flags
+        # Data quality flags. _data_gap mirrors Session.data_gap — the
+        # canonical list of every condition that sets it lives at the field
+        # definition in session.py. Transferred onto the session at completion.
         self._data_gap: bool = False
         self._eto_start: float | None = None
 
@@ -239,6 +255,12 @@ class PlugAnchoredSessionEngine:
         # Offline state tracking (FR-028: all-entities-unavailable must NOT trigger grace timer)
         self._charger_offline: bool = False
         self._offline_entities_count: int = 0
+        # PR-27 FR-020: True when a transient-disconnect grace was pending at
+        # the moment a full charger outage was detected, or when a grace timer
+        # expired (and was suppressed) during the outage. At outage resolution
+        # a FRESH full grace is re-armed and the normal triggers (re-plug
+        # absorption, unlock confirmation) decide.
+        self._grace_pending_at_outage: bool = False
 
         # Guest pricing snapshot (PR-06 — snapshotted at SESSION_START)
         self._guest_pricing: GuestPricing | None = None
@@ -265,6 +287,13 @@ class PlugAnchoredSessionEngine:
         # plug entity never reports a valid state within DEFERRED_RECOVERY_TIMEOUT_MIN,
         # the engine fires a persistent notification and force-completes the snapshot.
         self._deferred_recovery_timeout_unsub: Any = None
+        # PR-27 FR-005: mutual-exclusion flag between the deferred-recovery
+        # plug-ready resume and its timeout. Whichever callback runs first sets
+        # it (check-and-set before any await — atomic on the single-threaded
+        # event loop, research R2); the other becomes a no-op. Cancelling the
+        # other's handle is not sufficient when both were dispatched in the
+        # same loop iteration.
+        self._recovery_resolved: bool = False
 
         # Build pricing engine from entry data (immutable at runtime)
         pricing_mode = entry.data.get("pricing_mode", "static")
@@ -393,10 +422,32 @@ class PlugAnchoredSessionEngine:
         Called from __init__.async_unload_entry. Listeners registered via
         entry.async_on_unload are torn down by HA itself.
         """
+        # PR-27 FR-019: persist a final active-session snapshot so a reload
+        # mid-session loses at most seconds — not up to a full periodic-save
+        # interval — of tracked state. The FR-011 completed-id guard inside
+        # the store prevents this write from resurrecting a session whose
+        # completion just finished.
+        if self._active_session is not None:
+            try:
+                await self._session_store.async_save_active_session(self._active_session.to_dict())
+                _LOGGER.debug(
+                    "PlugAnchoredSessionEngine: final active-session snapshot "
+                    "persisted at unload (id=%s)",
+                    self._active_session.id,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "PlugAnchoredSessionEngine: final snapshot write at unload failed: %s",
+                    err,
+                )
+
         # Cancel idle/grace timers if still pending.
         self._cancel_idle_timer()
         self._cancel_grace_timer()
         self._cancel_rfid_wait()
+        # Review F1(b): cancel a pending completion retry — the FR-019 final
+        # snapshot above already preserved the restored session for recovery.
+        self._cancel_completion_retry()
 
         # PR-23 US5: cancel periodic HEARTBEAT and UI dispatch timers (FR-015).
         # These are also registered with entry.async_on_unload, but explicit
@@ -490,19 +541,35 @@ class PlugAnchoredSessionEngine:
             return
 
         current_cable_lock = self._get_cable_lock()
-        current_energy = self._get_energy() or 0.0
+        # PR-27 FR-001: keep None when the energy entity is unavailable — an
+        # absent reading is "no evidence", never a counter reset.
+        current_energy = self._get_energy()
         current_power = self._get_power() or 0.0
 
         if self._debug_logger:
+            energy_str = f"{current_energy:.3f}kWh" if current_energy is not None else "unavailable"
             self._debug_logger.log(
                 DEBUG_CAT_HA_RESTART_DETECTED,
                 f"restart detected — snapshot id={snapshot.get('id', '?')} "
                 f"current_plug={current_plug} cable_lock={current_cable_lock} "
-                f"power={current_power:.0f}W energy={current_energy:.3f}kWh",
+                f"power={current_power:.0f}W energy={energy_str}",
             )
 
         energy_start = float(snapshot.get("energy_start_kwh", 0.0))
-        energy_counter_reset = current_energy < energy_start
+        # PR-27 FR-002: only an available reading measurably below the session's
+        # start value is a reset; the epsilon kills float jitter false positives.
+        energy_counter_reset = (
+            current_energy is not None and current_energy < energy_start - ENERGY_RESET_EPSILON_KWH
+        )
+
+        # Effective energy for downstream use: when the live reading is missing,
+        # reconstruct it from the snapshot (start + accumulated) so the session
+        # resumes/completes with its last known values (PR-27 FR-001).
+        effective_energy = (
+            current_energy
+            if current_energy is not None
+            else energy_start + float(snapshot.get("energy_kwh", 0.0))
+        )
 
         # Determine whether plug is currently on (explicit string compare;
         # None was handled by the early return above).
@@ -510,7 +577,7 @@ class PlugAnchoredSessionEngine:
 
         if plug_on and not energy_counter_reset:
             # Cable still in — resume the session (FR-026)
-            await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
+            await self._resume_session_from_snapshot(snapshot, effective_energy, current_power, now)
         else:
             # Cable removed or energy counter reset — complete the old session (FR-027)
             reason = "energy counter reset" if energy_counter_reset else "plug was off at restart"
@@ -519,7 +586,7 @@ class PlugAnchoredSessionEngine:
                 reason,
                 snapshot.get("id", "?"),
             )
-            await self._complete_snapshot_as_session(snapshot, current_energy, now)
+            await self._complete_snapshot_as_session(snapshot, effective_energy, now)
 
             if self._debug_logger:
                 self._debug_logger.log(
@@ -540,6 +607,8 @@ class PlugAnchoredSessionEngine:
         engine fires a persistent notification and force-completes the snapshot
         rather than staying deferred forever.
         """
+        # PR-27 FR-005: fresh mutual-exclusion flag for this deferral round.
+        self._recovery_resolved = False
 
         async def _on_plug_ready(event: Event) -> None:
             new_state = event.data.get("new_state")
@@ -547,6 +616,11 @@ class PlugAnchoredSessionEngine:
                 return
             if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                 return
+            # PR-27 FR-005: check-and-set before any await — if the timeout
+            # already resolved the recovery, this callback is a no-op.
+            if self._recovery_resolved:
+                return
+            self._recovery_resolved = True
             # Plug entity now has a valid state — cancel listener + timeout and resume recovery.
             if self._deferred_recovery_unsub is not None:
                 self._deferred_recovery_unsub()
@@ -571,6 +645,11 @@ class PlugAnchoredSessionEngine:
                 self._active_session = None
 
         async def _on_recovery_timeout(_now: datetime) -> None:
+            # PR-27 FR-005: check-and-set before any await — if the plug-ready
+            # resume already resolved the recovery, this callback is a no-op.
+            if self._recovery_resolved:
+                return
+            self._recovery_resolved = True
             # Cancel the plug-state listener (it will no longer be needed).
             if self._deferred_recovery_unsub is not None:
                 try:
@@ -626,9 +705,13 @@ class PlugAnchoredSessionEngine:
             # path but with restart-time as disconnected_at).
             try:
                 now = dt_util.utcnow()
-                current_energy = self._get_energy() or float(
-                    snapshot.get("energy_start_kwh", 0.0)
-                ) + float(snapshot.get("energy_kwh", 0.0))
+                # PR-27 FR-001: explicit None check — a genuine 0.0 reading is
+                # evidence and must not fall through to the snapshot fallback.
+                current_energy = self._get_energy()
+                if current_energy is None:
+                    current_energy = float(snapshot.get("energy_start_kwh", 0.0)) + float(
+                        snapshot.get("energy_kwh", 0.0)
+                    )
                 await self._complete_snapshot_as_session(snapshot, current_energy, now)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error(
@@ -659,7 +742,22 @@ class PlugAnchoredSessionEngine:
         current_power: float,
         now: datetime,
     ) -> None:
-        """Resume an active session after HA restart with plug still connected."""
+        """Resume an active session after HA restart with plug still connected.
+
+        Post-conditions: any armed RFID wait is cleared (PR-27 FR-003);
+        data_gap is forced True on session and engine (PR-22 FR-026); the
+        pre-restart charging aggregates enter the tracker via seed_base OR a
+        synthetic closed window — never both (seed-split below); in spot mode
+        the hourly snapshot callback is re-armed; and the resumed session is
+        immediately re-persisted as the active snapshot (review F2).
+        """
+        # PR-27 FR-003: clear any armed RFID wait BEFORE installing the session.
+        # The deferred-resume path can race the engine's own plug-on handling,
+        # which arms a wait when trx is null; a leftover wait would make the
+        # next unplug silently discard the recovered session via the wait-exit
+        # branch instead of completing it.
+        self._cancel_rfid_wait()
+
         # Restore session object
         session = Session(
             id=snapshot["id"],
@@ -694,6 +792,10 @@ class PlugAnchoredSessionEngine:
         self._last_energy_kwh = current_energy
         self._last_power_w = current_power
         self._state = SessionEngineState.TRACKING
+        # PR-27: mirror the session-level flag (FR-026 sets data_gap=True on every
+        # restart resume) on the engine flag, so completion's
+        # `session.data_gap = self._data_gap` transfer cannot wipe it later.
+        self._data_gap = True
 
         # BUG-2 fix: re-arm the spot-pricing hourly snapshot callback after restart.
         # Without this, _hourly_unsub stays None, the hourly callback never fires,
@@ -703,16 +805,39 @@ class PlugAnchoredSessionEngine:
         if self._pricing.mode == "spot" and self._hourly_unsub is None:
             self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
             self._hour_energy_snapshot = max(0.0, current_energy - session.energy_start_kwh)
-            self._hourly_unsub = async_track_utc_time_change(
-                self._hass, self._async_hourly_snapshot, minute=0, second=0
-            )
-            self._engine_unsubs.append(self._hourly_unsub)
+            self._arm_hourly_spot_callback()
             if self._debug_logger:
                 self._debug_logger.log(
                     DEBUG_CAT_SESSION_RESUMED,
                     "spot-pricing hourly snapshot callback re-armed at restart"
                     f" (hour_start={self._hour_start_time}"
                     f" hour_energy_snapshot={self._hour_energy_snapshot:.3f}kWh)",
+                )
+
+        # PR-27 FR-012 (A1): carry pre-restart charging aggregates forward as a
+        # tracker base offset, so window-close and completion ADD to them
+        # instead of overwriting with post-restart-only totals. Seed split
+        # (research R3):
+        #   - CHARGED at restart (charging_ended_at set): no synthetic window is
+        #     injected below, so the FULL snapshot aggregate is seeded — this is
+        #     the A1 wipe case (hours of charging previously reset to zero and
+        #     avg_power_w to 0.0 at completion).
+        #   - CHARGING at restart (open pre-restart window): the synthetic
+        #     window below spans charging_started_at → now, a SUPERSET of every
+        #     pre-restart window (charging_started_at is the FIRST window's
+        #     start, per IC-6 gap absorption) — seeding any remainder on top
+        #     would double-count, so nothing is seeded.
+        #   - Never charged: aggregates are zero; seeding is a no-op.
+        if session.charging_started_at is not None and session.charging_ended_at is not None:
+            self._window_tracker.seed_base(
+                session.charging_duration_s, session.charging_window_count
+            )
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_SESSION_RESUMED,
+                    f"pre-restart charging aggregates seeded as tracker base — "
+                    f"duration={session.charging_duration_s}s "
+                    f"windows={session.charging_window_count} (A1 fix)",
                 )
 
         # Inject a synthetic closed window for any pre-restart open window whose close event
@@ -761,12 +886,19 @@ class PlugAnchoredSessionEngine:
                     session.charging_started_at,
                     exc,
                 )
+                # PR-27 FR-012: without the synthetic window, fall back to
+                # seeding the snapshot aggregates so the pre-restart charging
+                # time still survives (previously it was silently undercounted).
+                self._window_tracker.seed_base(
+                    session.charging_duration_s, session.charging_window_count
+                )
                 if self._debug_logger:
                     self._debug_logger.log(
                         DEBUG_CAT_HA_RESTART_DETECTED,
                         f"synthetic-window injection failed ({type(exc).__name__}: {exc}) — "
-                        f"continuing without pre-restart window in tracker; "
-                        f"charging_duration_s will be undercounted for this session",
+                        f"seeded snapshot aggregates as tracker base instead "
+                        f"(duration={session.charging_duration_s}s "
+                        f"windows={session.charging_window_count})",
                     )
         # else: session has no pre-restart open window — either INITIALIZING (no window had
         # opened yet) or already finalized (charging_ended_at set); nothing to inject.
@@ -801,6 +933,19 @@ class PlugAnchoredSessionEngine:
             session.user_name,
         )
 
+        # Review F2: immediately re-persist the resumed session as the active
+        # snapshot. async_load no longer strips the snapshot from disk, so this
+        # write is what keeps the on-disk copy fresh; if it fails the original
+        # snapshot is still on disk (non-fatal — log and continue tracking).
+        try:
+            await self._session_store.async_save_active_session(session.to_dict())
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: immediate post-resume snapshot re-persist "
+                "failed: %s — the pre-restart snapshot remains on disk",
+                err,
+            )
+
     async def _complete_snapshot_as_session(
         self, snapshot: dict, current_energy: float, now: datetime
     ) -> None:
@@ -816,11 +961,20 @@ class PlugAnchoredSessionEngine:
         connected_at_str = snapshot.get("connected_at") or snapshot.get(
             "started_at", now.isoformat()
         )
+        connection_parse_failed = False
         try:
             connected_at = datetime.fromisoformat(connected_at_str)
             connection_s = max(0, int((now - connected_at).total_seconds()))
         except (ValueError, TypeError):
             connection_s = 0
+            connection_parse_failed = True
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine recovery: malformed connected_at=%r for "
+                "snapshot id=%s — connection_duration_s set to 0; micro filter "
+                "falls back to AND semantics (FR-018)",
+                connected_at_str,
+                snapshot.get("id", "?"),
+            )
 
         charging_duration_s = int(
             snapshot.get("charging_duration_s") or snapshot.get("duration_seconds", 0)
@@ -859,20 +1013,33 @@ class PlugAnchoredSessionEngine:
         if charging_duration_s > 0 and session.energy_kwh > 0:
             session.avg_power_w = round((session.energy_kwh * 3_600_000) / charging_duration_s, 1)
 
-        min_duration = self._entry.options.get(
-            CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
+        # PR-27 FR-018 (recovery path, review F4): mirrors the live path in
+        # _async_complete_session_impl — a corrupt timestamp must not discard
+        # real energy, since the snapshot-clear below makes it irrecoverable.
+        # Kept sessions already carry data_gap=True (set unconditionally in
+        # this path).
+        is_micro = self._is_micro_session(
+            connection_s, session.energy_kwh, duration_unreliable=connection_parse_failed
         )
-        min_energy_kwh = (
-            self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
-            / 1000.0
-        )
-        is_micro = connection_s < min_duration or session.energy_kwh < min_energy_kwh
+        if connection_parse_failed and not is_micro and self._debug_logger:
+            self._debug_logger.log(
+                DEBUG_CAT_DATA_GAP,
+                f"connected_at unparseable for recovered snapshot id={session.id} — "
+                "kept (energy above micro threshold), data_gap=True (FR-018)",
+            )
 
         if not is_micro:
             await self._session_store.add_session(session.to_dict())
             self._hass.bus.async_fire(
                 EVENT_SESSION_COMPLETED, self._build_completed_event_data(session)
             )
+        else:
+            # PR-27 FR-006: a recovery snapshot discarded as micro must not
+            # linger on disk — clear it so a later restart cannot resurrect it
+            # as a multi-day phantom. This is the ONLY thing that removes the
+            # snapshot on the micro path: async_load deliberately leaves it on
+            # disk until a recovery decision lands (review F2).
+            await self._session_store.async_clear_active_session()
 
         self._state = SessionEngineState.IDLE
 
@@ -1127,6 +1294,25 @@ class PlugAnchoredSessionEngine:
                     DEBUG_CAT_CHARGER_BACK_ONLINE,
                     f"plug entity back online (value={new_val})",
                 )
+            # PR-27 FR-020: the outage interrupted an open grace question.
+            # Re-arm a FRESH full grace and let the normal triggers decide
+            # (re-plug absorption, cable-lock unlock confirmation). The
+            # boot-sequence plug=off itself is swallowed — entities flap while
+            # the charger restarts, exactly when not to take irreversible
+            # action (research R5; clarification 2026-06-11).
+            if self._grace_pending_at_outage:
+                self._grace_pending_at_outage = False
+                if self._active_session is not None and new_val == "off":
+                    self._start_grace_timer()
+                    if self._debug_logger:
+                        self._debug_logger.log(
+                            DEBUG_CAT_DISCONNECT_DETECTED,
+                            "fresh full grace timer armed at outage resolution "
+                            "(plug=off) — normal triggers will decide (FR-020)",
+                        )
+                    return
+                # plug == "on": fall through — _handle_plug_on absorbs the
+                # disconnect as transient (existing behavior).
 
         if new_val == "on":
             self._handle_plug_on()
@@ -1186,9 +1372,18 @@ class PlugAnchoredSessionEngine:
 
         PR-24 FR-004: if the RFID wait is active (no session committed yet),
         clear it and return to IDLE — do NOT start a session.
+
+        PR-27 FR-004 precedence: the wait-exit branch runs ONLY when no active
+        session exists. With both present (a stale wait left by a racing
+        resume), the session path wins — the unplug must complete the session,
+        not strand it behind the wait cleanup.
         """
-        if self._state == SessionEngineState.IDLE:
-            return  # no session to end
+        if self._state != SessionEngineState.TRACKING:
+            # PR-27 FR-008: IDLE has no session to end; COMPLETING means a
+            # completion is already in flight — a second plug trigger must not
+            # re-enter the pipeline (trigger flapping during the completion's
+            # disk write used to double-complete the session).
+            return
 
         # PR-22 FR-028: If all entities just went unavailable simultaneously,
         # do NOT treat this as a real plug-off
@@ -1198,7 +1393,10 @@ class PlugAnchoredSessionEngine:
 
         # PR-24 FR-004: if RFID wait is active, a session has not been committed
         # yet — cancel the wait and return to IDLE without starting any session.
-        if self._rfid_wait is not None:
+        # PR-27 FR-004: only when NO active session exists — with both present
+        # (stale wait left by a racing resume) the session path takes precedence;
+        # the unplug must complete the session, not strand it.
+        if self._rfid_wait is not None and self._active_session is None:
             self._cancel_rfid_wait()
             self._state = SessionEngineState.IDLE
             if self._debug_logger:
@@ -1262,6 +1460,12 @@ class PlugAnchoredSessionEngine:
         handler never reads car_status and never splits sessions (FR-008 / FR-N01..N05).
         """
         if new_val != "Unlocked":
+            return
+        if self._state != SessionEngineState.TRACKING:
+            # PR-27 FR-008: only an actively-tracking engine may confirm an
+            # unplug. In COMPLETING a completion is already in flight — a late
+            # Unlocked (e.g. after grace expiry, via a stale handle) must not
+            # fire a second completion.
             return
         if self._disconnect_grace_cancel is None:
             return
@@ -1334,7 +1538,30 @@ class PlugAnchoredSessionEngine:
 
         @callback
         def _grace_expired(_now: datetime) -> None:
-            """Force-end session when grace period expires."""
+            """Force-end session when grace period expires.
+
+            FR-020 (PR-27) outage suppression: when the timer fires during a
+            full charger outage there is no evidence to act on — the
+            completion is suppressed, _grace_pending_at_outage is set, and a
+            FRESH full grace is re-armed at outage resolution instead.
+            """
+            # PR-27 FR-009: a fired timer clears its handle immediately, so
+            # "grace pending" guards can never be satisfied by a stale handle.
+            self._disconnect_grace_cancel = None
+            if self._charger_offline:
+                # PR-27 FR-020: a timer that expired while every signal was
+                # absent has no evidence to act on — never force-complete
+                # mid-outage. Keep the grace question open; the outage
+                # resolution path arms a fresh full grace.
+                self._grace_pending_at_outage = True
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        DEBUG_CAT_CHARGER_OFFLINE,
+                        f"grace timer expired during full charger outage after {grace_min} min "
+                        "— completion suppressed; a fresh grace will be armed at "
+                        "outage resolution (FR-020)",
+                    )
+                return
             if self._state != SessionEngineState.TRACKING:
                 return
             if self._debug_logger:
@@ -1370,6 +1597,68 @@ class PlugAnchoredSessionEngine:
     def _cancel_grace_timer(self) -> None:
         """Cancel the disconnect grace timer if active."""
         self._safe_cancel("_disconnect_grace_cancel")
+
+    # -----------------------------------------------------------------------
+    # Completion retry backstop (review F1b)
+    # -----------------------------------------------------------------------
+
+    def _arm_completion_retry(self, disconnected_at: datetime | None) -> None:
+        """Arm a one-shot retry of a failed completion (review F1b).
+
+        Called by the completion wrapper after the impl restored its claim
+        (pre-persist failure). The engine is back in TRACKING with the
+        restored session; in 30 s the retry re-invokes the completion with
+        the ORIGINAL disconnect time. If the retry attempt fails again, the
+        wrapper re-arms — the engine keeps retrying every 30 s until the
+        fault clears or another trigger settles the session (never strands).
+
+        Args:
+            disconnected_at: The original completion call's disconnect time
+                (None for the synchronous plug-off and grace-expiry paths,
+                which use completion-time "now").
+        """
+        self._safe_cancel("_completion_retry_unsub")
+        self._completion_retry_disconnected_at = disconnected_at
+
+        @callback
+        def _retry(_now: datetime) -> None:
+            self._completion_retry_unsub = None
+            retry_disconnected_at = self._completion_retry_disconnected_at
+            self._completion_retry_disconnected_at = None
+            if self._active_session is None:
+                return
+            if self._state != SessionEngineState.TRACKING:
+                # COMPLETING: another trigger already re-entered the pipeline.
+                return
+            _LOGGER.info(
+                "PlugAnchoredSessionEngine: retrying failed completion for session id=%s",
+                self._active_session.id,
+            )
+            self._state = SessionEngineState.COMPLETING
+            self._hass.async_create_task(self._complete_pending_retry(retry_disconnected_at))
+
+        self._completion_retry_unsub = async_call_later(
+            self._hass, _COMPLETION_RETRY_DELAY_S, _retry
+        )
+
+    def _cancel_completion_retry(self) -> None:
+        """Cancel the pending completion retry if armed (review F1b). Idempotent."""
+        self._safe_cancel("_completion_retry_unsub")
+        self._completion_retry_disconnected_at = None
+
+    async def _complete_pending_retry(self, disconnected_at: datetime | None) -> None:
+        """Run a deferred completion and pick up a waiting plug-on (review F1b).
+
+        Used by both the 30 s retry timer and the plug-on bring-forward path
+        in _handle_plug_on_during_tracking. After the old session completes,
+        the engine is IDLE; if the plug is (still / again) on, a new car was
+        inserted while the failed completion was pending — process it as a
+        fresh plug-on so the insertion starts its own session instead of
+        being merged into the dead one (F1(b)(iv), cross-user merge guard).
+        """
+        await self._async_complete_session(disconnected_at=disconnected_at)
+        if self._state == SessionEngineState.IDLE and self._get_plug() == "on":
+            self._handle_plug_on()
 
     # -----------------------------------------------------------------------
     # RFID event-driven wait — entry into and exit from the `waiting_for_rfid`
@@ -1522,9 +1811,11 @@ class PlugAnchoredSessionEngine:
             self._open_window(now)
 
         elif not is_charging and tracker.is_open():
-            # Power dropped to 0 within an open window — start idle timer
-            self._cancel_idle_timer()
-            self._start_idle_timer(now)
+            # Power dropped to 0 within an open window — arm the idle timer.
+            # PR-27 FR-016: only when none is pending — repeated zero-power
+            # events must not push the deadline out indefinitely.
+            if self._idle_timer_cancel is None:
+                self._start_idle_timer(now)
 
         elif is_charging and tracker.is_open() and not was_charging:
             # Power resumed within an open window (was 0, now > 0, window already open)
@@ -1564,6 +1855,9 @@ class PlugAnchoredSessionEngine:
         @callback
         def _idle_expired(fire_time: datetime) -> None:
             """Close the current window after idle timeout elapses."""
+            # PR-27 FR-009: a fired timer clears its handle immediately, so
+            # "idle pending" checks (FR-016 arming guard) reflect reality.
+            self._idle_timer_cancel = None
             if not self._window_tracker.is_open():
                 return
             self._close_window(fire_time)
@@ -1575,9 +1869,18 @@ class PlugAnchoredSessionEngine:
         """Cancel the idle timer if active (power resumed before timeout)."""
         self._safe_cancel("_idle_timer_cancel")
 
-    def _close_window(self, now: datetime) -> None:
-        """Close the active charging window (T026) and fire ev_charging_charged."""
-        session = self._active_session
+    def _close_window(self, now: datetime, session: Session | None = None) -> None:
+        """Close the active charging window (T026) and fire ev_charging_charged.
+
+        Args:
+            now: Close timestamp for the window.
+            session: PR-27 FR-010 — the completion pipeline claims the active
+                session atomically (``self._active_session`` becomes ``None``
+                before this is called) and passes it explicitly. All other
+                callers omit it and the active session is used.
+        """
+        if session is None:
+            session = self._active_session
         if session is None or not self._window_tracker.is_open():
             return
 
@@ -1644,8 +1947,42 @@ class PlugAnchoredSessionEngine:
         except (ValueError, TypeError):
             return
 
+        # Review F3: capture the previous reading BEFORE overwriting the cache —
+        # reset detection must compare against it, not against energy_start_kwh.
+        prev_energy_kwh = self._last_energy_kwh
         self._last_energy_kwh = energy_kwh
         session = self._active_session
+
+        # PR-27 FR-015: live counter-reset detection. A reading measurably below
+        # the PREVIOUS reading means the charger rebooted and its counter
+        # restarted from ~0. Rebase the start reference so the energy
+        # accumulated so far is preserved and subsequent deltas add on top
+        # (previously the delta clamped to 0 for the rest of the session).
+        # Comparing against energy_start_kwh would miss a SECOND reset in the
+        # same session: the first rebase can push energy_start_kwh negative,
+        # so no later near-zero reading would ever undercut it (review F3).
+        reference_kwh = prev_energy_kwh if prev_energy_kwh is not None else session.energy_start_kwh
+        if energy_kwh < reference_kwh - ENERGY_RESET_EPSILON_KWH:
+            old_start = session.energy_start_kwh
+            session.energy_start_kwh = energy_kwh - session.energy_kwh
+            session.data_gap = True
+            self._data_gap = True
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: mid-session energy counter reset detected "
+                "(reading=%.3f kWh < previous=%.3f kWh) — rebased start to %.3f kWh, "
+                "accumulated %.3f kWh preserved, session flagged data_gap",
+                energy_kwh,
+                reference_kwh,
+                session.energy_start_kwh,
+                session.energy_kwh,
+            )
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_DATA_GAP,
+                    f"mid-session counter reset: reading={energy_kwh:.3f}kWh "
+                    f"old_start={old_start:.3f}kWh new_start={session.energy_start_kwh:.3f}kWh "
+                    f"accumulated={session.energy_kwh:.3f}kWh preserved (FR-015)",
+                )
 
         # Energy delta from session start
         session.energy_kwh = max(0.0, energy_kwh - session.energy_start_kwh)
@@ -1793,14 +2130,7 @@ class PlugAnchoredSessionEngine:
                 self._active_session.price_details = []
                 self._hour_energy_snapshot = 0.0
                 self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-                self._hourly_unsub = async_track_utc_time_change(
-                    self._hass, self._async_hourly_snapshot, minute=0, second=0
-                )
-                # BUG-6 fix: do NOT call entry.async_on_unload here. Each session would
-                # leak a stale callback into the entry's unload list because
-                # _async_complete_session cancels the handle but cannot remove it from
-                # the list. Manage lifecycle ourselves via async_unload() below.
-                self._engine_unsubs.append(self._hourly_unsub)
+                self._arm_hourly_spot_callback()
 
             # Story 07: check for unmapped RFID and trigger passive notification if needed
             if session_user_type == "unknown" and resolution is not None:
@@ -1859,6 +2189,19 @@ class PlugAnchoredSessionEngine:
             self._state = SessionEngineState.IDLE
             self._active_session = None
             self._rfid_wait = None
+            # PR-27 FR-017: a failed start must cancel the hourly spot callback
+            # it may have armed, or the next spot session would run with a
+            # leaked duplicate (double hourly price entries).
+            if self._hourly_unsub is not None:
+                try:
+                    self._engine_unsubs.remove(self._hourly_unsub)
+                except ValueError:
+                    pass
+                try:
+                    self._hourly_unsub()
+                except Exception as unsub_err:  # noqa: BLE001
+                    _LOGGER.debug("hourly_unsub cancel failed after start failure: %s", unsub_err)
+                self._hourly_unsub = None
             # Surface to the user via persistent notification (mirror BUG-4 pattern).
             try:
                 persistent_notification.async_create(
@@ -2018,13 +2361,41 @@ class PlugAnchoredSessionEngine:
                     f"unexpected completion error session_id={session_id} error={err!r} "
                     "— engine force-reset to IDLE",
                 )
-            # Reset engine state so a returning plug-on / RFID can start fresh.
-            self._active_session = None
-            self._state = SessionEngineState.IDLE
+            # PR-27 FR-010: if the impl restored its atomic claim (the failure
+            # happened BEFORE anything was persisted or fired), the engine
+            # still owns the session — return to TRACKING and arm a real retry.
+            # Review F1(b): without the timer NO viable trigger exists (grace
+            # was cancelled at the top of the impl, the plug is already off,
+            # and the cable-lock confirmation requires a pending grace) — the
+            # restored session would strand, absorb the next plug-on
+            # (cross-user merge) and be silently filed as completed by
+            # SessionStore._is_complete() on the next restart.
+            if self._active_session is not None:
+                self._state = SessionEngineState.TRACKING
+                self._arm_completion_retry(disconnected_at)
+            else:
+                # Reset engine state so a returning plug-on / RFID can start fresh.
+                self._state = SessionEngineState.IDLE
             self._dispatch_update()
 
     async def _async_complete_session_impl(self, disconnected_at: datetime | None = None) -> None:
         """Finalize session: compute metrics, apply micro-filter, persist, fire event.
+
+        PR-27 FR-010 claim/restore contract (revised by review F1):
+          - The active session is CLAIMED synchronously at entry
+            (``self._active_session`` → None before the first await), so a
+            second completion attempt finds no session and aborts.
+          - The exception-prone metrics steps (spot final-hour finalize, ETO
+            read, guest charge price) DEGRADE on failure (WARNING +
+            data_gap=True + safe value) — they never abort the completion
+            (review F1a).
+          - On a truly unexpected pre-persist exception the claim is RESTORED
+            after undoing this attempt's speculative mutations
+            (disconnected_at/ended_at cleared; speculative spot final-hour
+            entry popped and the hourly callback re-armed), then the exception
+            propagates. The wrapper reads ``self._active_session`` to choose
+            TRACKING (claim restored → arm the 30 s F1(b) retry) vs IDLE
+            (nothing to retry).
 
         Args:
             disconnected_at: PR-25 (021-cable-lock-race). When provided, this UTC
@@ -2035,125 +2406,214 @@ class PlugAnchoredSessionEngine:
                 the real unplug moment, not the 0–3 s-later confirmation (FR-011).
                 When ``None`` (every existing caller), current ``now`` behavior is kept.
         """
-        session = self._active_session
+        # PR-27 FR-010: claim the active session atomically BEFORE the first
+        # await. A second completion attempt (trigger flapping, racing timers)
+        # finds no session and aborts. The swap runs synchronously on the
+        # single-threaded event loop, so check-and-claim cannot interleave
+        # (research R2). Defense in depth with the FR-008 state guards and
+        # FR-009 handle hygiene.
+        session, self._active_session = self._active_session, None
 
         if session is None:
             self._state = SessionEngineState.IDLE
             self._dispatch_update()
             return
 
-        # Cancel any pending timers
-        self._cancel_idle_timer()
-        self._cancel_grace_timer()
+        # Review F1(b): tracks whether THIS attempt appended the speculative
+        # spot final-hour entry — popped again in the exception path so a
+        # retried completion cannot duplicate it.
+        spot_final_appended = False
 
-        now = dt_util.utcnow()
-        # PR-25: the recorded disconnect time may differ from "now" when the session
-        # is completed via the cable_lock→Unlocked confirmation path (FR-011). The
-        # charging-window close still uses "now" — windows are finalized at the
-        # moment the session completes, independent of the disconnect timestamp.
-        disconnect_time = disconnected_at if disconnected_at is not None else now
-        now_iso = disconnect_time.isoformat()
-
-        # Close any open window with current time
-        if self._window_tracker.is_open():
-            self._close_window(now)
-
-        # Compute final durations
-        connected_at_str = session.connected_at or session.started_at
         try:
-            connected_at = datetime.fromisoformat(connected_at_str)
-            connection_s = max(0, int((disconnect_time - connected_at).total_seconds()))
-        except (ValueError, TypeError):
-            connection_s = 0
-            # A malformed connected_at silently zeroes connection_duration and can push
-            # the session under the micro-filter threshold, discarding it without trace.
-            # Log it so a silently-dropped session is auditable.
-            _LOGGER.warning(
-                "PlugAnchoredSessionEngine: malformed connected_at=%r for session id=%s "
-                "— connection_duration_s set to 0 (session may be discarded by micro-filter)",
-                connected_at_str,
-                session.id,
-            )
-            if self._debug_logger:
-                self._debug_logger.log(
-                    "SESSION_STOP",
-                    f"malformed connected_at={connected_at_str!r} session_id={session.id} "
-                    "— connection_duration_s=0",
+            # Cancel any pending timers
+            self._cancel_idle_timer()
+            self._cancel_grace_timer()
+
+            now = dt_util.utcnow()
+            # PR-25: the recorded disconnect time may differ from "now" when the
+            # session is completed via the cable_lock→Unlocked confirmation path
+            # (FR-011). The charging-window close still uses "now" — windows are
+            # finalized at the moment the session completes, independent of the
+            # disconnect timestamp.
+            disconnect_time = disconnected_at if disconnected_at is not None else now
+            now_iso = disconnect_time.isoformat()
+
+            # Close any open window with current time (session passed explicitly —
+            # the claim above already detached it from self._active_session).
+            if self._window_tracker.is_open():
+                self._close_window(now, session)
+
+            # Compute final durations
+            connected_at_str = session.connected_at or session.started_at
+            connection_parse_failed = False
+            try:
+                connected_at = datetime.fromisoformat(connected_at_str)
+                connection_s = max(0, int((disconnect_time - connected_at).total_seconds()))
+            except (ValueError, TypeError):
+                connection_s = 0
+                connection_parse_failed = True
+                # A malformed connected_at silently zeroes connection_duration and can push
+                # the session under the micro-filter threshold, discarding it without trace.
+                # Log it so a silently-dropped session is auditable.
+                _LOGGER.warning(
+                    "PlugAnchoredSessionEngine: malformed connected_at=%r for session id=%s "
+                    "— connection_duration_s set to 0 (session may be discarded by micro-filter)",
+                    connected_at_str,
+                    session.id,
+                )
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        "SESSION_STOP",
+                        f"malformed connected_at={connected_at_str!r} session_id={session.id} "
+                        "— connection_duration_s=0",
+                    )
+
+            session.disconnected_at = now_iso
+            session.ended_at = now_iso  # backward compat alias
+            session.connection_duration_s = connection_s
+
+            # charging_duration_s is the sum of all window durations (PR-22 FR-011)
+            session.charging_duration_s = self._window_tracker.total_charging_duration_s()
+
+            # avg_power_w computed from charging_duration_s, NOT connection (PR-22 FR-012)
+            if session.charging_duration_s > 0 and session.energy_kwh > 0:
+                session.avg_power_w = round(
+                    (session.energy_kwh * 3_600_000) / session.charging_duration_s, 1
+                )
+            else:
+                session.avg_power_w = 0.0
+
+            # Transfer data quality flags
+            session.data_gap = self._data_gap
+            session.reconstructed = getattr(session, "reconstructed", False)
+
+            # Spot mode: finalize last partial hour.
+            # Review F1(a): degraded on failure — a spot read/calc error must
+            # not strand the session; the cost stays at the running estimate
+            # (kept current by _handle_energy_update) and data_gap flags it.
+            if self._pricing.mode == "spot" and self._hourly_unsub is not None:
+                # Remove the unsub from the engine-managed list before calling it so
+                # async_unload() doesn't double-cancel a stale handle (BUG-6).
+                try:
+                    self._engine_unsubs.remove(self._hourly_unsub)
+                except ValueError:
+                    pass
+                self._hourly_unsub()
+                self._hourly_unsub = None
+                try:
+                    current_relative_energy = (
+                        self._last_energy_kwh or 0.0
+                    ) - session.energy_start_kwh
+                    kwh_final = max(0.0, current_relative_energy - self._hour_energy_snapshot)
+                    spot_price = self._read_spot_price()
+                    final_detail = self._pricing.calculate_spot_hour(kwh_final, spot_price)
+                    final_detail["hour"] = self._hour_start_time
+                    final_detail["kwh"] = round(kwh_final, 3)
+                    if session.price_details is None:
+                        session.price_details = []
+                    session.price_details.append(final_detail)
+                    spot_final_appended = True
+                    session.cost_total_kr = self._pricing.calculate_spot_total(
+                        session.price_details
+                    )
+                except Exception as err:  # noqa: BLE001 — degrade, never strand (F1a)
+                    session.data_gap = True
+                    self._data_gap = True
+                    _LOGGER.warning(
+                        "PlugAnchoredSessionEngine: spot final-hour finalize failed for "
+                        "session id=%s: %s — cost degraded to running estimate "
+                        "(%.4f kr), data_gap=True",
+                        session.id,
+                        err,
+                        session.cost_total_kr,
+                    )
+
+            # ETO cross-validation.
+            # Review F1(a): degraded on failure — totals stay unset.
+            try:
+                eto_end = self._get_eto()
+                if self._eto_start is not None and eto_end is not None:
+                    session.charger_total_before_kwh = self._eto_start
+                    session.charger_total_after_kwh = eto_end
+            except Exception as err:  # noqa: BLE001 — degrade, never strand (F1a)
+                session.data_gap = True
+                self._data_gap = True
+                _LOGGER.warning(
+                    "PlugAnchoredSessionEngine: ETO cross-validation read failed for "
+                    "session id=%s: %s — charger totals left unset, data_gap=True",
+                    session.id,
+                    err,
                 )
 
-        session.disconnected_at = now_iso
-        session.ended_at = now_iso  # backward compat alias
-        session.connection_duration_s = connection_s
-
-        # charging_duration_s is the sum of all window durations (FR-011)
-        session.charging_duration_s = self._window_tracker.total_charging_duration_s()
-
-        # avg_power_w computed from charging_duration_s, NOT connection (FR-012)
-        if session.charging_duration_s > 0 and session.energy_kwh > 0:
-            session.avg_power_w = round(
-                (session.energy_kwh * 3_600_000) / session.charging_duration_s, 1
-            )
-        else:
-            session.avg_power_w = 0.0
-
-        # Transfer data quality flags
-        session.data_gap = self._data_gap
-        session.reconstructed = getattr(session, "reconstructed", False)
-
-        # Spot mode: finalize last partial hour
-        if self._pricing.mode == "spot" and self._hourly_unsub is not None:
-            # Remove the unsub from the engine-managed list before calling it so
-            # async_unload() doesn't double-cancel a stale handle (BUG-6).
+            # Final guest charge price.
+            # Review F1(a): degraded on failure — the running charge price
+            # (updated during energy tracking) is kept.
             try:
-                self._engine_unsubs.remove(self._hourly_unsub)
-            except ValueError:
-                pass
-            self._hourly_unsub()
-            self._hourly_unsub = None
-            current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
-            kwh_final = max(0.0, current_relative_energy - self._hour_energy_snapshot)
-            spot_price = self._read_spot_price()
-            final_detail = self._pricing.calculate_spot_hour(kwh_final, spot_price)
-            final_detail["hour"] = self._hour_start_time
-            final_detail["kwh"] = round(kwh_final, 3)
-            if session.price_details is None:
-                session.price_details = []
-            session.price_details.append(final_detail)
-            session.cost_total_kr = self._pricing.calculate_spot_total(session.price_details)
+                charge_price = self._calculate_charge_price(session)
+            except Exception as err:  # noqa: BLE001 — degrade, never strand (F1a)
+                charge_price = None
+                session.data_gap = True
+                self._data_gap = True
+                _LOGGER.warning(
+                    "PlugAnchoredSessionEngine: guest charge-price calculation failed "
+                    "for session id=%s: %s — running charge price kept, data_gap=True",
+                    session.id,
+                    err,
+                )
+            if charge_price is not None:
+                session.charge_price_total_kr = charge_price
 
-        # ETO cross-validation
-        eto_end = self._get_eto()
-        if self._eto_start is not None and eto_end is not None:
-            session.charger_total_before_kwh = self._eto_start
-            session.charger_total_after_kwh = eto_end
-
-        # Final guest charge price
-        charge_price = self._calculate_charge_price(session)
-        if charge_price is not None:
-            session.charge_price_total_kr = charge_price
-
-        # Micro-filter (FR-N04 note: fumble sessions are two separate sessions;
-        # micro-filter handles them by discarding sub-threshold records)
-        min_duration = self._entry.options.get(
-            CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
-        )
-        min_energy_kwh = (
-            self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
-            / 1000.0
-        )
-        is_micro = connection_s < min_duration or session.energy_kwh < min_energy_kwh
-
-        if self._debug_logger:
-            h = connection_s // 3600
-            m = (connection_s % 3600) // 60
-            s = connection_s % 60
-            self._debug_logger.log(
-                "SESSION_STOP",
-                f"session_id={session.id} energy={session.energy_kwh:.3f}kWh "
-                f"connection={h}:{m:02d}:{s:02d} "
-                f"charging_duration={session.charging_duration_s}s "
-                f"windows={session.charging_window_count} micro={is_micro}",
+            # Micro-filter (FR-N04 note: fumble sessions are two separate sessions;
+            # micro-filter handles them by discarding sub-threshold records)
+            is_micro = self._is_micro_session(
+                connection_s, session.energy_kwh, duration_unreliable=connection_parse_failed
             )
+            if connection_parse_failed and not is_micro:
+                # PR-27 FR-018: sessions kept despite an unparseable
+                # connected_at carry data_gap=True (unreliable duration).
+                session.data_gap = True
+                self._data_gap = True
+                if self._debug_logger:
+                    self._debug_logger.log(
+                        DEBUG_CAT_DATA_GAP,
+                        f"connected_at unparseable for session_id={session.id} — "
+                        "kept (energy above micro threshold), data_gap=True (FR-018)",
+                    )
+
+            if self._debug_logger:
+                h = connection_s // 3600
+                m = (connection_s % 3600) // 60
+                s = connection_s % 60
+                self._debug_logger.log(
+                    "SESSION_STOP",
+                    f"session_id={session.id} energy={session.energy_kwh:.3f}kWh "
+                    f"connection={h}:{m:02d}:{s:02d} "
+                    f"charging_duration={session.charging_duration_s}s "
+                    f"windows={session.charging_window_count} micro={is_micro}",
+                )
+
+        except Exception:
+            # PR-27 FR-010 exception path: nothing has been persisted and no
+            # event has fired yet — restore the claim so the engine still owns
+            # the session and the BUG-4 wrapper can put it back into TRACKING
+            # and arm the F1(b) retry instead of dropping it.
+            #
+            # Review F1(b)(i): undo this attempt's speculative mutations so the
+            # retry is idempotent.
+            #  - disconnected_at/ended_at: a restored session carrying a set
+            #    disconnected_at would be silently filed as completed by
+            #    SessionStore._is_complete() on the next restart (no event, no
+            #    stats); the retry re-sets them from its own disconnect time.
+            session.disconnected_at = None
+            session.ended_at = None
+            #  - speculative spot final-hour entry: pop it and re-arm the
+            #    hourly callback so the retried completion finalizes spot
+            #    pricing exactly once (no duplicate final price_details entry).
+            if spot_final_appended and session.price_details:
+                session.price_details.pop()
+                self._arm_hourly_spot_callback()
+            self._active_session = session
+            raise
 
         # BUG-4 fix: wrap persist + event-fire in try/finally so a disk-full or JSON
         # error cannot leave the engine stuck in COMPLETING with no event fired.
@@ -2221,6 +2681,17 @@ class PlugAnchoredSessionEngine:
                     connection_s,
                     session.energy_kwh,
                 )
+                # PR-27 FR-006: remove any periodic snapshot of the discarded
+                # session from disk so the next restart cannot resurrect it as
+                # a phantom "recovered" session.
+                try:
+                    await self._session_store.async_clear_active_session()
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "PlugAnchoredSessionEngine: failed to clear active-session "
+                        "snapshot after micro discard: %s",
+                        err,
+                    )
         finally:
             # Record last session info for StatusSensor
             self._last_session_user = session.user_name
@@ -2228,8 +2699,12 @@ class PlugAnchoredSessionEngine:
 
             # Reset to IDLE — must always happen so the engine does not get
             # stuck in COMPLETING after a persist failure (BUG-4).
-            self._active_session = None
+            # PR-27 FR-010: _active_session was already claimed (set to None) at
+            # the top of this method; only the remaining per-session state is reset.
             self._rfid_wait = None  # defensive parity: complete session implies no pending wait
+            # Review F1(b): a finished completion settles any pending retry
+            # (e.g. another trigger completed the session before the timer fired).
+            self._cancel_completion_retry()
             self._window_tracker = ChargingWindowTracker()
             self._guest_pricing = None
             self._last_energy_kwh = 0.0
@@ -2241,6 +2716,8 @@ class PlugAnchoredSessionEngine:
             # cannot be applied to a later, unrelated completion (D7).
             self._plug_off_at = None
             self._data_gap_before_disconnect = None
+            # PR-27 FR-020: the grace question (if any) is settled by this completion.
+            self._grace_pending_at_outage = False
             self._eto_start = None
             self._state = SessionEngineState.IDLE
 
@@ -2284,6 +2761,23 @@ class PlugAnchoredSessionEngine:
     # -----------------------------------------------------------------------
     # Spot pricing hourly callback
     # -----------------------------------------------------------------------
+
+    def _arm_hourly_spot_callback(self) -> None:
+        """Arm the spot-pricing hourly snapshot callback.
+
+        PR-27 FR-017: arm only when no hourly callback is active —
+        overwriting a live handle would leak it (never cancelled)
+        and duplicate every hourly price entry.
+        """
+        if self._hourly_unsub is None:
+            self._hourly_unsub = async_track_utc_time_change(
+                self._hass, self._async_hourly_snapshot, minute=0, second=0
+            )
+            # BUG-6 fix: do NOT call entry.async_on_unload here. Each session
+            # would leak a stale callback into the entry's unload list because
+            # _async_complete_session cancels the handle but cannot remove it
+            # from the list. Manage lifecycle ourselves via async_unload().
+            self._engine_unsubs.append(self._hourly_unsub)
 
     @callback
     def _async_hourly_snapshot(self, now: datetime) -> None:
@@ -2333,6 +2827,9 @@ class PlugAnchoredSessionEngine:
 
         if all_offline and not self._charger_offline:
             self._charger_offline = True
+            # PR-27 FR-020: remember whether a grace question was open when the
+            # outage began — resolution re-arms a fresh full grace in that case.
+            self._grace_pending_at_outage = self._disconnect_grace_cancel is not None
             if self._active_session is not None:
                 self._active_session.data_gap = True
                 self._data_gap = True
@@ -2419,6 +2916,28 @@ class PlugAnchoredSessionEngine:
         if self._guest_pricing.method == "markup" and self._guest_pricing.markup_factor is not None:
             return round(session.cost_total_kr * self._guest_pricing.markup_factor, 2)
         return None
+
+    def _is_micro_session(
+        self, connection_s: int, energy_kwh: float, *, duration_unreliable: bool
+    ) -> bool:
+        """Decide whether a session falls below the FR-018 micro-filter thresholds.
+
+        PR-27 FR-018: when the duration evidence is meaningless (a connected_at
+        parse failure zeroed it), require BOTH criteria to discard, so a
+        malformed timestamp can never throw away real energy. A genuine blip
+        still matches (near-zero energy too). Otherwise either criterion alone
+        discards.
+        """
+        min_duration = self._entry.options.get(
+            CONF_MIN_SESSION_DURATION_S, DEFAULT_MIN_SESSION_DURATION_S
+        )
+        min_energy_kwh = (
+            self._entry.options.get(CONF_MIN_SESSION_ENERGY_WH, DEFAULT_MIN_SESSION_ENERGY_WH)
+            / 1000.0
+        )
+        if duration_unreliable:
+            return connection_s < min_duration and energy_kwh < min_energy_kwh
+        return connection_s < min_duration or energy_kwh < min_energy_kwh
 
     # -----------------------------------------------------------------------
     # Observation logging helpers (from legacy engine)
@@ -2559,10 +3078,31 @@ class PlugAnchoredSessionEngine:
         """Plug=on event while engine is already TRACKING.
 
         Possible causes:
-          1. Active session is running — disconnect was transient (existing).
-          2. RFID wait in progress, duplicate plug-on signal (NEW).
-        Neither case requires action; both just record the event in the debug log.
+          1. Completion retry pending — a NEW car was plugged in while a failed
+             completion awaited its retry (review F1(b)(iv)): bring the
+             completion forward NOW (with the original disconnect time) and
+             process this plug-on as a fresh session start afterwards. The
+             insertion must never be absorbed into the dead session
+             (cross-user merge — the Petra/Paul incident class).
+          2. Active session is running — disconnect was transient (existing).
+          3. RFID wait in progress, duplicate plug-on signal.
+        Cases 2 and 3 require no action; both just record the event in the debug log.
         """
+        if self._completion_retry_unsub is not None and self._active_session is not None:
+            self._safe_cancel("_completion_retry_unsub")
+            retry_disconnected_at = self._completion_retry_disconnected_at
+            self._completion_retry_disconnected_at = None
+            if self._debug_logger:
+                self._debug_logger.log(
+                    "SESSION_STOP",
+                    f"plug=on while a failed completion awaited retry — completing the "
+                    f"old session now (id={self._active_session.id}); this plug-in "
+                    "starts a fresh session (F1)",
+                )
+            self._state = SessionEngineState.COMPLETING
+            self._hass.async_create_task(self._complete_pending_retry(retry_disconnected_at))
+            return
+
         self._cancel_grace_timer()
         # PR-25: the transient disconnect genuinely recovered (plug returned). Clear
         # the captured plug-off context so it cannot leak into a later completion (D7).

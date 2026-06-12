@@ -167,6 +167,14 @@ class SessionStore:
                 "Found active session snapshot for recovery: id=%s",
                 active_snapshot.get("id", "?"),
             )
+            # Review F2: do NOT rewrite the envelope here. The on-disk snapshot
+            # is the only durable copy until a recovery decision lands — a
+            # load-time cleanup would lose the session permanently on a crash
+            # during deferred recovery or before the first post-resume save.
+            # Never-consumed-twice (the old FR-007 goal) is enforced per
+            # decision path instead: resume immediately re-persists the session
+            # via async_save_active_session, finalize rewrites the envelope via
+            # add_session, and a micro discard calls async_clear_active_session.
 
         return self._sessions, active_snapshot
 
@@ -205,9 +213,36 @@ class SessionStore:
         Saves the active session as the last entry in the store temporarily.
         This is NOT the same as add_session — it writes a transient snapshot.
         Used by periodic save to survive HA restarts mid-session.
+
+        PR-27 FR-011: a snapshot whose session id already exists in the
+        completed-sessions list is skipped. This closes the race where the
+        periodic writer captures the active dict just before completion lands
+        and would otherwise resurrect the completed session as an incomplete
+        phantom on the next restart. It also guards the unload-time final
+        write (FR-019).
         """
+        session_id = session_dict.get("id")
+        if session_id is not None and any(s.get("id") == session_id for s in self._sessions):
+            _LOGGER.debug(
+                "Skipping active-session snapshot write for id=%s — "
+                "session already completed (FR-011 guard)",
+                session_id,
+            )
+            return
         # Write all completed sessions + the active snapshot in the versioned envelope
         await self._store.async_save(self._make_envelope([*self._sessions, session_dict]))
+
+    async def async_clear_active_session(self) -> None:
+        """Remove any persisted active-session snapshot from disk (PR-27 FR-006).
+
+        Rewrites the store envelope from the completed-sessions list only.
+        Called by the engine when a session is discarded as micro (live or
+        during recovery) so the stale snapshot cannot be resurrected as a
+        phantom session on the next restart. Works with an empty completed
+        list (fresh-install edge case).
+        """
+        _LOGGER.debug("Clearing active-session snapshot from disk")
+        await self.async_save()
 
     @callback
     def schedule_periodic_save(

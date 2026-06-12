@@ -29,6 +29,7 @@ from custom_components.ev_charging_manager.const import DEBUG_LOG_FLUSH_LINES
 from custom_components.ev_charging_manager.debug_logger import (
     DebugLogger,
     async_cleanup_legacy_file,
+    redact_tag,
 )
 
 # ---------------------------------------------------------------------------
@@ -472,3 +473,63 @@ async def test_cleanup_failure_never_raises(hass: HomeAssistant, tmp_path, caplo
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert str(legacy) in warnings[0].message
+
+
+# ---------------------------------------------------------------------------
+# T007 (US2): redact_tag — RFID tag values masked in all log lines (FR-004)
+# ---------------------------------------------------------------------------
+
+
+def test_redact_tag_none() -> None:
+    """None renders as 'None' — no crash, no spurious mask."""
+    assert redact_tag(None) == "None"
+
+
+def test_redact_tag_short_values_fully_masked() -> None:
+    """Values of length <= 2 are fully masked."""
+    assert redact_tag("") == "***"
+    assert redact_tag("a") == "***"
+    assert redact_tag("ab") == "***"
+    assert redact_tag(2) == "***"
+
+
+def test_redact_tag_long_value_keeps_last_two() -> None:
+    """Longer values show *** plus the last two characters."""
+    assert redact_tag("abc123f4") == "***f4"
+    assert redact_tag("04:B7:C8:D2:E1:F3:A2") == "***A2"
+
+
+async def test_legacy_engine_rfid_read_redacted(hass: HomeAssistant, tmp_path) -> None:
+    """Legacy SessionEngine: RFID_READ log lines carry the masked tag,
+    never the full value (FR-004 crosses the engine freeze)."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from custom_components.ev_charging_manager.const import DOMAIN
+    from tests.conftest import (
+        MOCK_CAR_STATUS_ENTITY,
+        MOCK_CHARGER_DATA,
+        MOCK_TRX_ENTITY,
+        setup_session_engine,
+    )
+
+    hass.config.config_dir = str(tmp_path)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"debug_logging": True},
+        title="My go-e Charger",
+    )
+    await setup_session_engine(hass, entry)
+
+    hass.states.async_set(MOCK_TRX_ENTITY, "abc123f4")
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Charging")
+    await hass.async_block_till_done()
+
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    await debug_logger.async_disable()  # flush everything emitted so far
+
+    content = open(debug_logger.file_path, encoding="utf-8").read()
+    assert "abc123f4" not in content, "Full RFID tag value must never reach the log file"
+    rfid_lines = [ln for ln in content.splitlines() if "RFID_READ" in ln]
+    assert rfid_lines, "Expected an RFID_READ line"
+    assert "tag=***f4" in rfid_lines[0]

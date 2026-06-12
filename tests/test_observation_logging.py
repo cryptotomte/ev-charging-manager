@@ -218,7 +218,11 @@ async def test_obs_05_err_state_real_transition(hass: HomeAssistant) -> None:
 
 
 async def test_obs_06_trx_state_transition(hass: HomeAssistant) -> None:
-    """T-OBS-06: trx entity 0 → 2 emits TRX_STATE (uses existing CONF_RFID_ENTITY)."""
+    """T-OBS-06: trx entity 0 → 2 emits TRX_STATE (uses existing CONF_RFID_ENTITY).
+
+    PR-28 (FR-004): trx values are RFID tag values — the TRX_STATE message
+    carries only the masked form (length <= 2 masks fully).
+    """
     entry = _make_observation_entry()
     engine, mock_log = await _setup_observation_engine(hass, entry)
 
@@ -232,8 +236,28 @@ async def test_obs_06_trx_state_transition(hass: HomeAssistant) -> None:
     assert trx_calls, "Expected TRX_STATE log call"
     category, message = trx_calls[-1].args
     assert category == "TRX_STATE"
-    assert "trx changed: 0 → 2" in message
+    assert "trx changed: *** → ***" in message
     assert "| wh=" in message
+
+
+async def test_obs_06b_trx_state_long_tag_redacted(hass: HomeAssistant) -> None:
+    """PR-28 (FR-004): a long tag value appears as ***{last2} in TRX_STATE,
+    never in full; the cached 'before' value is also masked on display."""
+    entry = _make_observation_entry()
+    engine, mock_log = await _setup_observation_engine(hass, entry)
+
+    engine._last_trx = "0"
+    hass.states.async_set(MOCK_TRX_ENTITY, "abc123f4")
+    await hass.async_block_till_done()
+
+    trx_calls = [call for call in mock_log.call_args_list if call.args[0] == "TRX_STATE"]
+    assert trx_calls, "Expected TRX_STATE log call"
+    message = trx_calls[-1].args[1]
+    assert "trx changed: *** → ***f4" in message
+    assert "abc123f4" not in message
+
+    # The raw value is still cached for transition detection (not the mask)
+    assert engine._last_trx == "abc123f4"
 
 
 # ===========================================================================

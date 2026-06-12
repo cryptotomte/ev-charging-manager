@@ -122,8 +122,14 @@ class _SessionSensorBase(SensorEntity):
 
     @property
     def available(self) -> bool:
-        """Return True only when a session is active (TRACKING state)."""
-        return self._is_tracking()
+        """Return True only when an active session exists (PR-29 / FR-003).
+
+        Keyed on session existence, NOT on the engine's coarse TRACKING state:
+        the plug-anchored engine is TRACKING-without-session during the
+        waiting-for-RFID phase, which must render `unavailable` (never
+        "unknown"/empty) per the project's availability rule.
+        """
+        return self._active_session() is not None
 
 
 class CurrentUserSensor(_SessionSensorBase):
@@ -251,9 +257,11 @@ class SessionChargePriceSensor(_SessionSensorBase):
 
     @property
     def available(self) -> bool:
-        """Available only when TRACKING an active guest session."""
-        if not self._is_tracking():
-            return False
+        """Available only during an active guest session (FR-003 base + guest pricing).
+
+        Layers the guest-pricing condition on top of the base active-session
+        gate (PR-29: base meaning swapped from TRACKING to session existence).
+        """
         session = self._active_session()
         return session is not None and session.charge_price_method is not None
 
@@ -300,7 +308,11 @@ class SessionSocAddedSensor(_SessionSensorBase):
 
     @property
     def available(self) -> bool:
-        """Available only when tracking AND vehicle battery capacity is known."""
+        """Available only with an active session AND known vehicle battery capacity.
+
+        Already keyed on session existence — consistent with the PR-29 base gate;
+        the battery-capacity condition is layered on top.
+        """
         session = self._active_session()
         if session is None:
             return False

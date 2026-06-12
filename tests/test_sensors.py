@@ -262,6 +262,200 @@ async def test_cost_sensor_device_class(hass: HomeAssistant):
     assert state.attributes.get("device_class") == "monetary"
 
 
+# ---------------------------------------------------------------------------
+# PR-29 (US2/FR-003): session-sensor availability keyed on active session
+# ---------------------------------------------------------------------------
+
+MOCK_PLUG_ENTITY = "binary_sensor.goe_abc123_car_0"
+MOCK_CABLE_LOCK_ENTITY = "sensor.goe_abc123_cus_value"
+
+# unique_id suffixes of all session sensors covered by the FR-003 base gate
+_SESSION_SENSOR_SUFFIXES = [
+    "current_user",
+    "current_vehicle",
+    "session_energy",
+    "session_duration",
+    "session_cost",
+    "session_charge_price",
+    "session_power",
+    "session_soc_added",
+    "charging_duration",
+]
+
+
+async def _setup_v2_engine(hass: HomeAssistant) -> "MockConfigEntry":
+    """Set up a goe_gemini entry so the PlugAnchoredSessionEngine is active.
+
+    The v2 engine is the only engine with a TRACKING-without-session state
+    (waiting-for-RFID), which is the FR-003 scenario under test.
+    """
+    from unittest.mock import AsyncMock
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"},
+        options={
+            "plug_entity": MOCK_PLUG_ENTITY,
+            "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
+        },
+        title="Test go-e Charger",
+    )
+
+    from tests.conftest import MOCK_CAR_STATUS_ENTITY, MOCK_TRX_ENTITY
+
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
+    hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+
+    entry.add_to_hass(hass)
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    return entry
+
+
+def _state_by_uid(hass: HomeAssistant, entry, uid_suffix: str) -> str:
+    """Return HA state for the sensor with unique_id {entry_id}_{uid_suffix}."""
+    from homeassistant.helpers import entity_registry as er
+
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_{uid_suffix}")
+    if entity_id is None:
+        return "MISSING"
+    state = hass.states.get(entity_id)
+    return state.state if state else "MISSING"
+
+
+async def test_session_sensors_unavailable_during_waiting_for_rfid(hass: HomeAssistant):
+    """FR-003: TRACKING without a session (waiting-for-RFID) → ALL session sensors unavailable.
+
+    Before PR-29 the base gate was keyed on the engine's coarse TRACKING state,
+    so the wait phase rendered every session sensor as 'unknown' (available with
+    empty value) — and crashed the power sensor (round(None), US1).
+    """
+    from unittest.mock import AsyncMock
+
+    from custom_components.ev_charging_manager.const import SessionSubState
+    from tests.conftest import MOCK_TRX_ENTITY  # noqa: F401 — readability
+
+    entry = await _setup_v2_engine(hass)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Plug in with trx=null → engine TRACKING, no session (RFID wait)
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is None
+    assert engine.get_status_sub_state() == SessionSubState.WAITING_FOR_RFID
+
+    for suffix in _SESSION_SENSOR_SUFFIXES:
+        assert _state_by_uid(hass, entry, suffix) == STATE_UNAVAILABLE, (
+            f"FR-003: sensor '{suffix}' must be unavailable during waiting-for-RFID, "
+            f"got {_state_by_uid(hass, entry, suffix)!r}"
+        )
+
+
+async def test_session_sensors_available_when_session_starts(hass: HomeAssistant):
+    """FR-003: session start (RFID resolved) → session sensors become available with values."""
+    from unittest.mock import AsyncMock
+
+    from tests.conftest import MOCK_TRX_ENTITY
+
+    entry = await _setup_v2_engine(hass)
+    vehicle_id = await _add_vehicle(hass, entry.entry_id)
+    user_id = await _add_user(hass, entry.entry_id)
+    await _add_rfid(hass, entry.entry_id, card_index=1, user_id=user_id, vehicle_id=vehicle_id)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Plug in waiting for RFID, then blip → session starts
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        await hass.async_block_till_done()
+
+        # Power + energy flow
+        hass.states.async_set(MOCK_POWER_ENTITY, "3650.0")
+        hass.states.async_set(MOCK_ENERGY_ENTITY, "5.0")
+        await hass.async_block_till_done()
+
+    assert engine.active_session is not None
+
+    assert _state_by_uid(hass, entry, "current_user") == "Petra"
+    assert _state_by_uid(hass, entry, "current_vehicle") == "Peugeot 3008 PHEV"
+    assert float(_state_by_uid(hass, entry, "session_energy")) == pytest.approx(5.0, abs=0.01)
+    assert float(_state_by_uid(hass, entry, "session_cost")) == pytest.approx(12.50, abs=0.01)
+    assert float(_state_by_uid(hass, entry, "session_power")) == pytest.approx(3650.0, abs=1.0)
+    assert _state_by_uid(hass, entry, "session_duration") != STATE_UNAVAILABLE
+
+
+async def test_session_sensors_unavailable_after_unplug(hass: HomeAssistant):
+    """FR-003: unplug (back to IDLE) → all session sensors unavailable again."""
+    from unittest.mock import AsyncMock
+
+    from tests.conftest import MOCK_TRX_ENTITY
+
+    entry = await _setup_v2_engine(hass)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Blip-first start (fast path)
+        hass.states.async_set(MOCK_TRX_ENTITY, "2")
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+        assert engine.active_session is not None
+
+        # Unplug: cable_lock → Unlocked confirms genuine unplug, then plug off
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+
+    assert engine.active_session is None
+    assert engine.state == SessionEngineState.IDLE
+
+    for suffix in _SESSION_SENSOR_SUFFIXES:
+        assert _state_by_uid(hass, entry, suffix) == STATE_UNAVAILABLE, (
+            f"FR-003: sensor '{suffix}' must be unavailable after unplug"
+        )
+
+
+async def test_status_and_binary_sensor_unaffected_by_availability_rule(hass: HomeAssistant):
+    """FR-004: status sensor and the charging binary sensor keep their always-available design."""
+    from unittest.mock import AsyncMock
+
+    entry = await _setup_v2_engine(hass)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        # Waiting-for-RFID phase (no session)
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+
+    # Status sensor: available, showing the wait sub-state
+    assert _state_by_uid(hass, entry, "status") == "waiting_for_rfid"
+
+    # Charging binary sensor: available (off), never unavailable while engine exists
+    from homeassistant.helpers import entity_registry as er
+
+    registry = er.async_get(hass)
+    binary_id = registry.async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{entry.entry_id}_charging"
+    )
+    assert binary_id is not None
+    state = hass.states.get(binary_id)
+    assert state is not None
+    assert state.state == "off"
+
+
 async def test_status_sensor_last_session_attributes_after_completed_session(
     hass: HomeAssistant,
 ):

@@ -929,6 +929,12 @@ class PlugAnchoredSessionEngine:
             self._hass.bus.async_fire(
                 EVENT_SESSION_COMPLETED, self._build_completed_event_data(session)
             )
+        else:
+            # PR-27 FR-006: a recovery snapshot discarded as micro must not
+            # linger on disk — clear it so a later restart cannot resurrect it
+            # as a multi-day phantom (belt-and-braces with the FR-007 load-time
+            # cleanup in SessionStore.async_load).
+            await self._session_store.async_clear_active_session()
 
         self._state = SessionEngineState.IDLE
 
@@ -2280,6 +2286,17 @@ class PlugAnchoredSessionEngine:
                     connection_s,
                     session.energy_kwh,
                 )
+                # PR-27 FR-006: remove any periodic snapshot of the discarded
+                # session from disk so the next restart cannot resurrect it as
+                # a phantom "recovered" session.
+                try:
+                    await self._session_store.async_clear_active_session()
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "PlugAnchoredSessionEngine: failed to clear active-session "
+                        "snapshot after micro discard: %s",
+                        err,
+                    )
         finally:
             # Record last session info for StatusSensor
             self._last_session_user = session.user_name

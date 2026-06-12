@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import logging
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.ev_charging_manager.const import (
     DOMAIN,
@@ -19,6 +25,7 @@ from tests.conftest import (
     MOCK_ENERGY_ENTITY,
     MOCK_POWER_ENTITY,
     MOCK_TRX_ENTITY,
+    setup_session_engine,
 )
 
 
@@ -254,3 +261,133 @@ async def test_recovery_micro_session_does_not_reach_stats(hass: HomeAssistant) 
         "Micro sessions discarded by recovery must not appear in statistics"
     )
     assert stats_engine.user_stats["Unknown"].session_count == 0
+
+
+# ---------------------------------------------------------------------------
+# PR-28 (024-debug-logger-overhaul) US1: new log location + legacy cleanup
+# ---------------------------------------------------------------------------
+
+_LEGACY_LOG_NAME = "ev_charging_manager_debug.log"
+
+
+def _make_debug_entry(debug_logging: bool) -> MockConfigEntry:
+    """Return a config entry with the debug_logging option set."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={"debug_logging": debug_logging},
+        title="My go-e Charger",
+    )
+
+
+async def test_setup_creates_log_at_config_root_not_www(hass: HomeAssistant, tmp_path) -> None:
+    """US1 scenario 1: with debug logging enabled the log is created in the
+    config root and nothing exists under web-served www/ (FR-001)."""
+    hass.config.config_dir = str(tmp_path)
+    entry = _make_debug_entry(debug_logging=True)
+
+    await setup_session_engine(hass, entry)
+    # Drain the buffered DEBUG_ON marker to disk (age trigger)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=6))
+    await hass.async_block_till_done()
+
+    root_log = tmp_path / _LEGACY_LOG_NAME
+    assert root_log.exists(), "Log file must be created at the config root"
+    assert "DEBUG_ON" in root_log.read_text()
+    assert not (tmp_path / "www" / _LEGACY_LOG_NAME).exists(), (
+        "No log file may exist under the web-served www/ directory"
+    )
+
+
+async def test_legacy_www_file_deleted_at_setup(hass: HomeAssistant, tmp_path, caplog) -> None:
+    """US1 scenario 2: a pre-existing legacy www/ log file is deleted at setup
+    and the deletion is logged (FR-002)."""
+    hass.config.config_dir = str(tmp_path)
+    legacy = tmp_path / "www" / _LEGACY_LOG_NAME
+    legacy.parent.mkdir()
+    legacy.write_text("old exposed content\n")
+    entry = _make_debug_entry(debug_logging=True)
+
+    with caplog.at_level(logging.INFO):
+        await setup_session_engine(hass, entry)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert not legacy.exists(), "Legacy www/ log file must be deleted at setup"
+    assert any(
+        "legacy debug log" in r.message.lower() and str(legacy) in r.message
+        for r in caplog.records
+    ), "The deletion must be logged with the legacy path"
+
+
+async def test_legacy_www_file_deleted_when_logging_disabled(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """US1 scenario 4: the legacy file is deleted even when debug logging is
+    DISABLED — the exposure must end regardless of the toggle (FR-002)."""
+    hass.config.config_dir = str(tmp_path)
+    legacy = tmp_path / "www" / _LEGACY_LOG_NAME
+    legacy.parent.mkdir()
+    legacy.write_text("old exposed content\n")
+    entry = _make_debug_entry(debug_logging=False)
+
+    await setup_session_engine(hass, entry)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert not legacy.exists(), "Legacy cleanup must run even with debug_logging=False"
+    # And no new log file is created while logging is disabled
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=6))
+    await hass.async_block_till_done()
+    assert not (tmp_path / _LEGACY_LOG_NAME).exists()
+
+
+async def test_legacy_file_missing_is_noop(hass: HomeAssistant, tmp_path) -> None:
+    """US1 scenario 3: setup proceeds normally when no legacy file exists."""
+    hass.config.config_dir = str(tmp_path)
+    entry = _make_debug_entry(debug_logging=True)
+
+    await setup_session_engine(hass, entry)
+
+    assert entry.state is ConfigEntryState.LOADED
+
+
+async def test_legacy_deletion_failure_warns_and_setup_succeeds(
+    hass: HomeAssistant, tmp_path, caplog
+) -> None:
+    """FR-002 edge: deletion failure logs a WARNING naming the path and never
+    fails setup."""
+    hass.config.config_dir = str(tmp_path)
+    legacy = tmp_path / "www" / _LEGACY_LOG_NAME
+    legacy.parent.mkdir()
+    legacy.write_text("old exposed content\n")
+    entry = _make_debug_entry(debug_logging=True)
+
+    with (
+        patch(
+            "custom_components.ev_charging_manager.debug_logger.os.remove",
+            side_effect=OSError("permission denied"),
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        await setup_session_engine(hass, entry)
+
+    assert entry.state is ConfigEntryState.LOADED, "Cleanup failure must never fail setup"
+    assert any(
+        r.levelno == logging.WARNING and str(legacy) in r.message for r in caplog.records
+    ), "A WARNING naming the legacy path must be emitted"
+
+
+async def test_unload_writes_debug_off_as_final_line(hass: HomeAssistant, tmp_path) -> None:
+    """FR-008: integration unload flushes the buffer; DEBUG_OFF is the final line."""
+    hass.config.config_dir = str(tmp_path)
+    entry = _make_debug_entry(debug_logging=True)
+
+    await setup_session_engine(hass, entry)
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    debug_logger.log("CAR_STATE", "pre-unload event")
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    lines = (tmp_path / _LEGACY_LOG_NAME).read_text().splitlines()
+    assert any("pre-unload event" in ln for ln in lines), "Buffer must be flushed on unload"
+    assert "DEBUG_OFF" in lines[-1], "DEBUG_OFF must be the final line"

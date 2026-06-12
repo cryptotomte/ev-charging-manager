@@ -26,7 +26,10 @@ from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.ev_charging_manager import debug_logger as debug_logger_module
 from custom_components.ev_charging_manager.const import DEBUG_LOG_FLUSH_LINES
-from custom_components.ev_charging_manager.debug_logger import DebugLogger
+from custom_components.ev_charging_manager.debug_logger import (
+    DebugLogger,
+    async_cleanup_legacy_file,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -423,3 +426,49 @@ async def test_buffer_capped_drop_oldest_with_recovery_note(
     # The note precedes the retained lines (chronological position of the gap)
     assert content.index("lines dropped") < content.index("cap-line-05")
     assert logger._buffer == []
+
+
+# ---------------------------------------------------------------------------
+# T005 (US1): async_cleanup_legacy_file unit tests (FR-002)
+# ---------------------------------------------------------------------------
+
+
+async def test_cleanup_deletes_legacy_file(hass: HomeAssistant, tmp_path, caplog) -> None:
+    """The legacy www/ file is deleted and the deletion logged at INFO."""
+    legacy = tmp_path / "www" / "ev_charging_manager_debug.log"
+    legacy.parent.mkdir()
+    legacy.write_text("exposed content\n")
+
+    with caplog.at_level(logging.INFO, logger=debug_logger_module.__name__):
+        await async_cleanup_legacy_file(hass, str(tmp_path))
+
+    assert not legacy.exists()
+    assert any(str(legacy) in r.message for r in caplog.records)
+
+
+async def test_cleanup_noop_when_legacy_missing(hass: HomeAssistant, tmp_path, caplog) -> None:
+    """No legacy file: cleanup is a silent no-op — no log records, no error."""
+    with caplog.at_level(logging.INFO, logger=debug_logger_module.__name__):
+        await async_cleanup_legacy_file(hass, str(tmp_path))
+
+    assert caplog.records == []
+
+
+async def test_cleanup_failure_never_raises(hass: HomeAssistant, tmp_path, caplog) -> None:
+    """Deletion failure emits a WARNING naming the path and never raises."""
+    legacy = tmp_path / "www" / "ev_charging_manager_debug.log"
+    legacy.parent.mkdir()
+    legacy.write_text("exposed content\n")
+
+    with (
+        patch(
+            "custom_components.ev_charging_manager.debug_logger.os.remove",
+            side_effect=OSError("permission denied"),
+        ),
+        caplog.at_level(logging.WARNING, logger=debug_logger_module.__name__),
+    ):
+        await async_cleanup_legacy_file(hass, str(tmp_path))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(legacy) in warnings[0].message

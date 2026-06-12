@@ -157,6 +157,7 @@ class DebugLogger:
         self._flush_lock = asyncio.Lock()
         self._cancel_flush_timer: CALLBACK_TYPE | None = None
         self._flush_scheduled: bool = False
+        self._closed: bool = False
         self._fail_count: int = 0
         self._dropped_count: int = 0
 
@@ -179,22 +180,29 @@ class DebugLogger:
         """Enable debug logging and buffer the DEBUG_ON marker line.
 
         No file system access happens here — the marker reaches disk with the
-        first flush.
+        first flush. Re-opens a previously closed (disabled) instance; in
+        production a fresh instance is created per reload, so this only
+        matters for in-place re-enable (tests).
         """
+        self._closed = False
         self._enabled = True
         self.log("DEBUG_ON", "Debug logging enabled")
 
     async def async_disable(self) -> None:
-        """Disable debug logging: buffer DEBUG_OFF, flush, clear the flag.
+        """Disable debug logging: buffer DEBUG_OFF, flush, close the instance.
 
-        Registered via ``entry.async_on_unload`` (coroutine callbacks are
-        awaited by HA). The DEBUG_OFF marker is buffered BEFORE the flag is
-        cleared, so it is always the final line in the file (FR-008).
-        No-op when logging was never enabled.
+        Called from BOTH ``entry.async_on_unload`` (reload/remove) and the
+        EVENT_HOMEASSISTANT_STOP listener (orderly stop) — idempotent: the
+        second call is a no-op (one DEBUG_OFF, one final flush). The DEBUG_OFF
+        marker is buffered BEFORE the flag is cleared, so it is always the
+        final line in the file (FR-008). No-op when logging was never enabled.
         """
+        if self._closed:
+            return
         if self._enabled:
             self.log("DEBUG_OFF", "Debug logging disabled")
             self._enabled = False
+        self._closed = True
         await self._async_flush()
 
     def log(self, category: str, message: str) -> None:
@@ -274,11 +282,17 @@ class DebugLogger:
             self._arm_timer()
 
     def _arm_timer(self) -> None:
-        """Arm the age-flush timer (cancelled automatically on HA shutdown)."""
+        """Arm the age-flush timer.
+
+        Deliberately NOT ``cancel_on_shutdown`` (review F1): the
+        EVENT_HOMEASSISTANT_STOP listener owns shutdown flushing — a timer
+        firing during shutdown is harmless (the flush lock serializes), while
+        auto-cancellation would actively drop a pending flush.
+        """
         self._cancel_flush_timer = async_call_later(
             self._hass,
             DEBUG_LOG_FLUSH_SECONDS,
-            HassJob(self._on_flush_timer, cancel_on_shutdown=True),
+            HassJob(self._on_flush_timer),
         )
 
     def _cancel_timer(self) -> None:

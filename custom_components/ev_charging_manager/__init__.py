@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.helpers import device_registry as dr
 
 from .charger_profiles import CHARGER_PROFILES
@@ -125,6 +126,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Disable on unload: flushes the buffer with DEBUG_OFF as the final line
     # (coroutine callbacks are awaited by entry.async_on_unload).
     entry.async_on_unload(debug_logger.async_disable)
+
+    # Review F1: HA does NOT unload config entries at an orderly stop —
+    # async_on_unload fires only on reload/remove, so without this listener
+    # up to 5 s / 500 buffered lines and the DEBUG_OFF marker would silently
+    # vanish at every clean HA restart. async_disable() is idempotent, so the
+    # unload path and this listener can both call it. Registered via
+    # entry.async_on_unload so a reload does not leak one listener per setup.
+    async def _flush_debug_log_on_stop(_event: Event) -> None:
+        await debug_logger.async_disable()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _flush_debug_log_on_stop)
+    )
 
     # Set up stats store and engine BEFORE the session engine (PR-26 Fix 5,
     # FR-011): session recovery below can fire EVENT_SESSION_COMPLETED, and the

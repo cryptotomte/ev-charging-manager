@@ -7,6 +7,7 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.util import dt as dt_util
@@ -371,6 +372,49 @@ async def test_legacy_deletion_failure_warns_and_setup_succeeds(
     assert any(r.levelno == logging.WARNING and str(legacy) in r.message for r in caplog.records), (
         "A WARNING naming the legacy path must be emitted"
     )
+
+
+async def test_stop_event_flushes_buffer_with_debug_off(hass: HomeAssistant, tmp_path) -> None:
+    """Review F1: HA does NOT unload config entries at an orderly stop — the
+    EVENT_HOMEASSISTANT_STOP listener must flush buffered lines with DEBUG_OFF
+    as the final line, or up to 5 s / 500 lines vanish at every clean restart."""
+    hass.config.config_dir = str(tmp_path)
+    entry = _make_debug_entry(debug_logging=True)
+
+    await setup_session_engine(hass, entry)
+    debug_logger = hass.data[DOMAIN][entry.entry_id]["debug_logger"]
+    debug_logger.log("CAR_STATE", "pre-stop event")
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+    await hass.async_block_till_done()
+
+    lines = (tmp_path / _LEGACY_LOG_NAME).read_text().splitlines()
+    assert any("pre-stop event" in ln for ln in lines), "Buffer must be flushed at HA stop"
+    assert "DEBUG_OFF" in lines[-1], "DEBUG_OFF must be the final line at HA stop"
+
+
+async def test_stop_listener_removed_on_unload(hass: HomeAssistant, tmp_path) -> None:
+    """Review F1: the stop listener is registered via entry.async_on_unload so
+    a reload does not leak one listener per setup."""
+    hass.config.config_dir = str(tmp_path)
+    entry = _make_debug_entry(debug_logging=True)
+
+    # Platform components (sensor/button/...) add their own stop listeners
+    # that persist after entry unload — measure relative deltas only.
+    await setup_session_engine(hass, entry)
+    after_setup = hass.bus.async_listeners().get(EVENT_HOMEASSISTANT_STOP, 0)
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    after_unload = hass.bus.async_listeners().get(EVENT_HOMEASSISTANT_STOP, 0)
+    assert after_unload == after_setup - 1, (
+        "The stop listener must be unsubscribed on unload — no leak per reload"
+    )
+
+    # A reload cycle ends with the same listener count as the first setup
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.bus.async_listeners().get(EVENT_HOMEASSISTANT_STOP, 0) == after_setup
 
 
 async def test_unload_writes_debug_off_as_final_line(hass: HomeAssistant, tmp_path) -> None:

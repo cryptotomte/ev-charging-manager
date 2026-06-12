@@ -250,6 +250,20 @@ async def test_log_noop_after_disable(hass: HomeAssistant, tmp_path) -> None:
     assert len(_read_lines(logger)) == count_before
 
 
+async def test_double_disable_writes_single_debug_off(hass: HomeAssistant, tmp_path) -> None:
+    """Review F1: async_disable() is idempotent — the EVENT_HOMEASSISTANT_STOP
+    listener and the unload callback may both call it; exactly one DEBUG_OFF."""
+    logger = await _make_enabled_logger(hass, tmp_path)
+    logger.log("CAR_STATE", "before double disable")
+
+    await logger.async_disable()
+    await logger.async_disable()
+
+    lines = _read_lines(logger)
+    assert sum("DEBUG_OFF" in ln for ln in lines) == 1
+    assert "DEBUG_OFF" in lines[-1]
+
+
 async def test_disable_noop_when_never_enabled(hass: HomeAssistant, tmp_path) -> None:
     """async_disable() without prior enable creates no file and does not raise."""
     logger = DebugLogger(hass, str(tmp_path))

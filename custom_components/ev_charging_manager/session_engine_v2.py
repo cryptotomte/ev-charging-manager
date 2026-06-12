@@ -910,6 +910,19 @@ class PlugAnchoredSessionEngine:
             session.user_name,
         )
 
+        # Review F2: immediately re-persist the resumed session as the active
+        # snapshot. async_load no longer strips the snapshot from disk, so this
+        # write is what keeps the on-disk copy fresh; if it fails the original
+        # snapshot is still on disk (non-fatal — log and continue tracking).
+        try:
+            await self._session_store.async_save_active_session(session.to_dict())
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: immediate post-resume snapshot re-persist "
+                "failed: %s — the pre-restart snapshot remains on disk",
+                err,
+            )
+
     async def _complete_snapshot_as_session(
         self, snapshot: dict, current_energy: float, now: datetime
     ) -> None:
@@ -1009,8 +1022,9 @@ class PlugAnchoredSessionEngine:
         else:
             # PR-27 FR-006: a recovery snapshot discarded as micro must not
             # linger on disk — clear it so a later restart cannot resurrect it
-            # as a multi-day phantom (belt-and-braces with the FR-007 load-time
-            # cleanup in SessionStore.async_load).
+            # as a multi-day phantom. This is the ONLY thing that removes the
+            # snapshot on the micro path: async_load deliberately leaves it on
+            # disk until a recovery decision lands (review F2).
             await self._session_store.async_clear_active_session()
 
         self._state = SessionEngineState.IDLE

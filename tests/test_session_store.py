@@ -254,8 +254,10 @@ async def test_save_active_session_writes_unknown_id(session_store_with_save):
     assert [s["id"] for s in saved_envelope["data"]] == ["s1", "s2"]
 
 
-async def test_load_persists_cleaned_envelope_after_extraction(hass: HomeAssistant):
-    """FR-007: load extracts the snapshot AND persists the cleaned envelope."""
+async def test_load_does_not_erase_snapshot_from_disk(hass: HomeAssistant):
+    """Review F2 (replaces the FR-007 load-time cleanup): load extracts the
+    snapshot WITHOUT writing — the on-disk copy is the only durable one until
+    a recovery decision (resume re-persist / finalize / micro clear) lands."""
     stored = _envelope([make_session("done"), make_active_snapshot("snap")])
     store = SessionStore(hass)
     with (
@@ -266,16 +268,19 @@ async def test_load_persists_cleaned_envelope_after_extraction(hass: HomeAssista
 
     assert snapshot is not None and snapshot["id"] == "snap"
     assert [s["id"] for s in sessions] == ["done"]
-    # The cleaned envelope (snapshot removed) must have been written back to disk.
-    mock_save.assert_called_once()
-    cleaned = mock_save.call_args[0][0]
-    assert [s["id"] for s in cleaned["data"]] == ["done"], (
-        "load-time cleanup must persist the envelope WITHOUT the extracted snapshot"
-    )
+    # Load must not rewrite the envelope — a crash before any recovery
+    # decision would otherwise lose the session permanently.
+    mock_save.assert_not_called()
 
 
-async def test_double_load_consumes_snapshot_once(hass: HomeAssistant):
-    """FR-007: two consecutive restarts cannot consume the same snapshot."""
+async def test_crash_during_deferred_recovery_keeps_snapshot_recoverable(hass: HomeAssistant):
+    """Review F2: a crash after load but BEFORE any recovery decision (e.g.
+    during deferred recovery, or within persistence_interval_s after resume)
+    must leave the snapshot on disk — the next boot recovers it again.
+
+    Never-consumed-twice (the old FR-007 goal) is now pinned per decision
+    path: micro discards clear explicitly, finalize rewrites via add_session,
+    resume re-persists the session as the new active snapshot."""
     stored = _envelope([make_active_snapshot("snap")])
     store1 = SessionStore(hass)
     with (
@@ -284,18 +289,19 @@ async def test_double_load_consumes_snapshot_once(hass: HomeAssistant):
     ):
         _sessions, snapshot1 = await store1.async_load()
     assert snapshot1 is not None and snapshot1["id"] == "snap"
-    mock_save.assert_called_once()
-    cleaned = mock_save.call_args[0][0]
+    mock_save.assert_not_called()
 
-    # Second restart loads what the first one wrote — no snapshot may remain.
+    # Crash before any decision: the next boot loads the SAME on-disk data
+    # and must still find the snapshot.
     store2 = SessionStore(hass)
     with (
-        patch.object(store2._store, "async_load", new_callable=AsyncMock, return_value=cleaned),
+        patch.object(store2._store, "async_load", new_callable=AsyncMock, return_value=stored),
         patch.object(store2._store, "async_save", new_callable=AsyncMock),
     ):
-        sessions2, snapshot2 = await store2.async_load()
-    assert snapshot2 is None, "second restart must not re-consume the snapshot"
-    assert sessions2 == []
+        _sessions2, snapshot2 = await store2.async_load()
+    assert snapshot2 is not None and snapshot2["id"] == "snap", (
+        "a crash during deferred recovery must not lose the snapshot"
+    )
 
 
 async def test_periodic_save_does_not_resurrect_completed_session(hass: HomeAssistant):

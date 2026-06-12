@@ -167,12 +167,14 @@ class SessionStore:
                 "Found active session snapshot for recovery: id=%s",
                 active_snapshot.get("id", "?"),
             )
-            # PR-27 FR-007: persist the cleaned envelope (completed sessions only)
-            # immediately after extracting the snapshot, so two consecutive
-            # restarts can never consume the same snapshot twice. A resumed
-            # session is re-persisted by the periodic writer; a finalized one
-            # by add_session.
-            await self.async_save()
+            # Review F2: do NOT rewrite the envelope here. The on-disk snapshot
+            # is the only durable copy until a recovery decision lands — a
+            # load-time cleanup would lose the session permanently on a crash
+            # during deferred recovery or before the first post-resume save.
+            # Never-consumed-twice (the old FR-007 goal) is enforced per
+            # decision path instead: resume immediately re-persists the session
+            # via async_save_active_session, finalize rewrites the envelope via
+            # add_session, and a micro discard calls async_clear_active_session.
 
         return self._sessions, active_snapshot
 

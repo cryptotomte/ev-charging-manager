@@ -28,6 +28,7 @@ from custom_components.ev_charging_manager.const import (
     EVENT_SESSION_COMPLETED,
     SessionEngineState,
 )
+from custom_components.ev_charging_manager.session_store import SessionStore
 from tests.conftest import (
     MOCK_CAR_STATUS_ENTITY,
     MOCK_CHARGER_DATA,
@@ -499,6 +500,93 @@ async def test_v2_recovery_energy_unavailable_resumes_with_data_gap(
         await hass.async_block_till_done()
     assert engine.active_session.energy_kwh == pytest.approx(3.5, abs=0.001), (
         "energy accumulation must continue from the live counter after the gap"
+    )
+
+
+async def test_v2_resume_re_persists_snapshot_immediately(hass: HomeAssistant) -> None:
+    """Review F2: a resumed session is immediately re-persisted as the active
+    snapshot. Load no longer strips the snapshot from disk; the resume path
+    must therefore write a fresh durable copy so a crash right after resume
+    (before the first periodic save) still recovers the session."""
+    snapshot = make_active_snapshot(
+        session_id="v2-repersist-001",
+        energy_start_kwh=10.0,
+        energy_kwh=3.0,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"},
+        options={
+            "plug_entity": MOCK_PLUG_ENTITY,
+            "cable_lock_entity": MOCK_CABLE_LOCK_ENTITY,
+            CONF_CHARGING_IDLE_TIMEOUT_MIN: 5,
+            CONF_DISCONNECT_GRACE_MIN: 10,
+        },
+        title="Test go-e Charger (resume re-persist)",
+    )
+    hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+    hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+    hass.states.async_set(MOCK_TRX_ENTITY, "null")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "13.5")
+    hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+
+    raw_store_data = {
+        "version": 1,
+        "minor_version": 2,
+        "key": "ev_charging_manager_sessions",
+        "data": [snapshot],
+    }
+    save_mock = AsyncMock()
+    with (
+        patch(
+            "homeassistant.helpers.storage.Store.async_load",
+            new_callable=AsyncMock,
+            return_value=raw_store_data,
+        ),
+        patch("homeassistant.helpers.storage.Store.async_save", save_mock),
+    ):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.state == SessionEngineState.TRACKING, "precondition: session resumed"
+    assert engine.active_session is not None
+    assert engine.active_session.id == "v2-repersist-001"
+
+    # The resume must have written a session-store envelope containing the
+    # resumed session as an INCOMPLETE (active) entry.
+    session_envelopes = [
+        call.args[0]
+        for call in save_mock.call_args_list
+        if call.args
+        and isinstance(call.args[0], dict)
+        and call.args[0].get("key") == "ev_charging_manager_sessions"
+    ]
+    assert session_envelopes, "resume must immediately re-persist the active snapshot"
+    final_envelope = session_envelopes[-1]
+    incomplete = [
+        s
+        for s in final_envelope["data"]
+        if s.get("disconnected_at") is None and s.get("ended_at") is None
+    ]
+    assert [s["id"] for s in incomplete] == ["v2-repersist-001"], (
+        "the re-persisted envelope must contain the resumed session as active snapshot"
+    )
+
+    # A fresh store loading that envelope returns the session as active snapshot
+    # (i.e. a crash right after resume is recoverable).
+    store2 = SessionStore(hass)
+    with (
+        patch.object(
+            store2._store, "async_load", new_callable=AsyncMock, return_value=final_envelope
+        ),
+        patch.object(store2._store, "async_save", new_callable=AsyncMock),
+    ):
+        _sessions2, snapshot2 = await store2.async_load()
+    assert snapshot2 is not None and snapshot2["id"] == "v2-repersist-001", (
+        "a restart right after resume must recover the re-persisted snapshot"
     )
 
 

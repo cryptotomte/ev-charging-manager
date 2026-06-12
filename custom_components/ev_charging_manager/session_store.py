@@ -241,7 +241,7 @@ class SessionStore:
         phantom session on the next restart. Works with an empty completed
         list (fresh-install edge case).
         """
-        _LOGGER.debug("Clearing active-session snapshot from disk (micro discard)")
+        _LOGGER.debug("Clearing active-session snapshot from disk")
         await self.async_save()
 
     @callback

@@ -238,7 +238,9 @@ class PlugAnchoredSessionEngine:
         self._heartbeat_log_timer_unsub: _Unsub = None
         self._ui_dispatch_timer_unsub: _Unsub = None
 
-        # Data quality flags
+        # Data quality flags. _data_gap mirrors Session.data_gap — the
+        # canonical list of every condition that sets it lives at the field
+        # definition in session.py. Transferred onto the session at completion.
         self._data_gap: bool = False
         self._eto_start: float | None = None
 
@@ -254,9 +256,10 @@ class PlugAnchoredSessionEngine:
         self._charger_offline: bool = False
         self._offline_entities_count: int = 0
         # PR-27 FR-020: True when a transient-disconnect grace was pending at
-        # the moment a full charger outage was detected (or expired suppressed
-        # during one). At outage resolution a FRESH full grace is re-armed and
-        # the normal triggers (re-plug absorption, unlock confirmation) decide.
+        # the moment a full charger outage was detected, or when a grace timer
+        # expired (and was suppressed) during the outage. At outage resolution
+        # a FRESH full grace is re-armed and the normal triggers (re-plug
+        # absorption, unlock confirmation) decide.
         self._grace_pending_at_outage: bool = False
 
         # Guest pricing snapshot (PR-06 — snapshotted at SESSION_START)
@@ -561,7 +564,7 @@ class PlugAnchoredSessionEngine:
 
         # Effective energy for downstream use: when the live reading is missing,
         # reconstruct it from the snapshot (start + accumulated) so the session
-        # resumes/completes with its last known values (FR-001).
+        # resumes/completes with its last known values (PR-27 FR-001).
         effective_energy = (
             current_energy
             if current_energy is not None
@@ -739,7 +742,15 @@ class PlugAnchoredSessionEngine:
         current_power: float,
         now: datetime,
     ) -> None:
-        """Resume an active session after HA restart with plug still connected."""
+        """Resume an active session after HA restart with plug still connected.
+
+        Post-conditions: any armed RFID wait is cleared (PR-27 FR-003);
+        data_gap is forced True on session and engine (PR-22 FR-026); the
+        pre-restart charging aggregates enter the tracker via seed_base OR a
+        synthetic closed window — never both (seed-split below); in spot mode
+        the hourly snapshot callback is re-armed; and the resumed session is
+        immediately re-persisted as the active snapshot (review F2).
+        """
         # PR-27 FR-003: clear any armed RFID wait BEFORE installing the session.
         # The deferred-resume path can race the engine's own plug-on handling,
         # which arms a wait when trx is null; a leftover wait would make the
@@ -1373,6 +1384,11 @@ class PlugAnchoredSessionEngine:
 
         PR-24 FR-004: if the RFID wait is active (no session committed yet),
         clear it and return to IDLE — do NOT start a session.
+
+        PR-27 FR-004 precedence: the wait-exit branch runs ONLY when no active
+        session exists. With both present (a stale wait left by a racing
+        resume), the session path wins — the unplug must complete the session,
+        not strand it behind the wait cleanup.
         """
         if self._state != SessionEngineState.TRACKING:
             # PR-27 FR-008: IDLE has no session to end; COMPLETING means a
@@ -1534,7 +1550,13 @@ class PlugAnchoredSessionEngine:
 
         @callback
         def _grace_expired(_now: datetime) -> None:
-            """Force-end session when grace period expires."""
+            """Force-end session when grace period expires.
+
+            FR-020 (PR-27) outage suppression: when the timer fires during a
+            full charger outage there is no evidence to act on — the
+            completion is suppressed, _grace_pending_at_outage is set, and a
+            FRESH full grace is re-armed at outage resolution instead.
+            """
             # PR-27 FR-009: a fired timer clears its handle immediately, so
             # "grace pending" guards can never be satisfied by a stale handle.
             self._disconnect_grace_cancel = None
@@ -2382,6 +2404,22 @@ class PlugAnchoredSessionEngine:
     async def _async_complete_session_impl(self, disconnected_at: datetime | None = None) -> None:
         """Finalize session: compute metrics, apply micro-filter, persist, fire event.
 
+        PR-27 FR-010 claim/restore contract (revised by review F1):
+          - The active session is CLAIMED synchronously at entry
+            (``self._active_session`` → None before the first await), so a
+            second completion attempt finds no session and aborts.
+          - The exception-prone metrics steps (spot final-hour finalize, ETO
+            read, guest charge price) DEGRADE on failure (WARNING +
+            data_gap=True + safe value) — they never abort the completion
+            (review F1a).
+          - On a truly unexpected pre-persist exception the claim is RESTORED
+            after undoing this attempt's speculative mutations
+            (disconnected_at/ended_at cleared; speculative spot final-hour
+            entry popped and the hourly callback re-armed), then the exception
+            propagates. The wrapper reads ``self._active_session`` to choose
+            TRACKING (claim restored → arm the 30 s F1(b) retry) vs IDLE
+            (nothing to retry).
+
         Args:
             disconnected_at: PR-25 (021-cable-lock-race). When provided, this UTC
                 timestamp is used for ``session.disconnected_at`` / ``session.ended_at``
@@ -2457,10 +2495,10 @@ class PlugAnchoredSessionEngine:
             session.ended_at = now_iso  # backward compat alias
             session.connection_duration_s = connection_s
 
-            # charging_duration_s is the sum of all window durations (FR-011)
+            # charging_duration_s is the sum of all window durations (PR-22 FR-011)
             session.charging_duration_s = self._window_tracker.total_charging_duration_s()
 
-            # avg_power_w computed from charging_duration_s, NOT connection (FR-012)
+            # avg_power_w computed from charging_duration_s, NOT connection (PR-22 FR-012)
             if session.charging_duration_s > 0 and session.energy_kwh > 0:
                 session.avg_power_w = round(
                     (session.energy_kwh * 3_600_000) / session.charging_duration_s, 1

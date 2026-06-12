@@ -123,10 +123,13 @@ class ChargingWindowTracker:
     def seed_base(self, duration_s: int, window_count: int) -> None:
         """Seed pre-restart charging aggregates as a base offset (PR-27 FR-012).
 
-        Called at most once, during restart-recovery resume, with the
-        snapshot's persisted ``charging_duration_s`` / ``charging_window_count``
-        (or the closed-window remainder when a synthetic window already covers
-        the open pre-restart window — see session_engine_v2 resume logic).
+        Called at most once, during restart-recovery resume. Callers pass the
+        snapshot's FULL persisted aggregates (``charging_duration_s`` /
+        ``charging_window_count``) only — never a remainder. When a synthetic
+        window covers the open pre-restart window the engine seeds NOTHING:
+        the synthetic span is a superset of every pre-restart window, so any
+        seed on top would double-count. See the seed-split comment in
+        ``PlugAnchoredSessionEngine._resume_session_from_snapshot``.
 
         ``total_charging_duration_s()`` and ``window_count()`` include the
         base; ``closed_window_count()`` and the window lists stay live-only

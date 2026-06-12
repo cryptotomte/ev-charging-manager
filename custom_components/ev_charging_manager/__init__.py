@@ -84,6 +84,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {}
 
+    # PR-28 (FR-002): delete the legacy web-served www/ log file as the FIRST
+    # await of setup (review F6) — the unauthenticated /local/ exposure must
+    # end even when a later setup step (store load, migration, ...) raises and
+    # fails the entry. Never fails setup itself.
+    await async_cleanup_legacy_file(hass, hass.config.config_dir)
+
     # Initialize ConfigStore and sync from subentries
     config_store = ConfigStore(hass)
     await config_store.async_load()
@@ -112,12 +118,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Runs before SessionEngine so it can read the resolved entity IDs from entry.options.
     await async_migrate_observation_slots(hass, entry)
 
-    # PR-28 (FR-002): delete the legacy web-served www/ log file BEFORE logger
-    # creation, unconditionally — the unauthenticated /local/ exposure must end
-    # even when debug logging is disabled. Never fails setup.
-    await async_cleanup_legacy_file(hass, hass.config.config_dir)
-
-    # Set up debug logger — instantiated before session engine
+    # Set up debug logger — instantiated before session engine. The legacy
+    # www/ file cleanup (FR-002) already ran as the first await of setup.
     debug_logging_enabled = entry.options.get(CONF_DEBUG_LOGGING, False)
     debug_logger = DebugLogger(hass, hass.config.config_dir)
     if debug_logging_enabled:

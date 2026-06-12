@@ -338,6 +338,32 @@ async def test_legacy_www_file_deleted_when_logging_disabled(hass: HomeAssistant
     assert not (tmp_path / _LEGACY_LOG_NAME).exists()
 
 
+async def test_legacy_cleanup_runs_even_when_setup_fails_early(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """Review F6: the legacy-file cleanup is the FIRST await in setup — an
+    exception in any later setup step (here: ConfigStore load) must not leave
+    the unauthenticated /local/ exposure in place."""
+    hass.config.config_dir = str(tmp_path)
+    legacy = tmp_path / "www" / _LEGACY_LOG_NAME
+    legacy.parent.mkdir()
+    legacy.write_text("old exposed content\n")
+    entry = _make_debug_entry(debug_logging=True)
+
+    with patch(
+        "custom_components.ev_charging_manager.ConfigStore.async_load",
+        side_effect=RuntimeError("storage corrupted"),
+    ):
+        entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is not ConfigEntryState.LOADED, "Setup must fail in this scenario"
+    assert not legacy.exists(), (
+        "Legacy www/ cleanup must run before anything that can fail setup"
+    )
+
+
 async def test_legacy_file_missing_is_noop(hass: HomeAssistant, tmp_path) -> None:
     """US1 scenario 3: setup proceeds normally when no legacy file exists."""
     hass.config.config_dir = str(tmp_path)

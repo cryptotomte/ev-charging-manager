@@ -47,6 +47,19 @@ MOCK_CABLE_LOCK_ENTITY = "sensor.goe_abc123_cus_value"
 MOCK_SPOT_ENTITY = "sensor.fake_spot_price"
 
 
+@pytest.fixture(autouse=True)
+def _pin_clock_mid_hour(freezer) -> None:
+    """Pin the frozen clock mid-hour (UTC) before engine setup.
+
+    Without this, freezegun freezes at the REAL current time, and the
+    ticks below (5 min + 31 s) can cross a real UTC hour boundary —
+    firing the engine's hourly spot callback (async_track_utc_time_change
+    minute=0) and appending a legitimate hourly price_details entry that
+    breaks the speculative-entry assertions. Mid-hour, no tick in this
+    module can reach an hour boundary."""
+    freezer.move_to("2026-06-12T12:30:00+00:00")
+
+
 async def _make_entry(hass: HomeAssistant, *, spot: bool = False) -> MockConfigEntry:
     """Set up a goe_gemini (plug-anchored) entry, optionally in spot mode."""
     data = {**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"}

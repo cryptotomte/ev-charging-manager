@@ -53,6 +53,16 @@ CONF_DEBUG_LOGGING = "debug_logging"
 # Debug logging defaults (PR-010)
 DEFAULT_DEBUG_LOGGING = False
 
+# Debug logger buffered-I/O tuning (PR-28, FR-009) — not user-configurable.
+# Flush when the buffer reaches this many lines ...
+DEBUG_LOG_FLUSH_LINES = 50
+# ... or this many seconds after the first buffered line, whichever comes first.
+DEBUG_LOG_FLUSH_SECONDS = 5
+# Rotate the active log file to a single .1 generation past this size.
+DEBUG_LOG_MAX_BYTES = 5 * 1024 * 1024
+# Hard buffer cap while the disk is unwritable (10 × flush lines, drop-oldest).
+DEBUG_LOG_BUFFER_CAP = 500
+
 # Default values
 DEFAULT_CHARGER_NAME = "EV Charger"
 DEFAULT_ENERGY_UNIT = "Wh"

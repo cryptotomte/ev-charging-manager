@@ -55,6 +55,11 @@ def _read_lines(logger: DebugLogger) -> list[str]:
         return fh.read().splitlines()
 
 
+def _read_text(logger: DebugLogger) -> str:
+    with open(logger.file_path, encoding="utf-8") as fh:
+        return fh.read()
+
+
 # ---------------------------------------------------------------------------
 # T003 (h) + carried-over pins: file location and line format (SC-006)
 # ---------------------------------------------------------------------------
@@ -94,7 +99,7 @@ async def test_enable_buffers_debug_on_marker(hass: HomeAssistant, tmp_path) -> 
     assert logger.enabled
 
     await _flush_by_time(hass)
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "DEBUG_ON" in content
     assert "Debug logging enabled" in content
 
@@ -213,7 +218,7 @@ async def test_emission_order_preserved_across_flushes(hass: HomeAssistant, tmp_
     logger.log("CAR_STATE", "order-4")
     await _flush_by_time(hass)
 
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     positions = [content.index(f"order-{i}") for i in (1, 2, 3, 4)]
     assert positions == sorted(positions)
 
@@ -294,7 +299,7 @@ async def test_failed_final_flush_abandons_lines_terminally(
     count_before = len(_read_lines(logger))
     await _flush_by_time(hass)
     assert len(_read_lines(logger)) == count_before
-    assert "doomed-line" not in open(logger.file_path, encoding="utf-8").read()
+    assert "doomed-line" not in _read_text(logger)
 
 
 async def test_debug_off_final_under_concurrent_log(hass: HomeAssistant, tmp_path, caplog) -> None:
@@ -361,7 +366,7 @@ async def test_disable_preserves_file_content(hass: HomeAssistant, tmp_path) -> 
 
     await logger.async_disable()
 
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "DEBUG_ON" in content
     assert "SESSION_START" in content
     assert "ENGINE_DECISION" in content
@@ -378,7 +383,7 @@ async def test_reenable_appends_not_overwrites(hass: HomeAssistant, tmp_path) ->
     logger.log("SESSION_START", "session_id=second")
     await logger.async_disable()
 
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "session_id=first" in content
     assert "session_id=second" in content
     assert content.index("session_id=first") < content.index("session_id=second")
@@ -399,11 +404,11 @@ async def test_clear_flushes_then_truncates(hass: HomeAssistant, tmp_path) -> No
     await logger.async_clear()
 
     # Active file truncated; pre-clear content gone (flushed first, then truncated)
-    assert open(logger.file_path, encoding="utf-8").read() == ""
+    assert _read_text(logger) == ""
     assert logger._buffer != []  # DEBUG_CLEAR marker buffered
 
     await _flush_by_time(hass)
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "DEBUG_CLEAR" in content
     assert "Log cleared by user" in content
     assert "on-disk event" not in content
@@ -419,7 +424,7 @@ async def test_clear_no_marker_when_disabled(hass: HomeAssistant, tmp_path) -> N
     await logger.async_clear()
     await _flush_by_time(hass)
 
-    assert open(logger.file_path, encoding="utf-8").read() == ""
+    assert _read_text(logger) == ""
 
 
 async def test_clear_failure_rebuffers_pending_lines(hass: HomeAssistant, tmp_path) -> None:
@@ -439,7 +444,7 @@ async def test_clear_failure_rebuffers_pending_lines(hass: HomeAssistant, tmp_pa
 
     await _flush_by_time(hass)
 
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "pending-at-clear" in content
     assert logger._buffer == []
 
@@ -475,7 +480,7 @@ async def test_flush_failure_retains_lines_for_retry(hass: HomeAssistant, tmp_pa
 
     await _flush_by_time(hass)
 
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "retained-1" in content
     assert "retained-2" in content
     assert content.index("retained-1") < content.index("retained-2")
@@ -554,7 +559,7 @@ async def test_buffer_capped_drop_oldest_with_recovery_note(
 
     await _flush_by_time(hass)
 
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "5 lines dropped" in content
     assert "cap-line-04" not in content
     assert "cap-line-05" in content
@@ -590,7 +595,7 @@ async def test_dropped_count_sums_across_multiple_capped_cycles(
     # Recovery: one note carrying the summed count
     await _flush_by_time(hass)
 
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "10 lines dropped" in content
     assert content.count("DEBUG_DROPPED") == 1
     # Survivors: c1-10..c1-14 + all of cycle 2; c1-09 and older are gone
@@ -816,7 +821,7 @@ async def test_rotation_failure_falls_back_to_append(hass: HomeAssistant, tmp_pa
         await _flush_by_time(hass)
 
     # Lines still landed in the (oversized) active file — no drop mode
-    content = open(logger.file_path, encoding="utf-8").read()
+    content = _read_text(logger)
     assert "after rotation failure 1" in content
     assert "after rotation failure 2" in content
 
@@ -846,5 +851,5 @@ async def test_clear_truncates_active_only_dot1_remains(hass: HomeAssistant, tmp
 
     await logger.async_clear()
 
-    assert open(logger.file_path, encoding="utf-8").read() == ""
+    assert _read_text(logger) == ""
     assert open(logger.rotated_file_path, encoding="utf-8").read() == "ROTATED GENERATION\n"

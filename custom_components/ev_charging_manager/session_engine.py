@@ -47,7 +47,7 @@ from .const import (
     SessionEngineState,
     UnknownReason,
 )
-from .debug_logger import DebugLogger
+from .debug_logger import DebugLogger, redact_tag
 from .models import GuestPricing
 from .pricing import PricingEngine, SpotConfig
 from .rfid_lookup import RfidLookup
@@ -855,16 +855,17 @@ class SessionEngine:
         rfid_lookup = RfidLookup(self._config_store.data)
         resolution = rfid_lookup.resolve(trx)
 
-        # Log RFID resolution result for diagnostics (PR-010, T010)
+        # Log RFID resolution result for diagnostics (PR-010, T010).
+        # FR-004 (PR-28): tag values are masked in debug-log lines.
         if self._debug_logger:
             if resolution is not None and resolution.user_type != "unknown":
                 self._debug_logger.log(
                     "RFID_READ",
-                    f"tag={trx} matched user={resolution.user_name} "
+                    f"tag={redact_tag(trx)} matched user={resolution.user_name} "
                     f"(rfid_index={resolution.rfid_index})",
                 )
             else:
-                self._debug_logger.log("RFID_READ", f"tag={trx} unknown")
+                self._debug_logger.log("RFID_READ", f"tag={redact_tag(trx)} unknown")
 
         # Snapshot energy at session start
         energy = self._get_energy()
@@ -963,12 +964,13 @@ class SessionEngine:
 
         self._state = SessionEngineState.TRACKING
 
+        # FR-004 (PR-28): full tag values only at debug level in the HA log
         _LOGGER.info(
             "Session started: id=%s user=%s vehicle=%s trx=%s",
             self._active_session.id,
             self._active_session.user_name,
             self._active_session.vehicle_name,
-            trx,
+            redact_tag(trx),
         )
 
         # Fire session_started event
@@ -1351,9 +1353,19 @@ class SessionEngine:
             return
 
         # Emit the log line — always, including transitions to invalid states (informative)
+        display_before, display_new = before, new_value
+        if category == "TRX_STATE":
+            # FR-004 (PR-28): trx values are RFID tag values — mask them in the
+            # logged message. Absent/invalid sentinels render unchanged; the raw
+            # value is still cached below for transition detection.
+            if display_before not in _INVALID_STATES:
+                display_before = redact_tag(display_before)
+            if display_new not in _INVALID_STATES:
+                display_new = redact_tag(display_new)
         self._debug_logger.log(
             category,
-            f"{signal_token} changed: {before} → {new_value}{self._format_signal_snapshot()}",
+            f"{signal_token} changed: {display_before} → {display_new}"
+            f"{self._format_signal_snapshot()}",
         )
 
         # Update cache ONLY on valid transitions — transient unavailability must not

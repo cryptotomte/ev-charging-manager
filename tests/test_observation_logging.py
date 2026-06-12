@@ -948,15 +948,15 @@ async def test_obs_fr006_real_debug_logger_format(
     from custom_components.ev_charging_manager.debug_logger import DebugLogger
 
     log_dir = str(tmp_path)
-    logger = DebugLogger(log_dir)
-    logger.enable()
+    logger = DebugLogger(hass, log_dir)
+    await logger.async_enable()
 
     # Write one observation-style log line
     logger.log("PLUG_STATE", "plug changed: off → on | wh=1.234 power=1100")
-    logger.disable()
+    await logger.async_disable()  # flushes the buffer to disk
 
-    # Read the file
-    log_file = tmp_path / "www" / "ev_charging_manager_debug.log"
+    # Read the file (PR-28: at the config root, no longer under www/)
+    log_file = tmp_path / "ev_charging_manager_debug.log"
     assert log_file.exists(), f"Log file not created at {log_file}"
     lines = log_file.read_text().splitlines()
 

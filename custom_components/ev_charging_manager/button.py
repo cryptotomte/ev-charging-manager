@@ -49,6 +49,10 @@ class ClearDebugLogButton(ButtonEntity):
         )
 
     async def async_press(self) -> None:
-        """Handle button press — truncate the debug log file."""
+        """Handle button press — flush, then truncate the debug log file.
+
+        The logger's own async path serializes with in-flight flushes and runs
+        all file operations in the executor (PR-28 FR-012).
+        """
         _LOGGER.debug("Clear debug log button pressed for entry %s", self._entry.entry_id)
-        await self.hass.async_add_executor_job(self._debug_logger.clear)
+        await self._debug_logger.async_clear()

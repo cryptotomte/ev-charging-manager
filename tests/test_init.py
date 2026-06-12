@@ -314,14 +314,11 @@ async def test_legacy_www_file_deleted_at_setup(hass: HomeAssistant, tmp_path, c
     assert entry.state is ConfigEntryState.LOADED
     assert not legacy.exists(), "Legacy www/ log file must be deleted at setup"
     assert any(
-        "legacy debug log" in r.message.lower() and str(legacy) in r.message
-        for r in caplog.records
+        "legacy debug log" in r.message.lower() and str(legacy) in r.message for r in caplog.records
     ), "The deletion must be logged with the legacy path"
 
 
-async def test_legacy_www_file_deleted_when_logging_disabled(
-    hass: HomeAssistant, tmp_path
-) -> None:
+async def test_legacy_www_file_deleted_when_logging_disabled(hass: HomeAssistant, tmp_path) -> None:
     """US1 scenario 4: the legacy file is deleted even when debug logging is
     DISABLED — the exposure must end regardless of the toggle (FR-002)."""
     hass.config.config_dir = str(tmp_path)
@@ -371,9 +368,9 @@ async def test_legacy_deletion_failure_warns_and_setup_succeeds(
         await setup_session_engine(hass, entry)
 
     assert entry.state is ConfigEntryState.LOADED, "Cleanup failure must never fail setup"
-    assert any(
-        r.levelno == logging.WARNING and str(legacy) in r.message for r in caplog.records
-    ), "A WARNING naming the legacy path must be emitted"
+    assert any(r.levelno == logging.WARNING and str(legacy) in r.message for r in caplog.records), (
+        "A WARNING naming the legacy path must be emitted"
+    )
 
 
 async def test_unload_writes_debug_off_as_final_line(hass: HomeAssistant, tmp_path) -> None:

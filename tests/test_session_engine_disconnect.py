@@ -19,6 +19,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
+    async_capture_events,
     async_fire_time_changed,
 )
 
@@ -26,6 +27,7 @@ from custom_components.ev_charging_manager.const import (
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
     CONF_DISCONNECT_GRACE_MIN,
     DOMAIN,
+    EVENT_SESSION_COMPLETED,
     SessionEngineState,
 )
 from custom_components.ev_charging_manager.session_engine_v2 import (
@@ -498,3 +500,74 @@ async def test_grace_suppressed_during_outage_and_rearmed_on_resolution(
     assert engine.state == SessionEngineState.IDLE
     assert len(session_store.sessions) == 1
     assert session_store.sessions[0]["id"] == session_id
+
+
+async def test_fresh_grace_after_outage_fires_with_full_duration(
+    hass: HomeAssistant, freezer
+) -> None:
+    """Review F5: the FRESH grace re-armed at outage resolution must be a REAL
+    timer with the FULL disconnect_grace_min duration. With plug=off at
+    resolution and NO further triggers, the session is still TRACKING just
+    under the deadline and force-completed exactly once just past it."""
+    entry = await _make_engine_entry(hass)
+    engine = _get_engine(hass, entry)
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
+    completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+
+    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
+        await _plug_in_and_charge(hass, energy_kwh=6.0)
+        freezer.tick(timedelta(minutes=5))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+        session_id = engine.active_session.id
+
+        # Transient disconnect → grace armed (cable stays Locked).
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+        assert engine._disconnect_grace_cancel is not None, "grace must be pending"
+
+        # Full charger outage; the original grace expires mid-outage (suppressed).
+        hass.states.async_set(MOCK_POWER_ENTITY, STATE_UNAVAILABLE)
+        hass.states.async_set(MOCK_ENERGY_ENTITY, STATE_UNAVAILABLE)
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, STATE_UNAVAILABLE)
+        await hass.async_block_till_done()
+        assert engine._charger_offline is True, "precondition: charger detected offline"
+
+        freezer.tick(timedelta(minutes=GRACE_TIMEOUT_MIN + 1))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+        assert engine.active_session is not None, "no completion may land mid-outage"
+
+        # Outage resolves with plug=off → fresh full grace armed.
+        # NO further triggers from here on — only time passes.
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()
+        assert engine._charger_offline is False, "outage must be resolved"
+        assert engine._disconnect_grace_cancel is not None, "fresh grace must be armed"
+
+        # Just under the FULL grace duration: still TRACKING (pins that the
+        # re-armed grace is a full timer, not a remainder or instant action).
+        freezer.tick(timedelta(minutes=GRACE_TIMEOUT_MIN) - timedelta(seconds=30))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+        assert engine.state == SessionEngineState.TRACKING, (
+            "F5: just under disconnect_grace_min after re-arm the session must still track"
+        )
+        assert engine.active_session is not None
+        assert len(completed_events) == 0
+        assert len(session_store.sessions) == 0
+
+        # Past the deadline: exactly one force-completion (pins a REAL timer —
+        # a dummy handle would never fire and the session would track forever).
+        freezer.tick(timedelta(minutes=1))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    assert engine.active_session is None, "F5: the fresh grace must force-complete at expiry"
+    assert engine.state == SessionEngineState.IDLE
+    assert len(session_store.sessions) == 1, "exactly one completion"
+    assert session_store.sessions[0]["id"] == session_id
+    assert len(completed_events) == 1, "exactly one EVENT_SESSION_COMPLETED"

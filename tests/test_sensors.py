@@ -447,9 +447,7 @@ async def test_status_and_binary_sensor_unaffected_by_availability_rule(hass: Ho
     from homeassistant.helpers import entity_registry as er
 
     registry = er.async_get(hass)
-    binary_id = registry.async_get_entity_id(
-        "binary_sensor", DOMAIN, f"{entry.entry_id}_charging"
-    )
+    binary_id = registry.async_get_entity_id("binary_sensor", DOMAIN, f"{entry.entry_id}_charging")
     assert binary_id is not None
     state = hass.states.get(binary_id)
     assert state is not None

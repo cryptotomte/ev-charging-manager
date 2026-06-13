@@ -587,9 +587,9 @@ async def test_attributes_present_exactly_when_value_is(hass: HomeAssistant) -> 
 
     from homeassistant.util import dt as dt_util
 
+    from custom_components.ev_charging_manager.charging_window import ChargingWindowTracker
     from custom_components.ev_charging_manager.const import SessionEngineState
     from custom_components.ev_charging_manager.sensor import ChargingDurationSensor
-    from custom_components.ev_charging_manager.charging_window import ChargingWindowTracker
 
     entry = MockConfigEntry(
         domain=DOMAIN,

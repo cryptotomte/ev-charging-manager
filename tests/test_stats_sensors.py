@@ -702,8 +702,7 @@ async def test_all_stats_sensors_unavailable_when_engine_absent(
         state = hass.states.get(entity_id)
         assert state is not None
         assert state.state == STATE_UNAVAILABLE, (
-            f"FR-007: {uid} must be unavailable with the stats engine absent, "
-            f"got {state.state!r}"
+            f"FR-007: {uid} must be unavailable with the stats engine absent, got {state.state!r}"
         )
 
 

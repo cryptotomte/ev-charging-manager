@@ -199,8 +199,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         # BUG-6: tear down engine-managed listeners (per-session unsubs) that we
         # cannot register via entry.async_on_unload because they were created
-        # mid-session, not at setup. PlugAnchoredSessionEngine exposes async_unload;
-        # the legacy SessionEngine does not, so we duck-type the call.
+        # mid-session, not at setup. Both PlugAnchoredSessionEngine and the legacy
+        # SessionEngine now expose async_unload (F6); the hasattr guard remains for
+        # safety / forward-compat with any future engine that omits it.
         domain_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
         session_engine = domain_data.get("session_engine")
         if session_engine is not None and hasattr(session_engine, "async_unload"):

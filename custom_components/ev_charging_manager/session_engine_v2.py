@@ -269,6 +269,14 @@ class PlugAnchoredSessionEngine:
         self._hour_energy_snapshot: float = 0.0
         self._hour_start_time: str = ""
         self._hourly_unsub: Any = None
+        # PR-29 (FR-008/FR-010): spot price captured at the START of the current
+        # accounting hour (session start, resume re-arm, each hourly boundary).
+        # The CAPTURED pair prices the hour when it closes — never a fresh read
+        # at the tick (Nordpool-style sensors flip to the new hour's price at
+        # the boundary, racing the tick). None price means "unavailable at
+        # capture" → fallback pricing for the whole hour. In-memory only; dies
+        # with the session (resume recaptures).
+        self._current_hour_price: float | None = None
 
         # Story 07 (passive notification): set of notification IDs currently visible,
         # keyed for auto-dismiss when the corresponding mapping is added (FR-022).
@@ -350,6 +358,19 @@ class PlugAnchoredSessionEngine:
     def last_session_rfid_index(self) -> int | None:
         """Return the RFID index from the last completed session."""
         return self._last_session_rfid_index
+
+    @property
+    def last_power_w(self) -> float | None:
+        """Return the most recent power reading (W), or None if no reading yet.
+
+        PR-29 (FR-001): public read-only surface for SessionPowerSensor — None
+        means no power reading has been processed yet (the initial state before
+        the first power update); consumers must handle it instead of crashing on
+        round(None). Both the session-start and restart-resume paths coerce the
+        first reading via `self._get_power() or 0.0`, so None is only observable
+        before any session has begun.
+        """
+        return self._last_power_w
 
     @property
     def window_tracker(self) -> ChargingWindowTracker:
@@ -805,6 +826,9 @@ class PlugAnchoredSessionEngine:
         if self._pricing.mode == "spot" and self._hourly_unsub is None:
             self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
             self._hour_energy_snapshot = max(0.0, current_energy - session.energy_start_kwh)
+            # PR-29 (FR-008): the pre-restart captured price is gone (in-memory)
+            # — recapture at resume for the in-progress hour.
+            self._capture_hour_price()
             self._arm_hourly_spot_callback()
             if self._debug_logger:
                 self._debug_logger.log(
@@ -1994,8 +2018,12 @@ class PlugAnchoredSessionEngine:
         else:
             completed_cost = self._pricing.calculate_spot_total(session.price_details or [])
             partial_kwh = max(0.0, session.energy_kwh - self._hour_energy_snapshot)
-            spot_price = self._read_spot_price()
-            partial_detail = self._pricing.calculate_spot_hour(partial_kwh, spot_price)
+            # PR-29 (FR-008): the running estimate prices the in-progress hour
+            # with its CAPTURED pair, matching what the hour will be billed at
+            # when it closes (previously a live read — boundary-race inconsistent).
+            partial_detail = self._pricing.calculate_spot_hour(
+                partial_kwh, self._current_hour_price
+            )
             session.cost_total_kr = round(completed_cost + partial_detail["cost_kr"], 4)
 
         # Update guest charge price
@@ -2132,6 +2160,9 @@ class PlugAnchoredSessionEngine:
                 self._active_session.price_details = []
                 self._hour_energy_snapshot = 0.0
                 self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+                # PR-29 (FR-008): capture the price that governs the first
+                # (partial) accounting hour at its start.
+                self._capture_hour_price()
                 self._arm_hourly_spot_callback()
 
             # Story 07: check for unmapped RFID and trigger passive notification if needed
@@ -2508,8 +2539,11 @@ class PlugAnchoredSessionEngine:
                         self._last_energy_kwh or 0.0
                     ) - session.energy_start_kwh
                     kwh_final = max(0.0, current_relative_energy - self._hour_energy_snapshot)
-                    spot_price = self._read_spot_price()
-                    final_detail = self._pricing.calculate_spot_hour(kwh_final, spot_price)
+                    # PR-29 (FR-008): the final partial hour is priced with the
+                    # pair captured at that hour's start.
+                    final_detail = self._pricing.calculate_spot_hour(
+                        kwh_final, self._current_hour_price
+                    )
                     final_detail["hour"] = self._hour_start_time
                     final_detail["kwh"] = round(kwh_final, 3)
                     if session.price_details is None:
@@ -2784,14 +2818,20 @@ class PlugAnchoredSessionEngine:
 
     @callback
     def _async_hourly_snapshot(self, now: datetime) -> None:
-        """Capture energy and cost for the completed hour (spot pricing)."""
+        """Close the completed hour and start the next one (spot pricing).
+
+        PR-29 (FR-008/FR-009): the CLOSING hour is priced with the pair
+        captured at that hour's START — never with a read at tick time
+        (Nordpool-style sensors flip to the new hour's price exactly at the
+        boundary, racing this tick). The price read NOW becomes the captured
+        price for the hour that starts at this boundary.
+        """
         if self._active_session is None or self._pricing.mode != "spot":
             return
         session = self._active_session
         current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
         kwh_this_hour = max(0.0, current_relative_energy - self._hour_energy_snapshot)
-        spot_price = self._read_spot_price()
-        detail = self._pricing.calculate_spot_hour(kwh_this_hour, spot_price)
+        detail = self._pricing.calculate_spot_hour(kwh_this_hour, self._current_hour_price)
         detail["hour"] = self._hour_start_time
         detail["kwh"] = round(kwh_this_hour, 3)
         if session.price_details is None:
@@ -2800,6 +2840,8 @@ class PlugAnchoredSessionEngine:
         session.cost_total_kr = self._pricing.calculate_spot_total(session.price_details)
         self._hour_energy_snapshot = current_relative_energy
         self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+        # FR-009 (PR-29): capture the price for the hour that starts at this boundary.
+        self._capture_hour_price()
         self._dispatch_update()
 
     # -----------------------------------------------------------------------
@@ -2910,6 +2952,53 @@ class PlugAnchoredSessionEngine:
             return float(state.state)
         except (ValueError, TypeError):
             return None
+
+    def _capture_hour_price(self) -> None:
+        """Capture the spot price for the accounting hour starting now (FR-008 (PR-29)).
+
+        Called at session start, at restart-resume re-arm, and at each hourly
+        boundary AFTER the previous hour has been closed. FR-010 (PR-29): fallback
+        is evaluated at capture time — a None capture prices the whole hour at
+        the fallback price. Per-hour fallback provenance is NOT tracked on the
+        engine; it lives in each `price_details` entry's `fallback` flag, which
+        `PricingEngine.calculate_spot_hour` sets from `price is None` when the
+        hour closes.
+
+        PR-27 F1(a) intent, relocated by PR-29 FR-008: the spot read no longer
+        runs at finalize, so a read FAILURE now surfaces here. `_read_spot_price()`
+        already swallows the expected degradations (ValueError/TypeError →
+        None), so the broad guard below only ever fires on UNEXPECTED faults
+        (e.g. AttributeError from a future refactor). Those are real bugs, so
+        they are logged at ERROR with a traceback — but still degraded to None
+        (fallback prices the hour) and flagged via `data_gap` rather than
+        stranding the session, since capture must never raise into the caller's
+        hot path.
+        """
+        try:
+            price = self._read_spot_price()
+        except Exception:  # noqa: BLE001 — degrade, never strand (PR-27 F1a)
+            price = None
+            if not self._data_gap:
+                self._data_gap = True
+            if self._active_session is not None:
+                self._active_session.data_gap = True
+            _LOGGER.error(
+                "PlugAnchoredSessionEngine: unexpected spot price read fault at "
+                "hour start (%s) — fallback %.2f kr/kWh will price this hour, "
+                "data_gap=True",
+                self._hour_start_time,
+                self._pricing.fallback_price or 0.0,
+                exc_info=True,
+            )
+        self._current_hour_price = price
+        if price is None:
+            _LOGGER.warning(
+                "Spot price sensor '%s' unavailable at hour start (%s) — "
+                "fallback %.2f kr/kWh will price this hour",
+                self._entry.data.get(CONF_SPOT_PRICE_ENTITY),
+                self._hour_start_time,
+                self._pricing.fallback_price or 0.0,
+            )
 
     def _calculate_charge_price(self, session: Session) -> float | None:
         if self._guest_pricing is None:

@@ -62,7 +62,28 @@ class StatsBaseSensor(SensorEntity):
 
     def _stats_engine(self) -> StatsEngine | None:
         """Return the StatsEngine for this entry, or None if not loaded."""
-        return self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("stats_engine")
+        engine = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("stats_engine")
+        if engine is None:
+            # FR-007 (PR-29): three benign causes (pre-setup, post-teardown,
+            # reload race) all gate the sensor unavailable and look identical.
+            # Leave a trace so a genuine load/teardown anomaly is diagnosable.
+            _LOGGER.debug(
+                "StatsEngine absent for entry %s — stats sensors gating unavailable",
+                self._entry.entry_id,
+            )
+        return engine
+
+    @property
+    def available(self) -> bool:
+        """Return True only when the stats engine is loaded (PR-29 / FR-007).
+
+        Statistics are indeterminable without the engine (teardown/reload
+        race) — rendering `unavailable` instead of a spurious 0 protects the
+        TOTAL_INCREASING sensors from HA's long-term-statistics meter-reset
+        detection (the Energy-dashboard double-count vector). Subclasses
+        layer further conditions (user bucket, guest data) on top.
+        """
+        return self._stats_engine() is not None
 
     def _get_user_stats(self, user_name: str) -> UserStats | None:
         """Return UserStats for the given user, or None if engine not loaded."""
@@ -110,8 +131,17 @@ class UserTotalEnergySensor(StatsBaseSensor):
         self._attr_translation_placeholders = {"user": user_name}
 
     @property
+    def available(self) -> bool:
+        """Available only when the stats engine AND the user's bucket exist (FR-007 (PR-29))."""
+        return self._get_user_stats(self._user_name) is not None
+
+    @property
     def native_value(self) -> float:
-        """Return lifetime total energy (0.0 when no sessions)."""
+        """Return lifetime total energy (0.0 for a fresh zero bucket).
+
+        The stats-absent branch is unreachable via the availability gate
+        (FR-007 (PR-29)); the 0.0 return is kept as a None-safe belt-and-braces.
+        """
         stats = self._get_user_stats(self._user_name)
         if stats is None:
             return 0.0
@@ -156,8 +186,17 @@ class UserTotalCostSensor(StatsBaseSensor):
         self._attr_translation_placeholders = {"user": user_name}
 
     @property
+    def available(self) -> bool:
+        """Available only when the stats engine AND the user's bucket exist (FR-007 (PR-29))."""
+        return self._get_user_stats(self._user_name) is not None
+
+    @property
     def native_value(self) -> float:
-        """Return lifetime total cost (0.0 when no sessions)."""
+        """Return lifetime total cost (0.0 for a fresh zero bucket).
+
+        The stats-absent branch is unreachable via the availability gate
+        (FR-007 (PR-29)); the 0.0 return is kept as a None-safe belt-and-braces.
+        """
         stats = self._get_user_stats(self._user_name)
         if stats is None:
             return 0.0
@@ -185,8 +224,17 @@ class UserSessionCountSensor(StatsBaseSensor):
         self._attr_translation_placeholders = {"user": user_name}
 
     @property
+    def available(self) -> bool:
+        """Available only when the stats engine AND the user's bucket exist (FR-007 (PR-29))."""
+        return self._get_user_stats(self._user_name) is not None
+
+    @property
     def native_value(self) -> int:
-        """Return lifetime session count (0 when no sessions)."""
+        """Return lifetime session count (0 for a fresh zero bucket).
+
+        The stats-absent branch is unreachable via the availability gate
+        (FR-007 (PR-29)); the 0 return is kept as a None-safe belt-and-braces.
+        """
         stats = self._get_user_stats(self._user_name)
         if stats is None:
             return 0

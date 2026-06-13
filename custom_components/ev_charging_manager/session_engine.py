@@ -1,4 +1,19 @@
-"""SessionEngine — core session tracking state machine for EV Charging Manager."""
+"""SessionEngine — core session tracking state machine for EV Charging Manager.
+
+PR-29 / FR-011 — legacy spot-pricing limitation (deliberately NOT fixed here):
+``_async_hourly_snapshot`` below reads the spot price AT the hourly tick to
+price the hour that just CLOSED. With Nordpool-style sensors that flip to the
+new hour's price exactly at HH:00, this races the tick and can bill the closed
+hour at the next hour's price (the boundary-race bug fixed in the v2 engine,
+``PlugAnchoredSessionEngine``, via price capture at each hour's START).
+
+The legacy engine is frozen for non-go-e profiles; porting the capture pattern
+here is not a trivial drop-in (it touches session start, resume re-arm, the
+hourly tick, and finalize across a separate code path) so it is intentionally
+deferred. New installs use the plug-anchored v2 engine, which is correct. A
+later refactor (PR-31) will extract the shared spot machinery so this engine
+inherits the fix.
+"""
 
 from __future__ import annotations
 
@@ -201,6 +216,19 @@ class SessionEngine:
     def last_session_rfid_index(self) -> int | None:
         """Return the RFID index from the last completed session."""
         return self._last_session_rfid_index
+
+    @property
+    def last_power_w(self) -> float | None:
+        """Return the most recent power reading (W), or None if no reading yet.
+
+        PR-29 (FR-001 (PR-29)): public read-only surface for SessionPowerSensor —
+        mirror of PlugAnchoredSessionEngine.last_power_w. None means no power
+        reading has been processed yet (the initial state before the first power
+        update); consumers must handle it instead of crashing on round(None).
+        The legacy engine coerces `_last_power_w = self._get_power() or 0.0` once
+        a session is active, so None is observable only before the first session.
+        """
+        return self._last_power_w
 
     async def async_recover(self, snapshot: dict | None) -> None:
         """Recover an active session after a system restart.
@@ -505,6 +533,26 @@ class SessionEngine:
                 continue
             if state.state not in _INVALID_STATES:
                 setattr(self, attr_name, state.state)
+
+    async def async_unload(self) -> None:
+        """Tear down engine-owned listeners (PR-29 FR-012).
+
+        The spot-pricing hourly callback is registered from inside the engine
+        on session start and is NOT registered via entry.async_on_unload (that
+        leaked one stale entry per session). Cancel it here. Idempotent — the
+        handle is cleared, so a call after completion (which already cancelled
+        it) or a repeated unload is a no-op. Listeners registered via
+        entry.async_on_unload (the state-change subscription) are torn down by
+        HA itself.
+
+        Duck-typed from __init__.async_unload_entry (mirror of the v2 engine).
+        """
+        if self._hourly_unsub is not None:
+            try:
+                self._hourly_unsub()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("SessionEngine: hourly_unsub cancel failed: %s", err)
+            self._hourly_unsub = None
 
     def _is_valid_state(self, state_val: str | None) -> bool:
         """Return True if state value is a valid (non-unavailable) value."""
@@ -944,13 +992,17 @@ class SessionEngine:
             self._active_session.price_details = []
             self._hour_energy_snapshot = 0.0  # relative to session start
             self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+            # PR-29 FR-012: keep the hourly unsub ENGINE-owned. Registering it
+            # via entry.async_on_unload on every session start leaked one stale
+            # entry per spot session (the list is never pruned for the entry's
+            # lifetime). It is cancelled at completion (below) and in
+            # async_unload() instead.
             self._hourly_unsub = async_track_utc_time_change(
                 self._hass,
                 self._async_hourly_snapshot,
                 minute=0,
                 second=0,
             )
-            self._entry.async_on_unload(self._hourly_unsub)
 
         # Log IDLE → TRACKING engine decision for diagnostics (PR-010, T011)
         if self._debug_logger:

@@ -524,6 +524,126 @@ async def test_window_attribute_schema(hass: HomeAssistant, freezer) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PR-29 (US3/FR-005): legacy engine → permanently unavailable
+# ---------------------------------------------------------------------------
+
+
+async def test_legacy_engine_charging_duration_unavailable(hass: HomeAssistant) -> None:
+    """FR-005 (PR-29): legacy SessionEngine with an ACTIVE session → unavailable.
+
+    The legacy engine has no charging-window tracking, so the sensor's value
+    is forever indeterminable there. Before PR-29 it rendered as available-
+    but-'unknown' forever — a standing availability-rule violation.
+
+    GAP-1 (PR-29 review): assert `sensor.available is False` at the unit level
+    rather than the rendered HA state. `available=True + native_value=None`
+    ALSO renders `unavailable`, so a state-only assertion does NOT fail when the
+    `window_tracker is not None` clause is reverted out of the gate. Probing
+    `available` directly pins the actual gate (mirrors
+    test_attributes_present_exactly_when_value_is).
+    """
+    from custom_components.ev_charging_manager.sensor import ChargingDurationSensor
+    from custom_components.ev_charging_manager.session_engine import SessionEngine
+    from tests.conftest import (
+        MOCK_CAR_STATUS_ENTITY,
+        setup_session_engine,
+        start_charging_session,
+    )
+
+    _ = MOCK_CAR_STATUS_ENTITY  # imported for symmetry with conftest helpers
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Legacy Charger")
+    await setup_session_engine(hass, entry)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert isinstance(engine, SessionEngine), "Precondition: legacy engine expected"
+    assert not hasattr(engine, "window_tracker"), (
+        "Precondition: legacy engine has no window_tracker surface"
+    )
+
+    await start_charging_session(hass, trx_value="2")
+    assert engine.active_session is not None, "Precondition: active legacy session"
+
+    sensor = ChargingDurationSensor(hass, entry)
+    assert sensor.available is False, (
+        "FR-005 (PR-29): ChargingDurationSensor must gate UNAVAILABLE on the "
+        "legacy engine (active session but no window tracking) — the value is "
+        "forever indeterminable there"
+    )
+    assert sensor.native_value is None, "Gated sensor must yield no value"
+
+
+# ---------------------------------------------------------------------------
+# PR-29 (US3/FR-006): attributes share the value's availability gate
+# ---------------------------------------------------------------------------
+
+
+async def test_attributes_present_exactly_when_value_is(hass: HomeAssistant) -> None:
+    """FR-006: extra_state_attributes uses the SAME gate as native_value.
+
+    Before PR-29 the value gated on engine+active_session while the
+    attributes gated on _is_tracking() — during COMPLETING (legacy-style
+    state semantics: session still set, state != TRACKING) the attributes
+    vanished while the value still rendered. Pin gate equality with a stub
+    engine frozen in that divergent state.
+    """
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.ev_charging_manager.charging_window import ChargingWindowTracker
+    from custom_components.ev_charging_manager.const import SessionEngineState
+    from custom_components.ev_charging_manager.sensor import ChargingDurationSensor
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini"},
+        title="Stub",
+    )
+    entry.add_to_hass(hass)
+
+    # Window tracker with one closed window (1 min, 1 kWh)
+    now = dt_util.utcnow()
+    tracker = ChargingWindowTracker()
+    tracker.open_window(now - timedelta(minutes=1), 0.0)
+    tracker.close_window(now, 1.0)
+
+    class _StubSession:
+        charging_window_count = 1
+
+    class _StubEngine:
+        """Engine frozen mid-COMPLETING: session still set, state != TRACKING."""
+
+        state = SessionEngineState.COMPLETING
+        active_session = _StubSession()
+        window_tracker = tracker
+        _window_tracker = tracker  # legacy-private alias used by pre-PR-29 code
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"session_engine": _StubEngine()}
+
+    sensor = ChargingDurationSensor(hass, entry)
+
+    value = sensor.native_value
+    attrs = sensor.extra_state_attributes
+
+    # The gates must agree: value present ⟺ attributes present
+    assert sensor.available is True
+    assert value is not None, "Value must render while the session is still set"
+    assert attrs != {}, (
+        "FR-006: attributes must be present exactly when the value is — "
+        "they vanished during COMPLETING before PR-29"
+    )
+    assert attrs["window_count"] == 1
+    assert attrs["current_window_open"] is False
+    assert len(attrs["windows"]) == 1
+
+    # And the inverse: no session → both gone
+    _StubEngine.active_session = None
+    assert sensor.available is False
+    assert sensor.native_value is None
+    assert sensor.extra_state_attributes == {}
+
+
+# ---------------------------------------------------------------------------
 # Scenario 7 — IC-3 row 3: waiting_for_rfid → sensor must be unavailable
 # ---------------------------------------------------------------------------
 

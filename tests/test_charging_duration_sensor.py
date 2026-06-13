@@ -529,15 +529,20 @@ async def test_window_attribute_schema(hass: HomeAssistant, freezer) -> None:
 
 
 async def test_legacy_engine_charging_duration_unavailable(hass: HomeAssistant) -> None:
-    """FR-005: legacy SessionEngine with an ACTIVE session → sensor unavailable.
+    """FR-005 (PR-29): legacy SessionEngine with an ACTIVE session → unavailable.
 
     The legacy engine has no charging-window tracking, so the sensor's value
     is forever indeterminable there. Before PR-29 it rendered as available-
     but-'unknown' forever — a standing availability-rule violation.
-    """
-    from homeassistant.const import STATE_UNAVAILABLE
-    from homeassistant.helpers import entity_registry as er
 
+    GAP-1 (PR-29 review): assert `sensor.available is False` at the unit level
+    rather than the rendered HA state. `available=True + native_value=None`
+    ALSO renders `unavailable`, so a state-only assertion does NOT fail when the
+    `window_tracker is not None` clause is reverted out of the gate. Probing
+    `available` directly pins the actual gate (mirrors
+    test_attributes_present_exactly_when_value_is).
+    """
+    from custom_components.ev_charging_manager.sensor import ChargingDurationSensor
     from custom_components.ev_charging_manager.session_engine import SessionEngine
     from tests.conftest import (
         MOCK_CAR_STATUS_ENTITY,
@@ -551,22 +556,20 @@ async def test_legacy_engine_charging_duration_unavailable(hass: HomeAssistant) 
     await setup_session_engine(hass, entry)
     engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
     assert isinstance(engine, SessionEngine), "Precondition: legacy engine expected"
+    assert not hasattr(engine, "window_tracker"), (
+        "Precondition: legacy engine has no window_tracker surface"
+    )
 
     await start_charging_session(hass, trx_value="2")
     assert engine.active_session is not None, "Precondition: active legacy session"
 
-    registry = er.async_get(hass)
-    entity_id = registry.async_get_entity_id(
-        "sensor", DOMAIN, f"{entry.entry_id}_charging_duration"
+    sensor = ChargingDurationSensor(hass, entry)
+    assert sensor.available is False, (
+        "FR-005 (PR-29): ChargingDurationSensor must gate UNAVAILABLE on the "
+        "legacy engine (active session but no window tracking) — the value is "
+        "forever indeterminable there"
     )
-    assert entity_id is not None, "ChargingDurationSensor must be registered"
-
-    state = hass.states.get(entity_id)
-    assert state is not None
-    assert state.state == STATE_UNAVAILABLE, (
-        f"FR-005: ChargingDurationSensor must be unavailable on the legacy engine "
-        f"(no window tracking), got {state.state!r}"
-    )
+    assert sensor.native_value is None, "Gated sensor must yield no value"
 
 
 # ---------------------------------------------------------------------------

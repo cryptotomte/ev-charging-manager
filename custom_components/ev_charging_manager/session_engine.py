@@ -1,4 +1,19 @@
-"""SessionEngine — core session tracking state machine for EV Charging Manager."""
+"""SessionEngine — core session tracking state machine for EV Charging Manager.
+
+PR-29 / FR-011 — legacy spot-pricing limitation (deliberately NOT fixed here):
+``_async_hourly_snapshot`` below reads the spot price AT the hourly tick to
+price the hour that just CLOSED. With Nordpool-style sensors that flip to the
+new hour's price exactly at HH:00, this races the tick and can bill the closed
+hour at the next hour's price (the boundary-race bug fixed in the v2 engine,
+``PlugAnchoredSessionEngine``, via price capture at each hour's START).
+
+The legacy engine is frozen for non-go-e profiles; porting the capture pattern
+here is not a trivial drop-in (it touches session start, resume re-arm, the
+hourly tick, and finalize across a separate code path) so it is intentionally
+deferred. New installs use the plug-anchored v2 engine, which is correct. A
+later refactor (PR-31) will extract the shared spot machinery so this engine
+inherits the fix.
+"""
 
 from __future__ import annotations
 

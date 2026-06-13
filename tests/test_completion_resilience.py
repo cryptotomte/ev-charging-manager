@@ -154,23 +154,36 @@ async def test_charge_price_failure_degrades_and_completes(hass: HomeAssistant, 
     assert len(completed_events) == 1, "exactly one EVENT_SESSION_COMPLETED"
 
 
-async def test_spot_finalize_failure_degrades_cost_and_completes(
+async def test_spot_capture_failure_degrades_cost_and_completes(
     hass: HomeAssistant, freezer
 ) -> None:
-    """F1(a)(ii): a spot final-hour failure degrades the cost to the running
-    estimate (not frozen-wrong / not zero) and the completion proceeds."""
+    """F1(a)(ii): a spot price-read failure degrades the cost to the running
+    estimate (not frozen-wrong / not zero) and the completion proceeds.
+
+    PR-29 (FR-008) moved the spot read OUT of finalize: the final hour is now
+    priced from the price CAPTURED at that hour's start, so a read failure can
+    only surface at a CAPTURE point (session start / resume / hourly tick).
+    This test simulates the failure at the session-start capture — the hour is
+    priced from the fallback, data_gap is flagged, and because the running
+    estimate is kept at that same captured (fallback) price, the persisted cost
+    equals the running estimate rather than being replaced by a wrong value."""
     entry = await _make_entry(hass, spot=True)
     engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
     session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
     completed_events = async_capture_events(hass, EVENT_SESSION_COMPLETED)
 
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
-        await _charge_session(hass, freezer)
-        session_id = engine.active_session.id
-        running_cost = engine.active_session.cost_total_kr
-        assert running_cost > 0, "precondition: running spot cost accumulated"
-
+        # The spot read RAISES at the session-start capture point: _capture_hour_price
+        # must degrade (fallback price + data_gap) instead of stranding the session.
         with patch.object(engine, "_read_spot_price", side_effect=RuntimeError("spot boom")):
+            await _charge_session(hass, freezer)
+            session_id = engine.active_session.id
+            running_cost = engine.active_session.cost_total_kr
+            assert running_cost > 0, "precondition: running spot cost accumulated (fallback)"
+            assert engine.active_session.data_gap is True, (
+                "capture-time read failure must flag data_gap immediately"
+            )
+
             await _unplug(hass)
 
     assert engine.state == SessionEngineState.IDLE

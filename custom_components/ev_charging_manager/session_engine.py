@@ -221,9 +221,12 @@ class SessionEngine:
     def last_power_w(self) -> float | None:
         """Return the most recent power reading (W), or None if no reading yet.
 
-        PR-29 (FR-001): public read-only surface for SessionPowerSensor —
-        mirror of PlugAnchoredSessionEngine.last_power_w. None means "no
-        reading processed yet" and must be handled by consumers.
+        PR-29 (FR-001 (PR-29)): public read-only surface for SessionPowerSensor —
+        mirror of PlugAnchoredSessionEngine.last_power_w. None means no power
+        reading has been processed yet (the initial state before the first power
+        update); consumers must handle it instead of crashing on round(None).
+        The legacy engine coerces `_last_power_w = self._get_power() or 0.0` once
+        a session is active, so None is observable only before the first session.
         """
         return self._last_power_w
 

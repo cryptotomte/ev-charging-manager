@@ -257,7 +257,7 @@ class SessionChargePriceSensor(_SessionSensorBase):
 
     @property
     def available(self) -> bool:
-        """Available only during an active guest session (FR-003 base + guest pricing).
+        """Available only during an active guest session (FR-003 (PR-29) base + guest pricing).
 
         Layers the guest-pricing condition on top of the base active-session
         gate (PR-29: base meaning swapped from TRACKING to session existence).
@@ -476,7 +476,7 @@ class ChargingDurationSensor(_SessionSensorBase):
 
     @property
     def available(self) -> bool:
-        """Return True only with an active session AND window tracking (FR-005).
+        """Return True only with an active session AND window tracking (FR-005 (PR-29)).
 
         Layers the window-tracking requirement on the base active-session gate
         (IC-3 row 3): TRACKING without a session means waiting_for_rfid — no
@@ -492,7 +492,7 @@ class ChargingDurationSensor(_SessionSensorBase):
         Computation (IC-5):
           total_closed_s + (utcnow() - open_window.start_at).total_seconds() if open else 0
         Formatted as zero-padded HH:MM:SS for parity with SessionDurationSensor.
-        Gate identical to `available` and `extra_state_attributes` (FR-006).
+        Gate identical to `available` and `extra_state_attributes` (FR-006 (PR-29)).
         """
         if not self.available:
             return None

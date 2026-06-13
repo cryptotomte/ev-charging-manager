@@ -277,7 +277,6 @@ class PlugAnchoredSessionEngine:
         # capture" → fallback pricing for the whole hour. In-memory only; dies
         # with the session (resume recaptures).
         self._current_hour_price: float | None = None
-        self._current_hour_fallback: bool = False
 
         # Story 07 (passive notification): set of notification IDs currently visible,
         # keyed for auto-dismiss when the corresponding mapping is added (FR-022).
@@ -365,9 +364,11 @@ class PlugAnchoredSessionEngine:
         """Return the most recent power reading (W), or None if no reading yet.
 
         PR-29 (FR-001): public read-only surface for SessionPowerSensor — None
-        means "no reading processed yet" (e.g. right after a restart resume
-        while the power entity is still unavailable) and must be handled by
-        consumers instead of crashing on round(None).
+        means no power reading has been processed yet (the initial state before
+        the first power update); consumers must handle it instead of crashing on
+        round(None). Both the session-start and restart-resume paths coerce the
+        first reading via `self._get_power() or 0.0`, so None is only observable
+        before any session has begun.
         """
         return self._last_power_w
 
@@ -2839,7 +2840,7 @@ class PlugAnchoredSessionEngine:
         session.cost_total_kr = self._pricing.calculate_spot_total(session.price_details)
         self._hour_energy_snapshot = current_relative_energy
         self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-        # FR-009: capture the price for the hour that starts at this boundary.
+        # FR-009 (PR-29): capture the price for the hour that starts at this boundary.
         self._capture_hour_price()
         self._dispatch_update()
 
@@ -2953,36 +2954,43 @@ class PlugAnchoredSessionEngine:
             return None
 
     def _capture_hour_price(self) -> None:
-        """Capture the spot price for the accounting hour starting now (FR-008).
+        """Capture the spot price for the accounting hour starting now (FR-008 (PR-29)).
 
         Called at session start, at restart-resume re-arm, and at each hourly
-        boundary AFTER the previous hour has been closed. FR-010: fallback is
-        evaluated at capture time — a None capture prices the whole hour at
-        the fallback price with the per-hour fallback flag set.
+        boundary AFTER the previous hour has been closed. FR-010 (PR-29): fallback
+        is evaluated at capture time — a None capture prices the whole hour at
+        the fallback price. Per-hour fallback provenance is NOT tracked on the
+        engine; it lives in each `price_details` entry's `fallback` flag, which
+        `PricingEngine.calculate_spot_hour` sets from `price is None` when the
+        hour closes.
 
         PR-27 F1(a) intent, relocated by PR-29 FR-008: the spot read no longer
-        runs at finalize, so a read FAILURE now surfaces here. A raising
-        `_read_spot_price()` is treated as None (fallback prices the hour) and
-        flags `data_gap` so the degradation is auditable rather than stranding
-        the session — capture must never raise into the caller's hot path.
+        runs at finalize, so a read FAILURE now surfaces here. `_read_spot_price()`
+        already swallows the expected degradations (ValueError/TypeError →
+        None), so the broad guard below only ever fires on UNEXPECTED faults
+        (e.g. AttributeError from a future refactor). Those are real bugs, so
+        they are logged at ERROR with a traceback — but still degraded to None
+        (fallback prices the hour) and flagged via `data_gap` rather than
+        stranding the session, since capture must never raise into the caller's
+        hot path.
         """
         try:
             price = self._read_spot_price()
-        except Exception as err:  # noqa: BLE001 — degrade, never strand (PR-27 F1a)
+        except Exception:  # noqa: BLE001 — degrade, never strand (PR-27 F1a)
             price = None
             if not self._data_gap:
                 self._data_gap = True
             if self._active_session is not None:
                 self._active_session.data_gap = True
-            _LOGGER.warning(
-                "PlugAnchoredSessionEngine: spot price read failed at hour start "
-                "(%s): %s — fallback %.2f kr/kWh will price this hour, data_gap=True",
+            _LOGGER.error(
+                "PlugAnchoredSessionEngine: unexpected spot price read fault at "
+                "hour start (%s) — fallback %.2f kr/kWh will price this hour, "
+                "data_gap=True",
                 self._hour_start_time,
-                err,
                 self._pricing.fallback_price or 0.0,
+                exc_info=True,
             )
         self._current_hour_price = price
-        self._current_hour_fallback = price is None
         if price is None:
             _LOGGER.warning(
                 "Spot price sensor '%s' unavailable at hour start (%s) — "

@@ -747,6 +747,113 @@ async def test_spot_session_price_details_have_required_keys(hass: HomeAssistant
 
 
 # ---------------------------------------------------------------------------
+# PR-29 US6 (T012/FR-012): legacy hourly-unsub leak
+#
+# The legacy SessionEngine armed a per-session spot hourly callback and
+# registered its unsub via entry.async_on_unload on EVERY session start. That
+# list is never pruned across the entry's lifetime, so each spot session leaked
+# one stale entry (and the completion cancel left a dead handle registered to
+# be called again at unload). The fix keeps the handle engine-owned, cancels it
+# at completion and in a new async_unload(), and never registers it on the
+# entry — so the entry unload-list stays constant in the number of sessions.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.freeze_time("2026-06-12T12:30:00+00:00")
+async def test_legacy_spot_unsub_does_not_leak_on_entry(hass: HomeAssistant):
+    """FR-012: two sequential legacy spot sessions must NOT grow the entry's
+    async_on_unload callback list (the per-session hourly unsub leak)."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    # Baseline after setup, before any session.
+    baseline = len(entry._on_unload or [])
+
+    # --- Session 1 ---
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+    assert engine.active_session is not None
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await hass.async_block_till_done()
+    await stop_charging_session(hass)
+    assert engine.state == SessionEngineState.IDLE
+
+    # Clear the PR-13 balancing-cycle gate via an Idle transition so a fresh
+    # Charging event starts a NEW session rather than being blocked.
+    hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Idle")
+    await hass.async_block_till_done()
+    assert engine._awaiting_reset is False
+
+    # --- Session 2 ---
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await start_charging_session(hass, trx_value="0")
+    assert engine.active_session is not None
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "12.4")
+    await hass.async_block_till_done()
+    await stop_charging_session(hass)
+    assert engine.state == SessionEngineState.IDLE
+
+    after = len(entry._on_unload or [])
+    assert after == baseline, (
+        f"entry async_on_unload list grew across two spot sessions "
+        f"({baseline} → {after}) — hourly unsub leaked"
+    )
+
+
+@pytest.mark.freeze_time("2026-06-12T12:30:00+00:00")
+async def test_legacy_async_unload_cancels_active_hourly_once(hass: HomeAssistant):
+    """FR-012: unload mid spot-session cancels the active hourly callback exactly
+    once; a second unload after completion does not double-cancel."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+    assert engine.active_session is not None
+    assert engine._hourly_unsub is not None, "spot session must arm an hourly callback"
+
+    # Unload mid-session cancels the active hourly callback exactly once.
+    await engine.async_unload()
+    assert engine._hourly_unsub is None, "async_unload must cancel + clear the handle"
+
+    # Idempotent — a second unload must not raise / double-cancel.
+    await engine.async_unload()
+    assert engine._hourly_unsub is None
+
+
+@pytest.mark.freeze_time("2026-06-12T12:30:00+00:00")
+async def test_legacy_async_unload_after_completion_no_double_cancel(hass: HomeAssistant):
+    """FR-012: completion already cancels the hourly handle; a later unload must
+    not attempt to cancel it again (no double-cancel)."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=MOCK_SPOT_CHARGER_DATA, options=_NO_MICRO, title="Test"
+    )
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, "0.89")
+    await setup_session_engine(hass, entry)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "10.0")
+    await start_charging_session(hass, trx_value="0")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "11.2")
+    await hass.async_block_till_done()
+    await stop_charging_session(hass)
+    assert engine.state == SessionEngineState.IDLE
+    assert engine._hourly_unsub is None, "completion already cancelled the handle"
+
+    # Unload after completion must be a no-op for the hourly handle (no raise).
+    await engine.async_unload()
+    assert engine._hourly_unsub is None
+
+
+# ---------------------------------------------------------------------------
 # T019: Fallback pricing tests (US4)
 # ---------------------------------------------------------------------------
 

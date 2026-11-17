@@ -1250,13 +1250,14 @@ class PlugAnchoredSessionEngine:
             return None
         return stored if stored.tzinfo is not None else None
 
-    def _restore_session_context(self, snapshot: dict, session: Session, now: datetime) -> None:
+    def _restore_session_context(self, snapshot: dict, session: Session, now: datetime) -> bool:
         """Restore what the session started with from the snapshot's ``resume_state``.
 
         Spec 027 D-36 (pricing), D-39 (spot hour), D-40 (guest rate), D-41 (charger
         total). A snapshot written by 0.4.7 has no ``resume_state`` and takes the
         fallbacks of D-45; a ``resume_state`` with a missing or malformed part takes
-        the same fallback for that part and logs a warning (RT-31).
+        the same fallback for that part and logs a warning (RT-31). Returns whether a
+        stored spot hour was restored.
         """
         state = snapshot.get("resume_state")
         if state is not None and not isinstance(state, dict):
@@ -1313,6 +1314,7 @@ class PlugAnchoredSessionEngine:
         self._guest_pricing = guest
         session.charge_price_method = guest.method if guest is not None else None
 
+        valid = False
         if self._pricing.mode == "spot":
             # Spec 027 D-39: the energy already billed is what price_details holds.
             self._hour_energy_snapshot = sum(
@@ -1335,6 +1337,27 @@ class PlugAnchoredSessionEngine:
                 self._capture_hour_price()
 
         self._eto_start = session.charger_total_before_kwh
+        return valid
+
+    def _implied_spot_price(self, snapshot: dict, session: Session) -> float | None:
+        """The spot price at which the snapshot's running cost priced its unbilled energy.
+
+        Spec 027 § 13.5 V-3: ``(cost − Σ cost_kr) / (energy − Σ kwh)`` from the snapshot,
+        as the spot price that gives this total price per kWh; None when it cannot be
+        formed.
+        """
+        details = session.price_details or []
+        unbilled_kwh = float(snapshot.get("energy_kwh", 0.0)) - sum(d["kwh"] for d in details)
+        unbilled_cost = float(snapshot.get("cost_total_kr", 0.0)) - sum(
+            d.get("cost_kr", 0.0) for d in details
+        )
+        vat = self._pricing_params[CONF_SPOT_VAT_MULTIPLIER]
+        if unbilled_kwh <= 0 or not vat:
+            return None
+        spot = (
+            unbilled_cost / unbilled_kwh / vat - self._pricing_params[CONF_SPOT_ADDITIONAL_COST_KWH]
+        )
+        return spot if math.isfinite(spot) else None
 
     async def _complete_snapshot_as_session(
         self,
@@ -1408,8 +1431,15 @@ class PlugAnchoredSessionEngine:
             reconstructed=True,
             data_gap=True,
         )
-        self._restore_session_context(snapshot, session, now)
+        spot_hour_restored = self._restore_session_context(snapshot, session, now)
         if self._pricing.mode == "spot":
+            if not spot_hour_restored:
+                # Spec 027 § 13.5 V-3 (amends D-45): without a stored hour, the price the
+                # snapshot's own running cost implies; else the price captured now, else
+                # the fallback.
+                implied = self._implied_spot_price(snapshot, session)
+                if implied is not None:
+                    self._current_hour_price = implied
             # Spec 027 D-39: the remaining energy closes into the stored hour.
             self._bill_open_hour(session, session.energy_kwh)
         self._recompute_derived(session)

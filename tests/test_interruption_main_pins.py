@@ -207,3 +207,30 @@ async def test_pin_main_power_flowing_before_the_rfid_entity_loads(
     await rig.goto("10:41:00")
 
     assert _summary(rig) == [("Paul", 2.0, 5.0, None, 2.0)]
+
+
+@pytest.mark.parametrize("spot_late", [False, True], ids=["price-present", "price-late"])
+async def test_pin_main_047_spot_snapshot_car_left(hass, hass_storage, freezer, spot_late) -> None:
+    """Verification V-3: a snapshot written by 0.4.7 (no stored spot hour) whose car left
+    during the upgrade. The fix round billed its unbilled energy at the fallback (27.0 kr)
+    while the price entity was not loaded; main keeps the snapshot's own cost, 3.0."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:30:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:36:00")
+
+    async def during(r: Rig) -> None:
+        snapshot = r.snapshot()
+        snapshot.pop("resume_state", None)
+        snapshot["charger_total_before_kwh"] = None
+        await r.set(power=0)
+        await r.unplug()
+        await r.goto("10:40:00", fire=False)
+
+    await restart("late", during=during, spot_late=spot_late)(rig)
+    await rig.goto("10:45:00")
+
+    assert _summary(rig) == [("Paul", 3.0, 3.0, None, 3.0)]

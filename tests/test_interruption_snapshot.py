@@ -281,6 +281,63 @@ async def test_d54_snapshot_written_by_047_with_the_price_entity_late(
     assert rig.money() == [B_TRUTH]
 
 
+async def _paul_charges_3_then_restart(rig: Rig, path: str, *, spot_late: bool) -> None:
+    """Paul charges 3.0 kWh at 1.0 kr (snapshot at 10:35); the integration is upgraded from
+    0.4.7 while the spot price moves to 2.0, and the snapshot is completed at start-up:
+    the car left, another card (a split), or the plug entity never valid (timeout)."""
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:30:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:36:00")
+
+    async def during(r: Rig) -> None:
+        _as_written_by_047(r)
+        await r.set(spot=2.0, power=0)
+        if path != "timeout":
+            await r.unplug()
+        if path == "split":
+            await r.set(trx="null", energy=0.0)
+            await r.plug_in(TRX_GFIX)
+        await r.goto("10:40:00", fire=False)
+
+    if path == "timeout":
+        await restart("late", during=during, absent=["plug"], order=[], spot_late=spot_late)(rig)
+        await rig.goto("11:41:00")
+    else:
+        await restart("late", during=during, spot_late=spot_late)(rig)
+        await rig.goto("10:45:00")
+        if path == "split":
+            await rig.set(energy=1.0, power=0)
+            await rig.unplug()
+
+
+@pytest.mark.parametrize("spot_late", [False, True], ids=["price-present", "price-late"])
+@pytest.mark.parametrize("path", ["car-left", "split", "timeout"])
+async def test_v3_047_spot_snapshot_completed_at_its_own_running_price(
+    hass, hass_storage, freezer, path, spot_late
+) -> None:
+    """Spec 027 § 13.5 V-3 (amends D-45): a 0.4.7 snapshot has no stored hour. When it is
+    completed, its unbilled energy is priced at the price its own running cost implies
+    (3.0 kr / 3.0 kWh), neither at the price captured now (2.0) nor at the fallback (9.0)
+    while the price entity is not loaded; price_details still sums to the energy."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await _paul_charges_3_then_restart(rig, path, spot_late=spot_late)
+
+    paul = rig.money()[0]
+    assert (paul["user"], paul["energy"], paul["cost"], paul["record_cost"]) == (
+        "Paul",
+        3.0,
+        3.0,
+        3.0,
+    )
+    assert [(kwh, price, fallback) for _, kwh, price, fallback in paul["details"]] == [
+        (3.0, 1.0, False)
+    ]
+    assert paul["details_kwh"] == 3.0
+
+
 BAD_PRICE = {"mode": "static", "static_price_kwh": "4"}
 BAD_HOUR = {"start": "x", "price": 9.0, "fallback": False}
 SPOT_HOUR_11 = {"start": "2026-11-17T11:00+00:00", "price": 2.0, "fallback": False}

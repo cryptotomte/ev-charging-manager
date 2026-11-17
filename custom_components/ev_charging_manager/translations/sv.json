@@ -102,7 +102,7 @@
                     "persistence_interval_s": "Hur ofta en aktiv session sparas till disk vid HA-omstart (60–3600 s, standard 300)",
                     "max_stored_sessions": "Äldsta sessioner tas bort när denna gräns överskrids (100–10000, standard 1000)",
                     "heartbeat_log_interval_min": "Minuter mellan HEARTBEAT-rader i felsökningsloggen under aktiv laddning (0–30, standard 5). Sätt till 0 för att avaktivera.",
-                    "ui_dispatch_interval_s": "Sekunder mellan levande sensoruppdateringar under aktiv laddning (0–300, standard 60). Sätt till 0 för att avaktivera."
+                    "ui_dispatch_interval_s": "Sekunder mellan levande sensoruppdateringar under aktiv laddning (10–300, standard 60). Sätt till 0 för att avaktivera."
                 }
             },
             "pricing": {

@@ -119,8 +119,8 @@
                     "disconnect_grace_min": "How long to wait after a transient plug-off before force-ending the session (5–30 min, default 10). Only applies when cable lock is not Unlocked.",
                     "notify_unmapped_rfid": "Notify when an RFID tag is detected by the charger but not mapped to a user in this integration. Energy from such sessions is attributed to the ''Unknown'' user. Disable only if you want to handle attribution gaps via automations.",
                     "heartbeat_log_interval_min": "Minutes between HEARTBEAT lines in the debug log during active charging (0–30, default 5). Set to 0 to disable.",
-                    "ui_dispatch_interval_s": "Seconds between live sensor refreshes during active charging (0–300, default 60). Set to 0 to disable live ticks.",
-                    "debug_logging": "Write charging events to www/ev_charging_manager_debug.log for diagnostics. Disable when investigation is complete."
+                    "ui_dispatch_interval_s": "Seconds between live sensor refreshes during active charging (10–300, default 60). Set to 0 to disable live ticks.",
+                    "debug_logging": "Write charging events to ev_charging_manager_debug.log in the Home Assistant config directory for diagnostics. Disable when investigation is complete."
                 }
             },
             "pricing": {

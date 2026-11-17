@@ -244,27 +244,44 @@ On the go-e Gemini profile (`goe_gemini`) a charging session survives a reload
 of the integration (for example after saving the options), a Home Assistant
 restart and a crash:
 
-- **Kept:** the user, the energy, the cost, the guest charge price and the spot
-  price per hour end up as without the interruption. The session in progress is
-  saved at every session event and when Home Assistant stops, so a reload or a
-  restart loses nothing; a crash loses at most what happened since the last save
+- **Kept:** in the ordinary case the user, the energy, the cost, the guest charge
+  price and the spot price per hour end up as without the interruption. The
+  session in progress is saved at every session event and when Home Assistant
+  stops, so a reload or a restart keeps everything up to the moment the
+  integration stopped; a crash loses at most what happened since the last save
   (at most `persistence_interval_s`, default 5 minutes).
 - **Price changes:** a price or pricing mode changed in the options applies from
   the **next** session. The session in progress keeps the price it started with.
-- **Someone else plugged in while Home Assistant was down:** the first session is
-  closed with the energy saved for it, and the new card gets a session of its own.
-  Nobody is billed for another person's energy.
-- **Can differ (money):** energy delivered between the last save and a crash is
-  lost when the charger's counter no longer shows it (another car plugged in, or
-  the counter reads less after the car left). If the charger's counter restarted
-  while Home Assistant was down, the energy counted before is kept but what the
-  new counter had counted at start-up is not added. In spot mode, energy
-  delivered while Home Assistant was down across an hour boundary is billed at
-  the price of the hour in which it went down.
+- **Someone else plugged in while Home Assistant was down:** when the charger
+  shows a different card than the one the session started with, the first
+  session is closed with the energy saved for it, and the new card gets a
+  session of its own.
+- **Waiting at start-up:** recovery waits for the plug sensor; if it has not
+  reported after 60 minutes, the session is closed with the larger of its saved
+  energy and the charger's counter, and a notification is shown. Once the plug
+  has reported, recovery waits at most 30 seconds for the energy or card sensor.
+- **Can differ (money):**
+  - A second car that charges and leaves within the same outage is added to the
+    previous user's session.
+  - A card shown only after a session was resumed is not acted on, also when the
+    session had no card: it keeps the user it started with.
+  - If the charger's counter restarted while Home Assistant was down and the
+    same card is still there, what the new counter had counted before start-up
+    is not billed.
+  - Energy delivered between the last save and a crash is lost when the
+    charger's counter no longer shows it (another car plugged in, or the counter
+    reads less after the car left).
+  - In spot mode, energy delivered while Home Assistant was down is priced at
+    the hour that was in progress when it went down, or at the current hour for
+    a session that starts at start-up. If the hour changes before the first
+    counter reading after start-up, that energy is priced at the later hour. An
+    hour is on the fallback price when the price sensor does not report within
+    that hour.
 - **Can differ (not money):** charging time and window count, the plug-in or
   unplug time when it was not observed, and a car that was briefly unplugged
   during the interruption becomes two sessions (the total is right). Every
-  recovered session is marked `reconstructed` and `data_gap`.
+  recovered session, and every session started with the cable already in, is
+  marked `reconstructed` and `data_gap`.
 
 On the `generic` profile a restart or reload during a session can still lose or
 split the session.

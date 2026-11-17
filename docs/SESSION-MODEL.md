@@ -172,36 +172,45 @@ The snapshot is written:
 - when the entry is unloaded (a reload, for example after saving the options),
 - when Home Assistant stops.
 
-A reload and an orderly restart therefore lose nothing. A crash or power loss
-loses at most what happened since the last of these writes.
+A reload and an orderly restart therefore keep everything up to the moment the
+integration stopped. A crash or power loss loses at most what happened since the
+last of these writes.
 
 ### What happens at start-up
 
-1. **The plug entity or the RFID entity has no value yet** (absent,
-   `unavailable` or `unknown`; `null` on the RFID entity is a value: no card).
-   Recovery waits for both. While it waits, a plug-in starts nothing. If they
-   are still missing after 60 minutes, the snapshot is completed with its own
-   energy and a notification is shown.
+1. **The plug entity has no value yet** (absent, `unavailable` or `unknown`).
+   Recovery waits for it. While it waits, a plug-in starts nothing. If the plug
+   is still missing after 60 minutes, the snapshot is completed with the larger
+   of its own energy and the counter difference (the counter may have moved on)
+   and a notification is shown.
 2. **The plug is off**: the car left while Home Assistant was down. The session
    is completed with the larger of the snapshot's energy and the counter
    difference (the go-e counter keeps the connection's final value until the
-   next plug-in). Cost, guest charge price and SoC estimate are recomputed from
-   that energy, and the end time is the start-up time.
-3. **The plug is on and the charger shows a different card** than the one the
-   session started with (or a card when the session had none): another person
-   has plugged in. The old session is completed with its snapshot energy, and
-   a new session starts for the present card and takes the whole counter of
-   the new connection.
-4. **Otherwise** (same card, or no card shown): the session is resumed with the
-   price parameters and guest rate it started with. The present counter reading
-   is fed through the normal energy handling, so a counter that restarted while
-   Home Assistant was down keeps the energy already counted. Cost, guest charge
-   price and SoC estimate are recomputed at once.
+   next plug-in). If the energy entity has no value yet, recovery waits for its
+   first reading, at most 30 seconds, and stops waiting at once if the plug
+   changes. Cost, guest charge price and SoC estimate are recomputed from that
+   energy, and the end time is the start-up time.
+3. **The plug is on.** If the RFID entity is absent or `unavailable`, recovery
+   waits for it, at most 30 seconds; `unknown` and `null` mean no card. Then:
+   - **The session started with a card and the charger shows a different
+     card**: another person has plugged in. The old session is completed with
+     its snapshot energy, and a new session starts for the present card and
+     takes the whole counter of the new connection.
+   - **Otherwise** (same card, no card shown, or a session that started without
+     a card): the session is resumed with the price parameters and guest rate it
+     started with. The present counter reading is fed through the normal energy
+     handling, so a counter that restarted while Home Assistant was down keeps
+     the energy already counted. Cost, guest charge price and SoC estimate are
+     recomputed at once.
 
-If the cable is already in at start-up and there is no snapshot, the engine
-handles it like a plug-in: it waits for a card (`waiting_for_rfid`) or starts a
-session for the card shown. Such a session takes the whole counter, because with
-the cable in the counter belongs to the current connection.
+A cable that is already in when there is nothing to recover is handled like a
+plug-in: the engine waits for a card (`waiting_for_rfid`), starts a session for
+the card shown, or, when no card is shown and power is already flowing, starts
+an open-access session at once. This applies at setup and whenever the plug
+entity goes from no value to `on`. Such a session takes the whole counter,
+because with the cable in the counter belongs to the current connection; after
+a snapshot was completed at the 60-minute timeout it starts from the counter's
+reading instead, so that snapshot's energy is not counted again.
 
 ### Prices across an interruption
 
@@ -213,15 +222,39 @@ the cable in the counter belongs to the current connection.
   with the price captured at its start. If the hour has passed, the energy not
   yet billed — including energy delivered while Home Assistant was down — is
   billed in that hour at its captured price, and a new hour starts with the
-  price read at start-up. Energy delivered during an outage cannot be split by
-  hour.
+  price read at start-up. A clock that reads earlier than the stored hour does
+  not close it.
+- If the spot price sensor has not reported since start-up when an hour starts,
+  the hour takes the sensor's first value within that hour; only if the hour
+  ends first does it use the fallback price. A sensor that had reported and is
+  merely unavailable at the hour's start gives the fallback price, as before.
 
 ### What an interruption still changes
 
+Money can still differ in these cases:
+
+- A second car that charges and leaves within the same outage: its energy is
+  added to the previous user's session, because the counter cannot tell the
+  two connections apart.
+- A card shown only after a session was resumed is not acted on: the session
+  keeps the user it started with.
+- The charger's counter restarts during the outage and the same card is still
+  there: what the new counter had counted before start-up is not billed.
+- Energy delivered during an outage is priced at the spot hour that was in
+  progress when Home Assistant went down, or at the current hour for a session
+  that starts at start-up. If the hour tick comes before the first counter
+  reading after a resume, the outage energy is priced at the later hour.
+- A spot hour is on the fallback price when the price sensor does not report
+  within that hour.
+- Energy that cannot be known is not attributed to anyone: when another
+  person's connection restarted the counter, or the counter reads below the
+  snapshot after the car left, the old session keeps its snapshot energy, and
+  energy delivered between the last snapshot write and the interruption is lost.
+
 These are not money and are deliberately unchanged:
 
-- Every resumed or recovered session has `reconstructed=True` and
-  `data_gap=True`.
+- Every resumed or recovered session, and every session started with the cable
+  already in, has `reconstructed=True` and `data_gap=True`.
 - Charging time and window count: a window open at the interruption becomes a
   synthetic window that ends at start-up (see below), and a window that is open
   after start-up counts as a new window.
@@ -230,11 +263,6 @@ These are not money and are deliberately unchanged:
   second session (energy and cost are correct in total).
 - `connected_at` is the start-up time when the plug-in was not observed, and the
   end time is the start-up time when the car left during the outage.
-
-Energy that cannot be known is not attributed to anyone: when another person's
-connection restarted the counter, or the counter reads below the snapshot after
-the car left, the old session keeps its snapshot energy, and energy delivered
-between the last snapshot write and the interruption is lost.
 
 A snapshot written by 0.4.7 (no `resume_state`) resumes with the price
 configured now, the guest rate looked up again through the card (used only
@@ -282,10 +310,10 @@ Sessions are stored under the storage key `ev_charging_manager_sessions`
 | `charge_price_method` | str \| None | Guests only: `fixed` or `markup` |
 | `estimated_soc_added_pct` | float \| None | SoC estimate, when the vehicle is known |
 | `charger_name` | str | Charger name |
-| `charger_total_before_kwh` | float \| None | Charger's lifetime counter at session start (stored at start) |
+| `charger_total_before_kwh` | float \| None | Charger's lifetime counter at session start (stored at start); in a completed record set only together with `charger_total_after_kwh` |
 | `charger_total_after_kwh` | float \| None | Charger's lifetime counter at session end |
 | `data_gap` | bool | The record may be incomplete or imprecise (see `session.py` for the full list) |
-| `reconstructed` | bool | The session was resumed or completed after a restart or reload |
+| `reconstructed` | bool | The session was resumed or completed after a restart or reload, or started with the cable already in |
 
 ### `resume_state` (active snapshot only)
 
@@ -299,7 +327,9 @@ events never have it, and version 0.4.7 ignores it after a downgrade.
 | `spot_hour` | Spot only: `start` of the hour in progress, its captured `price` and whether that is the `fallback`; None otherwise |
 
 A missing or malformed part falls back as for a 0.4.7 snapshot, with a warning
-in the Home Assistant log.
+in the Home Assistant log; so does a number that is not finite, or a fixed
+price, markup factor or fallback price below zero. A malformed `price_details`
+in the snapshot counts as empty, also with a warning.
 
 ---
 

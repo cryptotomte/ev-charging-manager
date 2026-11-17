@@ -627,8 +627,7 @@ async def test_cable_unlock_noop_when_offline(hass: HomeAssistant, freezer) -> N
 
 
 async def test_transient_resume_unchanged(hass: HomeAssistant, freezer) -> None:
-    """T020/FR-007: plug-on within grace resumes; grace expiry force-ends with data_gap."""
-    # --- part 1: resume on returning plug-on (no cable_lock→Unlocked) ---
+    """T020/FR-007: plug-on within grace resumes (no cable_lock→Unlocked)."""
     entry = await _make_engine_entry(hass)
     engine = _get_engine(hass, entry)
     session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
@@ -657,12 +656,14 @@ async def test_transient_resume_unchanged(hass: HomeAssistant, freezer) -> None:
 
     assert len(session_store.sessions) == 0, "resumed session not yet persisted"
 
-    # --- part 2: grace expiry force-ends (no recovery, no Unlocked) ---
-    entry2 = await _make_engine_entry(hass)
-    engine2 = _get_engine(hass, entry2)
-    store2 = hass.data[DOMAIN][entry2.entry_id]["session_store"]
+
+async def test_grace_expiry_force_end_unchanged(hass: HomeAssistant, freezer) -> None:
+    """T020/FR-007: grace expiry force-ends with data_gap (no recovery, no Unlocked)."""
+    entry = await _make_engine_entry(hass)
+    engine = _get_engine(hass, entry)
+    session_store = hass.data[DOMAIN][entry.entry_id]["session_store"]
     capture = _CaptureLogger()
-    engine2._debug_logger = capture
+    engine._debug_logger = capture
 
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
         await _plug_in_and_charge(hass, energy_kwh=6.0)
@@ -675,8 +676,8 @@ async def test_transient_resume_unchanged(hass: HomeAssistant, freezer) -> None:
         async_fire_time_changed(hass, dt_util.utcnow())
         await hass.async_block_till_done()
 
-    assert len(store2.sessions) == 1, "grace expiry must force-end the session"
-    assert store2.sessions[0]["data_gap"] is True, "force-end keeps data_gap True (FR-007)"
+    assert len(session_store.sessions) == 1, "grace expiry must force-end the session"
+    assert session_store.sessions[0]["data_gap"] is True, "force-end keeps data_gap True (FR-007)"
     assert DEBUG_CAT_SESSION_FORCE_ENDED_BY_GRACE_TIMEOUT in capture.categories, (
         f"grace expiry must log force-end category; saw {capture.categories}"
     )

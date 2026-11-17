@@ -15,6 +15,7 @@ charger profile (T013 / FR-036).
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -126,7 +127,16 @@ _RFID_REASON_MAP: dict[str, UnknownReason] = {
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_price(value: Any) -> bool:
+    """A finite, non-negative number (spec 027 D-55; a spot price itself may be negative)."""
+    return _is_number(value) and value >= 0
+
+
+def _hour_of(moment: datetime) -> datetime:
+    return moment.replace(minute=0, second=0, microsecond=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -999,7 +1009,7 @@ class PlugAnchoredSessionEngine:
             energy_kwh=float(snapshot.get("energy_kwh", 0.0)),
             cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
             cost_method=snapshot.get("cost_method", "static"),
-            price_details=snapshot.get("price_details"),
+            price_details=self._snapshot_price_details(snapshot),
             charger_total_before_kwh=snapshot.get("charger_total_before_kwh"),
             max_power_w=float(snapshot.get("max_power_w", 0.0)),
             charging_started_at=snapshot.get("charging_started_at"),
@@ -1147,9 +1157,17 @@ class PlugAnchoredSessionEngine:
         # went backwards during the outage meets the live reset rule.
         if current_energy is not None:
             self._handle_energy_update(str(current_energy))
-        if self._pricing.mode == "spot" and self._hour_start_time != now.strftime(
-            "%Y-%m-%dT%H:00+00:00"
-        ):
+        stored_hour = self._stored_hour()
+        if self._pricing.mode == "spot" and stored_hour is not None and stored_hour > _hour_of(now):
+            # Spec 027 D-55: a clock behind the snapshot (no RTC at boot) must not bill
+            # the stored hour twice; it continues until the clock passes it.
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: the stored spot hour %s is later than the clock "
+                "(%s) — it continues as the hour in progress",
+                self._hour_start_time,
+                now.isoformat(),
+            )
+        if self._pricing.mode == "spot" and (stored_hour is None or stored_hour < _hour_of(now)):
             # Spec 027 D-39: the stored hour has passed — the energy not yet billed,
             # outage energy included, closes into it at its stored price. Without a
             # reading the close waits for the first one (spec 027 § 12, X-2).
@@ -1186,6 +1204,33 @@ class PlugAnchoredSessionEngine:
                 err,
             )
 
+    @staticmethod
+    def _snapshot_price_details(snapshot: dict) -> list[dict] | None:
+        """The snapshot's ``price_details``; a malformed list counts as empty (D-55)."""
+        details = snapshot.get("price_details")
+        if details is None:
+            return None
+        if isinstance(details, list) and all(
+            isinstance(d, dict) and _is_number(d.get("kwh")) and _is_number(d.get("cost_kr", 0.0))
+            for d in details
+        ):
+            return [dict(d) for d in details]
+        _LOGGER.warning(
+            "PlugAnchoredSessionEngine: price_details of snapshot id=%s is malformed (%r) "
+            "— treated as empty (spec 027 D-55)",
+            snapshot.get("id", "?"),
+            details,
+        )
+        return []
+
+    def _stored_hour(self) -> datetime | None:
+        """The start of the spot hour in progress as a time, or None."""
+        try:
+            stored = datetime.fromisoformat(self._hour_start_time)
+        except (TypeError, ValueError):
+            return None
+        return stored if stored.tzinfo is not None else None
+
     def _restore_session_context(self, snapshot: dict, session: Session, now: datetime) -> None:
         """Restore what the session started with from the snapshot's ``resume_state``.
 
@@ -1218,15 +1263,12 @@ class PlugAnchoredSessionEngine:
 
         pricing = state.get("pricing")
         mode = pricing.get("mode") if isinstance(pricing, dict) else None
-        spot_keys = (
-            CONF_SPOT_ADDITIONAL_COST_KWH,
-            CONF_SPOT_VAT_MULTIPLIER,
-            CONF_SPOT_FALLBACK_PRICE_KWH,
-        )
-        if (mode == "static" and _is_number(pricing.get(CONF_STATIC_PRICE_KWH))) or (
+        if (mode == "static" and _is_price(pricing.get(CONF_STATIC_PRICE_KWH))) or (
             mode == "spot"
             and isinstance(pricing.get(CONF_SPOT_PRICE_ENTITY), str)
-            and all(_is_number(pricing.get(key)) for key in spot_keys)
+            and _is_number(pricing.get(CONF_SPOT_ADDITIONAL_COST_KWH))
+            and _is_number(pricing.get(CONF_SPOT_VAT_MULTIPLIER))
+            and _is_price(pricing.get(CONF_SPOT_FALLBACK_PRICE_KWH))
         ):
             self._apply_pricing(dict(pricing))
         else:
@@ -1236,8 +1278,8 @@ class PlugAnchoredSessionEngine:
         guest: GuestPricing | None = None
         raw_guest = state.get("guest_pricing")
         method = raw_guest.get("method") if isinstance(raw_guest, dict) else None
-        if (method == "fixed" and _is_number(raw_guest.get("price_per_kwh"))) or (
-            method == "markup" and _is_number(raw_guest.get("markup_factor"))
+        if (method == "fixed" and _is_price(raw_guest.get("price_per_kwh"))) or (
+            method == "markup" and _is_price(raw_guest.get("markup_factor"))
         ):
             guest = GuestPricing.from_dict(raw_guest)
         elif raw_guest is not None or "guest_pricing" not in state:
@@ -1259,8 +1301,10 @@ class PlugAnchoredSessionEngine:
             )
             spot_hour = state.get("spot_hour")
             try:
-                datetime.fromisoformat(spot_hour["start"])
-                valid = spot_hour["price"] is None or _is_number(spot_hour["price"])
+                # Compared with the clock as a time (D-55), so it must carry its zone.
+                valid = datetime.fromisoformat(spot_hour["start"]).tzinfo is not None and (
+                    spot_hour["price"] is None or _is_number(spot_hour["price"])
+                )
             except (KeyError, TypeError, ValueError):
                 valid = False
             if valid:
@@ -1329,7 +1373,7 @@ class PlugAnchoredSessionEngine:
             energy_kwh=round(energy_kwh, 3),
             cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
             cost_method=snapshot.get("cost_method", "static"),
-            price_details=snapshot.get("price_details"),
+            price_details=self._snapshot_price_details(snapshot),
             charger_total_before_kwh=snapshot.get("charger_total_before_kwh"),
             # Only as a pair with the total at session start, as the live completion.
             charger_total_after_kwh=(
@@ -3230,6 +3274,11 @@ class PlugAnchoredSessionEngine:
         boundary, racing this tick). The price read NOW becomes the captured
         price for the hour that starts at this boundary.
         """
+        # Spec 027 D-55: a tick for the hour in progress (a timer armed in the first second
+        # of an hour) or an earlier one (the clock stepped back) has nothing to close.
+        stored_hour = self._stored_hour()
+        if stored_hour is not None and _hour_of(now) <= stored_hour:
+            return
         self._spot_close_pending = False
         if self._active_session is None or self._pricing.mode != "spot":
             return

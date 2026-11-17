@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 from homeassistant.config_entries import ConfigEntryState
 from pytest_homeassistant_custom_component.common import async_capture_events
@@ -257,27 +259,132 @@ async def test_rt30_snapshot_written_by_047_spot(hass, hass_storage, freezer) ->
 
 BAD_PRICE = {"mode": "static", "static_price_kwh": "4"}
 BAD_HOUR = {"start": "x", "price": 9.0, "fallback": False}
+SPOT_HOUR_11 = {"start": "2026-11-17T11:00+00:00", "price": 2.0, "fallback": False}
 
 
-@pytest.mark.parametrize(
-    ("trx", "pricing", "resume_state", "expected"),
-    [
-        (TRX_GFIX, "static", "garbage", (10.0, 20.0)),
-        (TRX_GFIX, "static", {}, (10.0, 20.0)),
-        (TRX_PAUL, "static", {"pricing": BAD_PRICE}, (10.0, None)),
-        (TRX_GFIX, "static", {"pricing": None, "guest_pricing": {"method": "fixed"}}, (10.0, 20.0)),
-        (TRX_PAUL, "spot", {"pricing": SPOT_PRICING, "spot_hour": BAD_HOUR}, (16.0, None)),
-    ],
-    ids=["not-a-dict", "empty", "pricing-malformed", "guest-malformed", "spot-hour-malformed"],
-)  # fmt: skip
+def _state(**parts) -> dict:
+    """A resume_state with the given parts replaced (scenario B's at 11:35, guest markup)."""
+    return {"pricing": SPOT_PRICING, "guest_pricing": MARKUP, "spot_hour": SPOT_HOUR_11} | parts
+
+
+def _set_resume_state(value) -> Callable[[dict], None]:
+    return lambda snapshot: snapshot.__setitem__("resume_state", value)
+
+
+def _set_details(value) -> Callable[[dict], None]:
+    return lambda snapshot: snapshot.__setitem__("price_details", value)
+
+
+# trx, pricing, damage, (cost, charge price), the damaged part named in the warning
+RT31_CASES = {
+    "not-a-dict": (
+        TRX_GFIX,
+        "static",
+        _set_resume_state("garbage"),
+        (10.0, 20.0),
+        "resume_state of",
+    ),
+    "empty": (TRX_GFIX, "static", _set_resume_state({}), (10.0, 20.0), "resume_state.pricing"),
+    "pricing-malformed": (
+        TRX_PAUL,
+        "static",
+        _set_resume_state({"pricing": BAD_PRICE}),
+        (10.0, None),
+        "resume_state.pricing",
+    ),
+    "fixed-price-negative": (
+        TRX_PAUL,
+        "static",
+        _set_resume_state({"pricing": {"mode": "static", "static_price_kwh": -4.0}}),
+        (10.0, None),
+        "resume_state.pricing",
+    ),
+    "guest-malformed": (
+        TRX_GFIX,
+        "static",
+        _set_resume_state({"pricing": None, "guest_pricing": {"method": "fixed"}}),
+        (10.0, 20.0),
+        "resume_state.guest_pricing",
+    ),
+    "guest-unknown-method": (
+        TRX_GMARK,
+        "spot",
+        _set_resume_state(_state(guest_pricing={"method": "x"})),
+        (16.0, 24.0),
+        "resume_state.guest_pricing",
+    ),
+    "markup-negative": (
+        TRX_GMARK,
+        "spot",
+        _set_resume_state(_state(guest_pricing={"method": "markup", "markup_factor": -1.5})),
+        (16.0, 24.0),
+        "resume_state.guest_pricing",
+    ),
+    "spot-pricing-malformed": (
+        TRX_GMARK,
+        "spot",
+        _set_resume_state(_state(pricing=SPOT_PRICING | {"spot_additional_cost_kwh": "0"})),
+        (16.0, 24.0),
+        "resume_state.pricing",
+    ),
+    "spot-vat-not-finite": (
+        TRX_GMARK,
+        "spot",
+        _set_resume_state(_state(pricing=SPOT_PRICING | {"spot_vat_multiplier": float("nan")})),
+        (16.0, 24.0),
+        "resume_state.pricing",
+    ),
+    "fallback-negative": (
+        TRX_GMARK,
+        "spot",
+        _set_resume_state(_state(pricing=SPOT_PRICING | {"spot_fallback_price_kwh": -5.0})),
+        (16.0, 24.0),
+        "resume_state.pricing",
+    ),
+    "spot-hour-malformed": (
+        TRX_PAUL,
+        "spot",
+        _set_resume_state({"pricing": SPOT_PRICING, "spot_hour": BAD_HOUR}),
+        (16.0, None),
+        "resume_state.spot_hour",
+    ),
+    "hour-price-not-numeric": (
+        TRX_GMARK,
+        "spot",
+        _set_resume_state(_state(spot_hour=SPOT_HOUR_11 | {"price": "2.0"})),
+        (16.0, 24.0),
+        "resume_state.spot_hour",
+    ),
+    # Treated as empty: hour 10's 4.0 kWh are billed again in the stored hour 11, at
+    # its price; every kWh is billed once (9.0 kWh, 4.0 + 3.0 at 2.0, 2.0 at 3.0).
+    "price-details-not-a-list": (
+        TRX_GMARK,
+        "spot",
+        _set_details("abc"),
+        (20.0, 30.0),
+        "price_details",
+    ),
+    "price-details-kwh-not-numeric": (
+        TRX_GMARK,
+        "spot",
+        _set_details([{"hour": "2026-11-17T10:00+00:00", "kwh": "4.0", "cost_kr": 4.0}]),
+        (20.0, 30.0),
+        "price_details",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(RT31_CASES))
 async def test_rt31_resume_state_with_missing_or_malformed_parts(
-    hass, hass_storage, freezer, caplog, trx, pricing, resume_state, expected
+    hass, hass_storage, freezer, caplog, case
 ) -> None:
-    """RT-31: setup does not fail; the session resumes with the D-45 fallbacks (entry
-    price, guest looked up, spot hour from the resume) and a warning is logged."""
+    """RT-31 (D-55): setup does not fail; the session resumes with the D-45 fallbacks
+    (entry price, guest looked up, spot hour from the resume) or an empty price_details,
+    and a warning names the damaged part."""
+    trx, pricing, damage, expected, part = RT31_CASES[case]
 
     async def corrupt(rig: Rig) -> None:
-        snapshot_on_disk(rig.storage)["resume_state"] = resume_state
+        damage(snapshot_on_disk(rig.storage))
 
     rig = Rig(hass, freezer, hass_storage, pricing=pricing)
     if pricing == "spot":
@@ -288,8 +395,10 @@ async def test_rt31_resume_state_with_missing_or_malformed_parts(
     assert rig.entry.state is ConfigEntryState.LOADED
     (money,) = rig.money()
     assert (money["cost"], money["charge_price"]) == expected
+    assert money["details_kwh"] == (9.0 if pricing == "spot" else 0)
     assert len(rig.started) == 1, "the session resumed rather than restarted"
-    assert "resume_state" in caplog.text and "spec 027 D-45" in caplog.text
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(part in w and "spec 027" in w for w in warnings), warnings
 
 
 async def scenario_g(rig: Rig, interruption: Interruption) -> None:

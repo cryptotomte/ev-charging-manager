@@ -8,9 +8,12 @@ stated. Spot 1.0 / 2.0 / 3.0 kr/kWh in hours 10 / 11 / 12, no additional cost, V
 from __future__ import annotations
 
 import pytest
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from tests.session_rig import (
     B_TRUTH,
+    DAY,
     ETO,
     INTERRUPTIONS,
     LOCK,
@@ -279,3 +282,87 @@ async def test_rt08_spot_parameters_changed_during_a_spot_session(
     first, second = rig.money()
     assert first == B_TRUTH
     assert second["details"] == [("12:00", 1.0, next_price, False)]
+
+
+async def _fire_now(rig: Rig) -> None:
+    """What the event loop does with a timer whose time has already come: fire it now."""
+    async_fire_time_changed(rig.hass, dt_util.utcnow())
+    await rig.hass.async_block_till_done()
+
+
+async def _resume_in_the_first_second(rig: Rig) -> None:
+    rig.freezer.move_to(f"{DAY} 11:00:00.400+00:00")
+
+
+@pytest.mark.parametrize("start", ["live", "resume"])
+async def test_d55_tick_in_the_first_second_of_the_hour_in_progress(
+    hass, hass_storage, freezer, start
+) -> None:
+    """D-55: a session started, or resumed after hour 10 passed, within the first second
+    of hour 11 arms the hour timer in that second; its tick finds hour 11 in progress
+    and does nothing, so hour 11 appears once."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    if start == "live":
+        await rig.goto("10:59:00")
+        await rig.set(spot=2.0)
+        freezer.move_to(f"{DAY} 11:00:00.300+00:00")
+        await rig.plug_in(TRX_PAUL)
+    else:
+        await rig.goto("10:06:00")
+        await rig.plug_in(TRX_PAUL)
+        await rig.goto("10:30:00")
+        await rig.set(energy=3.0)
+        await rig.goto("10:59:00")
+        await rig.set(spot=2.0)
+        await rig.goto("10:59:30")
+        await restart(during=_resume_in_the_first_second)(rig)
+    await _fire_now(rig)
+    await rig.goto("11:20:00")
+    await rig.set(energy=5.0)
+    await rig.set(power=0)
+    await rig.goto("11:30:00")
+    await rig.unplug()
+
+    (money,) = rig.money()
+    if start == "live":
+        assert money["details"] == [("11:00", 5.0, 2.0, False)]
+    else:
+        assert money["details"] == [("10:00", 3.0, 1.0, False), ("11:00", 2.0, 2.0, False)]
+    _assert_billed_once(money)
+
+
+async def _clock_back_to_10_58(rig: Rig) -> None:
+    rig.freezer.move_to(f"{DAY} 10:58:00+00:00")
+
+
+async def test_d55_stored_hour_later_than_the_clock_continues(
+    hass, hass_storage, freezer, caplog
+) -> None:
+    """D-55: the host's clock reads 10:58 at boot, earlier than the stored hour 11 (no
+    RTC). The stored hour is not closed but continues, a warning says so, and the tick
+    at 11:00 finds it in progress: every hour once, every kWh at its hour's price."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:30:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:59:00")
+    await rig.set(spot=2.0)
+    await rig.goto("11:20:00")
+    await rig.set(energy=5.0)
+    await rig.goto("11:30:00")  # the periodic save at 11:25 holds 5.0 kWh in hour 11
+    await restart(during=_clock_back_to_10_58)(rig)
+    assert "is later than the clock" in caplog.text
+    assert [d["hour"][11:16] for d in rig.engine.active_session.price_details] == ["10:00"]
+    await rig.goto("11:10:00")
+    await rig.set(energy=6.0)
+    await rig.set(power=0)
+    await rig.goto("11:20:00")
+    await rig.unplug()
+
+    (money,) = rig.money()
+    assert money["details"] == [("10:00", 3.0, 1.0, False), ("11:00", 3.0, 2.0, False)]
+    assert money["cost"] == 9.0
+    _assert_billed_once(money)

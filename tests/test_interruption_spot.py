@@ -15,6 +15,7 @@ from tests.session_rig import (
     B_TRUTH,
     DAY,
     ETO,
+    FIELD_ORDER,
     INTERRUPTIONS,
     LOCK,
     PLUG,
@@ -145,27 +146,21 @@ async def test_rt14_price_entity_invalid_at_resume_same_hour(hass, hass_storage,
     assert rig.money() == [B_TRUTH]
 
 
-async def test_rt14_price_entity_invalid_at_resume_hour_passed(hass, hass_storage, freezer):
-    """RT-14: hour passed → the stored hour keeps its price unflagged; the new hour is
-    captured while the price entity is missing, so it uses the fallback and is flagged.
-
-    Allowed difference from the uninterrupted run: hour 11 at the fallback 9.0 kr/kWh.
-    """
+@pytest.mark.parametrize("charger", ["present", "late"])
+async def test_rt14_price_entity_not_loaded_at_resume_hour_passed(
+    hass, hass_storage, freezer, charger
+) -> None:
+    """RT-14 / D-54: hour passed → the stored hour keeps its price unflagged; the new
+    hour is captured while the price entity is not loaded yet, so it takes the entity's
+    first valid state within the hour (2.0 kr/kWh at 11:10) instead of the fallback, as
+    uninterrupted. (Before D-54: hour 11 at the fallback 9.0 kr/kWh, flagged.)"""
 
     async def down_then_spot_late(rig: Rig) -> None:
-        await restart("late", during=_down_across_one_boundary, absent=["spot"], order=["spot"])(
-            rig
-        )
+        await restart(charger, during=_down_across_one_boundary, spot_late=True)(rig)
 
     rig = Rig(hass, freezer, hass_storage, pricing="spot")
     await scenario_b(rig, TRX_PAUL, {"span": down_then_spot_late})
-    (money,) = rig.money()
-    assert money["details"] == [
-        ("10:00", 4.0, 1.0, False),
-        ("11:00", 3.0, 9.0, True),
-        ("12:00", 2.0, 3.0, False),
-    ]
-    assert money["cost"] == 4.0 + 27.0 + 6.0
+    assert rig.money() == [B_TRUTH]
 
 
 async def _restart_twice(rig: Rig) -> None:
@@ -366,3 +361,126 @@ async def test_d55_stored_hour_later_than_the_clock_continues(
     assert money["details"] == [("10:00", 3.0, 1.0, False), ("11:00", 3.0, 2.0, False)]
     assert money["cost"] == 9.0
     _assert_billed_once(money)
+
+
+async def _card_and_cable_while_down(rig: Rig) -> None:
+    """Paul shows his card and plugs in at 10:10 while down; 2.0 kWh by 10:20."""
+    await rig.goto("10:10:00", fire=False)
+    await rig.set(trx=TRX_PAUL)
+    await rig.set(plug="on", lock="Locked")
+    await rig.set(power=7000)
+    await rig.goto("10:20:00", fire=False)
+    await rig.set(energy=2.0)
+
+
+async def test_d54_cable_in_session_with_the_price_entity_late(hass, hass_storage, freezer):
+    """D-54 (D-51 path): the session of a cable already in starts at setup while the
+    price entity is not loaded yet; the hour takes its first valid state (1.0), not the
+    fallback for the whole counter (reviewer F: 45.0 kr for 5.0)."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await restart("late", during=_card_and_cable_while_down, spot_late=True)(rig)
+    await rig.goto("10:40:00")
+    await rig.set(energy=5.0)
+    await rig.set(power=0)
+    await rig.goto("10:50:00")
+    await rig.unplug()
+
+    (money,) = rig.money()
+    assert money["details"] == [("10:00", 5.0, 1.0, False)]
+    assert money["cost"] == 5.0
+
+
+async def _paul_leaves_and_the_markup_guest_charges(rig: Rig) -> None:
+    await rig.goto("11:10:00", fire=False)
+    await rig.set(power=0)
+    await rig.unplug()
+    await rig.set(trx="null")
+    await rig.goto("11:20:00", fire=False)
+    await rig.set(energy=0.0)
+    await rig.plug_in(TRX_GMARK)
+    await rig.goto("11:50:00", fire=False)
+    await rig.set(energy=4.0)
+
+
+async def test_d54_split_session_with_the_price_entity_late(hass, hass_storage, freezer):
+    """D-54 (D-50 path): the guest's session started by the split while the price
+    entity is not loaded yet bills hour 11 at the entity's first valid state (2.0), not
+    at the fallback (reviewer F: 36.0 kr for 8.0)."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:30:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:59:00")
+    await rig.set(spot=2.0)
+    await rig.goto("11:06:00")  # the periodic save at 11:05 holds hour 10 closed
+    await restart("late", during=_paul_leaves_and_the_markup_guest_charges, spot_late=True)(rig)
+    await rig.goto("12:00:00")
+    await rig.set(power=0)
+    await rig.goto("12:10:00")
+    await rig.unplug()
+
+    paul, guest = rig.money()
+    assert (paul["user"], paul["energy"], paul["cost"]) == ("Paul", 3.0, 3.0)
+    assert guest["user"] == "Markup"
+    assert guest["details"][0] == ("11:00", 4.0, 2.0, False)
+    assert (guest["energy"], guest["cost"], guest["charge_price"]) == (4.0, 8.0, 12.0)
+
+
+async def test_d54_hour_ends_before_the_price_entity_loads(hass, hass_storage, freezer):
+    """D-54: the price entity does not load within hour 10, so hour 10 takes the
+    fallback as today; it loads at 11:05, and hour 11 (captured while it still had no
+    state) takes that first valid state."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await restart("late", during=_card_and_cable_while_down, spot_late=True, order=FIELD_ORDER)(rig)
+    await rig.goto("11:05:00")
+    await rig.set(spot=2.0)
+    await rig.goto("11:30:00")
+    await rig.set(energy=3.0)
+    await rig.set(power=0)
+    await rig.goto("11:40:00")
+    await rig.unplug()
+
+    (money,) = rig.money()
+    assert money["details"] == [("10:00", 2.0, 9.0, True), ("11:00", 1.0, 2.0, False)]
+    assert money["cost"] == 20.0
+
+
+async def test_d54_a_state_of_the_next_hour_does_not_price_the_hour_in_progress(
+    hass, hass_storage, freezer
+) -> None:
+    """D-54: the price entity's first valid state arrives at 11:00:00.5, before the
+    hour tick has run; it carries hour 11's price, so hour 10 keeps the fallback and
+    hour 11 is captured from it at the tick (the boundary race of spec 025)."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await restart("late", during=_card_and_cable_while_down, spot_late=True, order=FIELD_ORDER)(rig)
+    await rig.goto("10:59:00")
+    freezer.move_to(f"{DAY} 11:00:00.500+00:00")
+    await rig.set(spot=2.0)
+    await _fire_now(rig)
+    await rig.goto("11:30:00")
+    await rig.set(energy=3.0)
+    await rig.set(power=0)
+    await rig.goto("11:40:00")
+    await rig.unplug()
+
+    (money,) = rig.money()
+    assert money["details"] == [("10:00", 2.0, 9.0, True), ("11:00", 1.0, 2.0, False)]
+
+
+async def test_d54_price_listener_is_gone_after_unload(hass, hass_storage, freezer) -> None:
+    """D-54: the listener that waits for the price entity's first valid state ends with
+    the entry; the unloaded engine no longer sees the entity."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await restart("late", during=_card_and_cable_while_down, spot_late=True, order=FIELD_ORDER)(rig)
+    engine = rig.engine
+    assert engine.active_session is not None and SPOT not in engine._spot_seen_valid  # noqa: SLF001
+    assert await hass.config_entries.async_unload(rig.entry.entry_id)
+    await hass.async_block_till_done()
+    await rig.set(spot=1.0)
+    assert SPOT not in engine._spot_seen_valid  # noqa: SLF001

@@ -139,6 +139,16 @@ def _hour_of(moment: datetime) -> datetime:
     return moment.replace(minute=0, second=0, microsecond=0)
 
 
+def _spot_value(state: Any) -> float | None:
+    """A price entity's state as a number, or None when it has no valid price."""
+    if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        return None
+    try:
+        return float(state.state)
+    except (ValueError, TypeError):
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class _RfidWaitState:
     """In-memory state for an active RFID wait (event-driven; no timer).
@@ -299,6 +309,13 @@ class PlugAnchoredSessionEngine:
         # Spec 027 D-39: a resume found the stored hour passed but had no counter
         # reading yet; the first reading closes the stored hour.
         self._spot_close_pending: bool = False
+        # Spec 027 D-54: price entities seen with a valid state since this engine was
+        # set up; the hour in progress awaits its price from a price entity that was
+        # not loaded yet; the listener that watches for that first valid state.
+        self._spot_seen_valid: set[str] = set()
+        self._spot_price_pending: bool = False
+        self._spot_watch_unsub: _Unsub = None
+        self._spot_watch_entity: str | None = None
 
         # Story 07 (passive notification): set of notification IDs currently visible,
         # keyed for auto-dismiss when the corresponding mapping is added (FR-022).
@@ -550,6 +567,7 @@ class PlugAnchoredSessionEngine:
             self._deferred_recovery_timeout_unsub = None
         self._safe_cancel("_recovery_wait_unsub")
         self._safe_cancel("_recovery_wait_timeout_unsub")
+        self._safe_cancel("_spot_watch_unsub")
 
         # Cancel and clear all engine-managed unsubs.
         for unsub in list(self._engine_unsubs):
@@ -1524,6 +1542,15 @@ class PlugAnchoredSessionEngine:
             state = self._hass.states.get(entity_id)
             if state and state.state not in _INVALID_STATES:
                 setattr(self, attr_name, state.state)
+
+        # Spec 027 D-54: from here on, whether the price entity has had a valid state.
+        entry_pricing = self._entry_pricing_params()
+        spot_entity = entry_pricing.get(CONF_SPOT_PRICE_ENTITY)
+        if entry_pricing["mode"] == "spot" and spot_entity:
+            if _spot_value(self._hass.states.get(spot_entity)) is not None:
+                self._spot_seen_valid.add(spot_entity)
+            elif self._spot_watch_unsub is None:
+                self._watch_spot_entity(spot_entity)
 
         # Spec 027 D-51: a cable already in at setup gets its normal plug-on handling
         # (spec 020: the RFID wait is re-derived from the entity values).
@@ -3196,6 +3223,7 @@ class PlugAnchoredSessionEngine:
             self._hour_energy_snapshot = 0.0
             self._hour_start_time = ""
             self._spot_close_pending = False
+            self._spot_price_pending = False
             self._data_gap = False
             # PR-25: clear the captured plug-off context so a stale timestamp/snapshot
             # cannot be applied to a later, unrelated completion (D7).
@@ -3489,14 +3517,79 @@ class PlugAnchoredSessionEngine:
                 exc_info=True,
             )
         self._current_hour_price = price
-        if price is None:
-            _LOGGER.warning(
-                "Spot price sensor '%s' unavailable at hour start (%s) — "
-                "fallback %.2f kr/kWh will price this hour",
-                self._pricing_params.get(CONF_SPOT_PRICE_ENTITY),
+        entity_id = self._pricing_params.get(CONF_SPOT_PRICE_ENTITY)
+        if price is not None and entity_id:
+            self._spot_seen_valid.add(entity_id)
+        # Spec 027 D-54: a price entity not loaded yet since setup (this integration
+        # starts first) gives the hour its first valid state instead of the fallback.
+        self._spot_price_pending = (
+            price is None and bool(entity_id) and entity_id not in self._spot_seen_valid
+        )
+        if self._spot_price_pending:
+            self._watch_spot_entity(entity_id)
+            _LOGGER.info(
+                "Spot price sensor '%s' not loaded yet at hour start (%s) — the hour takes "
+                "its first valid state within the hour, else fallback %.2f kr/kWh",
+                entity_id,
                 self._hour_start_time,
                 self._pricing.fallback_price or 0.0,
             )
+        elif price is None:
+            _LOGGER.warning(
+                "Spot price sensor '%s' unavailable at hour start (%s) — "
+                "fallback %.2f kr/kWh will price this hour",
+                entity_id,
+                self._hour_start_time,
+                self._pricing.fallback_price or 0.0,
+            )
+
+    def _watch_spot_entity(self, entity_id: str) -> None:
+        """Listen for the price entity's first valid state (spec 027 D-54)."""
+        if self._spot_watch_unsub is not None and self._spot_watch_entity == entity_id:
+            return
+        self._safe_cancel("_spot_watch_unsub")
+        self._spot_watch_entity = entity_id
+        self._spot_watch_unsub = async_track_state_change_event(
+            self._hass, [entity_id], self._on_spot_price_state
+        )
+
+    @callback
+    def _on_spot_price_state(self, event: Event) -> None:
+        """The price entity's first valid state; it prices the hour still awaiting one."""
+        new_state = event.data.get("new_state")
+        price = _spot_value(new_state)
+        if price is None:
+            return
+        entity_id = event.data.get("entity_id")
+        self._spot_seen_valid.add(entity_id)
+        session = self._active_session
+        if (
+            self._spot_price_pending
+            and session is not None
+            and self._pricing.mode == "spot"
+            and entity_id == self._pricing_params.get(CONF_SPOT_PRICE_ENTITY)
+        ):
+            hour_start = self._stored_hour()
+            # Only a state of the hour in progress: one updated before its start, or
+            # after its end while the tick is still due, carries another hour's price
+            # (the boundary race of spec 025 / PR-29).
+            if hour_start is None or not (
+                hour_start <= new_state.last_updated < hour_start + timedelta(hours=1)
+            ):
+                return
+            self._current_hour_price = price
+            self._spot_price_pending = False
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_SESSION_RESUMED,
+                    f"spot price {price} from {entity_id}'s first valid state prices the "
+                    f"hour {self._hour_start_time} (spec 027 D-54)",
+                )
+            self._recompute_derived(session)
+            self._dispatch_update()
+            self._schedule_snapshot_write()
+        self._safe_cancel("_spot_watch_unsub")
+        self._spot_watch_entity = None
 
     def _calculate_charge_price(self, session: Session) -> float | None:
         if self._guest_pricing is None:

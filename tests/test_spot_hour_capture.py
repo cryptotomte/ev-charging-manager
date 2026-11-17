@@ -343,9 +343,16 @@ async def test_resume_captures_price_for_in_progress_hour(hass: HomeAssistant, f
 async def test_fallback_provenance_is_capture_time(hass: HomeAssistant, freezer) -> None:
     """FR-010: price entity unavailable at an hour's START → that hour uses the
     fallback price with fallback=True, even if the entity recovers mid-hour;
-    the next hour (captured while available) is not fallback."""
-    entry = await _make_spot_entry(hass, spot_price=STATE_UNAVAILABLE)
+    the next hour (captured while available) is not fallback.
+
+    The entity was valid at setup and is merely unavailable at the capture: spec 027
+    D-54 gives an hour the entity's first valid state only when the entity has had
+    none since setup (not loaded yet), and keeps this rule otherwise.
+    """
+    entry = await _make_spot_entry(hass, spot_price="1.00")
     engine = _get_engine(hass, entry)
+    hass.states.async_set(MOCK_SPOT_PRICE_ENTITY, STATE_UNAVAILABLE)
+    await hass.async_block_till_done()
 
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
         # 12:30 — session starts with the price entity UNAVAILABLE → captured fallback

@@ -257,6 +257,17 @@ async def test_rt30_snapshot_written_by_047_spot(hass, hass_storage, freezer) ->
     assert rig.money() == [B_TRUTH]
 
 
+async def test_d54_snapshot_written_by_047_with_the_price_entity_late(
+    hass, hass_storage, freezer
+) -> None:
+    """D-54 (D-45 path): the hour that starts at the resume is captured while the price
+    entity is not loaded yet; its first valid state (2.0) prices the hour, as
+    uninterrupted, instead of the fallback."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await scenario_b(rig, TRX_PAUL, {"h2": restart(during=_upgrade, spot_late=True)})
+    assert rig.money() == [B_TRUTH]
+
+
 BAD_PRICE = {"mode": "static", "static_price_kwh": "4"}
 BAD_HOUR = {"start": "x", "price": 9.0, "fallback": False}
 SPOT_HOUR_11 = {"start": "2026-11-17T11:00+00:00", "price": 2.0, "fallback": False}

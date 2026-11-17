@@ -726,7 +726,7 @@ async def test_rt25_car_left_counter_kept(hass, hass_storage, freezer, intr) -> 
     totals present, in every start order (D-49 waits for the energy entity when the
     plug comes first). Allowed differences: the end time is the start-up time; in the
     field order the lifetime counter is not yet valid when the energy decides, so the
-    record has no charger total after."""
+    record has neither charger total (D-56: both or neither)."""
     rig = Rig(hass, freezer, hass_storage)
     await scenario_u(
         rig, TRX_PAUL, after_unplug=None, interrupted=intr != "none", order=LATE_ORDERS[intr]
@@ -734,7 +734,7 @@ async def test_rt25_car_left_counter_kept(hass, hass_storage, freezer, intr) -> 
     assert _summary(rig) == [("Paul", 3.8, 9.5, None, 3.8)]
     (record,) = rig.records()
     totals = (record["charger_total_before_kwh"], record["charger_total_after_kwh"])
-    assert totals == ((1000.0, None) if intr == "restart-late-field" else (1000.0, 1003.8))
+    assert totals == ((None, None) if intr == "restart-late-field" else (1000.0, 1003.8))
 
 
 @pytest.mark.parametrize("intr", list(LATE_ORDERS))

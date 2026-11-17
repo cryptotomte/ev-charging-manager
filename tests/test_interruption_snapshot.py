@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_capture_events
 
-from custom_components.ev_charging_manager.const import EVENT_UNKNOWN_RFID_DETECTED
+from custom_components.ev_charging_manager.const import (
+    EVENT_UNKNOWN_RFID_DETECTED,
+    SessionEngineState,
+)
 from tests.session_rig import (
     B_TRUTH,
     SPOT,
@@ -104,7 +109,11 @@ async def test_rt27_snapshot_written_at_each_session_event(hass, hass_storage, f
 async def test_rt28_write_for_a_session_no_longer_held_does_nothing(
     hass, hass_storage, freezer
 ) -> None:
-    """RT-28: a write requested for a discarded or completed session id is skipped."""
+    """RT-28: a write requested for a discarded or completed session id is skipped.
+
+    Each late write is requested while another session runs with energy in memory that
+    is not on disk yet, so a write that ignored the id would show on disk.
+    """
     rig = Rig(hass, freezer, hass_storage, persistence_interval_s=3600)
     await rig.setup()
     await rig.goto("10:06:00")
@@ -115,12 +124,16 @@ async def test_rt28_write_for_a_session_no_longer_held_does_nothing(
     micro_id = rig.engine.active_session.id
     await rig.unplug()
     assert rig.engine.active_session is None and rig.snapshot() is None
-    await rig.engine.async_write_snapshot(micro_id)
-    assert rig.snapshot() is None, "a discarded session must not be resurrected"
 
-    # Session A completes, session B runs; a late write for A must not touch the disk.
+    # Session A runs: 0.3 kWh in memory, 0.0 on disk; a late write for the micro session.
     await rig.goto("10:10:00")
     await rig.plug_in(TRX_PAUL)
+    await rig.set(energy=0.3)
+    assert rig.snapshot()["energy_kwh"] == 0.0
+    await rig.engine.async_write_snapshot(micro_id)
+    assert rig.snapshot()["energy_kwh"] == 0.0, "a write for a discarded session id"
+
+    # Session A completes, session B runs; a late write for A must not touch the disk.
     await rig.goto("10:20:00")
     await rig.set(energy=1.0)
     first_id = rig.engine.active_session.id
@@ -493,3 +506,138 @@ async def test_rt33_reload_during_a_pause_between_windows_as_on_main(
     await scenario_c(rig, reload)
     assert _completed(rig) == [(2.5, 6.25, 1860, 2)]
     assert [ev.data["window_index"] for ev in rig.charged] == [1, 1]
+
+
+async def test_d56_charger_totals_are_stored_as_a_pair(hass, hass_storage, freezer) -> None:
+    """D-56: the total at start is kept from session start (D-41), but a record has
+    both charger totals or neither, as on main: a live completion while the lifetime
+    counter is unavailable, and the snapshot of a split (no total after), have neither;
+    the split's new session, completed live, has both."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=3.0, power=0)
+    await rig.set(eto="unavailable")
+    await rig.goto("10:22:00")
+    await rig.unplug()
+    await rig.set(trx="null", eto=1003.0)
+
+    await rig.goto("10:30:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:40:00")
+    await rig.set(energy=4.0, eto=1004.0)
+    await rig.goto("10:46:00")  # the periodic save at 10:45 holds 1.0 kWh
+
+    async def guest_takes_over(rig: Rig) -> None:
+        await rig.unplug()
+        await rig.set(trx="null", energy=0.0)
+        await rig.plug_in(TRX_GFIX)
+        await rig.set(energy=1.0, eto=1005.0)
+
+    await restart(during=guest_takes_over)(rig)
+    await rig.goto("10:55:00")
+    await rig.set(energy=2.0, eto=1006.0)
+    await rig.unplug()
+
+    totals = [
+        (r["user_name"], r["charger_total_before_kwh"], r["charger_total_after_kwh"])
+        for r in rig.records()
+    ]
+    assert totals == [("Paul", None, None), ("Paul", None, None), ("Gaest", 1005.0, 1006.0)]
+    assert len(rig.money()) == 3
+
+
+SESSION_VALUES = (
+    "_guest_pricing", "_hour_energy_snapshot", "_hour_start_time", "_spot_close_pending",
+    "_spot_price_pending", "_data_gap", "_eto_start", "_last_energy_kwh", "_last_power_w",
+)  # fmt: skip
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present"])
+async def test_d56_snapshot_completion_resets_the_session_values(
+    hass, hass_storage, freezer, intr
+) -> None:
+    """D-56: after a snapshot whose car left is completed, the engine's per-session
+    values are those after a live completion (guest markup, spot)."""
+
+    async def leaves(rig: Rig, *, fire: bool = True) -> None:
+        await rig.goto("10:40:00", fire=fire)
+        await rig.set(energy=1.5, power=0)
+        await rig.unplug()
+
+    async def leaves_while_down(rig: Rig) -> None:
+        await leaves(rig, fire=False)
+
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_GMARK)
+    await rig.goto("10:30:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:31:00")
+    if intr == "none":
+        await leaves(rig)
+    else:
+        await restart(during=leaves_while_down)(rig)
+
+    (money,) = rig.money()
+    assert (money["energy"], money["charge_price"]) == (1.5, 2.25)
+    engine = rig.engine
+    assert {name: getattr(engine, name) for name in SESSION_VALUES} == {
+        "_guest_pricing": None,
+        "_hour_energy_snapshot": 0.0,
+        "_hour_start_time": "",
+        "_spot_close_pending": False,
+        "_spot_price_pending": False,
+        "_data_gap": False,
+        "_eto_start": None,
+        "_last_energy_kwh": 0.0,
+        "_last_power_w": 0.0,
+    }
+
+
+async def test_d56_snapshot_completion_keeps_a_held_session(hass, hass_storage, freezer) -> None:
+    """D-56: a snapshot completed while the engine holds a session (a real snapshot of
+    an earlier session) leaves the held session tracking."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:16:00")
+    earlier = copy.deepcopy(rig.snapshot())
+    await rig.unplug()
+    await rig.goto("10:20:00")
+    await rig.plug_in(TRX_GFIX)
+    engine = rig.engine
+    held = engine.active_session
+    earlier["id"] = "earlier-session"
+
+    await engine._complete_snapshot_as_session(earlier, 1.0, dt_util.utcnow())  # noqa: SLF001
+
+    assert engine.state == SessionEngineState.TRACKING
+    assert engine.active_session is held
+
+
+async def test_d56_no_snapshot_write_after_unload(hass, hass_storage, freezer) -> None:
+    """D-56: the unload writes the final snapshot; a write requested afterwards (a task
+    scheduled by a session event) does nothing."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    engine = rig.engine
+    assert await hass.config_entries.async_unload(rig.entry.entry_id)
+    await hass.async_block_till_done()
+    assert rig.snapshot()["energy_kwh"] == 1.0, "the final write at unload stays"
+
+    engine.active_session.energy_kwh = 9.9
+    await engine.async_write_snapshot()
+    await engine.async_write_snapshot(engine.active_session.id)
+
+    assert rig.snapshot()["energy_kwh"] == 1.0

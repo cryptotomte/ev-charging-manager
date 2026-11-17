@@ -349,6 +349,8 @@ class PlugAnchoredSessionEngine:
         # Spec 027 D-51: this engine force-completed a snapshot at the 60-minute
         # timeout, so a cable already in may still carry that snapshot's energy.
         self._force_completed_at_timeout: bool = False
+        # Spec 027 D-56: snapshot writes requested after unload do nothing.
+        self._unloaded: bool = False
 
         # The price parameters of the session in progress (spec 027 D-35/D-36), stored
         # with its snapshot; the entry's between sessions.
@@ -493,7 +495,11 @@ class PlugAnchoredSessionEngine:
         session, so a late write cannot resurrect a discarded or completed one.
         """
         session = self._active_session
-        if session is None or (session_id is not None and session.id != session_id):
+        if (
+            self._unloaded
+            or session is None
+            or (session_id is not None and session.id != session_id)
+        ):
             return
         try:
             await self._session_store.async_save_active_session(self.get_active_session_dict())
@@ -517,6 +523,7 @@ class PlugAnchoredSessionEngine:
         Called from __init__.async_unload_entry. Listeners registered via
         entry.async_on_unload are torn down by HA itself.
         """
+        self._unloaded = True
         # PR-27 FR-019: persist a final active-session snapshot so a reload
         # mid-session loses at most seconds — not up to a full periodic-save
         # interval — of tracked state. The FR-011 completed-id guard inside
@@ -1392,8 +1399,12 @@ class PlugAnchoredSessionEngine:
             cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
             cost_method=snapshot.get("cost_method", "static"),
             price_details=self._snapshot_price_details(snapshot),
-            charger_total_before_kwh=snapshot.get("charger_total_before_kwh"),
-            # Only as a pair with the total at session start, as the live completion.
+            # Spec 027 D-56: both totals or neither, as the live completion.
+            charger_total_before_kwh=(
+                snapshot.get("charger_total_before_kwh")
+                if charger_total_after_kwh is not None
+                else None
+            ),
             charger_total_after_kwh=(
                 charger_total_after_kwh
                 if snapshot.get("charger_total_before_kwh") is not None
@@ -1440,7 +1451,10 @@ class PlugAnchoredSessionEngine:
             # disk until a recovery decision lands (review F2).
             await self._session_store.async_clear_active_session()
 
-        self._state = SessionEngineState.IDLE
+        # Spec 027 D-56: the values belong to the session held now, if any.
+        if self._active_session is None:
+            self._reset_session_values()
+            self._state = SessionEngineState.IDLE
 
     # -----------------------------------------------------------------------
     # Setup: register HA entity listeners (T028)
@@ -3040,7 +3054,10 @@ class PlugAnchoredSessionEngine:
                     )
 
             # ETO cross-validation.
-            # Review F1(a): degraded on failure — totals stay unset.
+            # Review F1(a): degraded on failure — totals stay unset. Spec 027 D-56:
+            # the total at start is stored from session start (D-41), but a record
+            # has both totals or neither.
+            session.charger_total_before_kwh = None
             try:
                 eto_end = self._get_eto()
                 if self._eto_start is not None and eto_end is not None:
@@ -3212,29 +3229,33 @@ class PlugAnchoredSessionEngine:
             # stuck in COMPLETING after a persist failure (BUG-4).
             # PR-27 FR-010: _active_session was already claimed (set to None) at
             # the top of this method; only the remaining per-session state is reset.
-            self._rfid_wait = None  # defensive parity: complete session implies no pending wait
-            # Review F1(b): a finished completion settles any pending retry
-            # (e.g. another trigger completed the session before the timer fired).
-            self._cancel_completion_retry()
-            self._window_tracker = ChargingWindowTracker()
-            self._guest_pricing = None
-            self._last_energy_kwh = 0.0
-            self._last_power_w = 0.0
-            self._hour_energy_snapshot = 0.0
-            self._hour_start_time = ""
-            self._spot_close_pending = False
-            self._spot_price_pending = False
-            self._data_gap = False
-            # PR-25: clear the captured plug-off context so a stale timestamp/snapshot
-            # cannot be applied to a later, unrelated completion (D7).
-            self._plug_off_at = None
-            self._data_gap_before_disconnect = None
-            # PR-27 FR-020: the grace question (if any) is settled by this completion.
-            self._grace_pending_at_outage = False
-            self._eto_start = None
+            self._reset_session_values()
             self._state = SessionEngineState.IDLE
 
             self._dispatch_update()
+
+    def _reset_session_values(self) -> None:
+        """Clear the per-session values once a session is completed (live or snapshot)."""
+        self._rfid_wait = None  # defensive parity: complete session implies no pending wait
+        # Review F1(b): a finished completion settles any pending retry
+        # (e.g. another trigger completed the session before the timer fired).
+        self._cancel_completion_retry()
+        self._window_tracker = ChargingWindowTracker()
+        self._guest_pricing = None
+        self._last_energy_kwh = 0.0
+        self._last_power_w = 0.0
+        self._hour_energy_snapshot = 0.0
+        self._hour_start_time = ""
+        self._spot_close_pending = False
+        self._spot_price_pending = False
+        self._data_gap = False
+        # PR-25: clear the captured plug-off context so a stale timestamp/snapshot
+        # cannot be applied to a later, unrelated completion (D7).
+        self._plug_off_at = None
+        self._data_gap_before_disconnect = None
+        # PR-27 FR-020: the grace question (if any) is settled by this completion.
+        self._grace_pending_at_outage = False
+        self._eto_start = None
 
     def _build_completed_event_data(self, session: Session) -> dict[str, Any]:
         """Build the EVENT_SESSION_COMPLETED payload."""

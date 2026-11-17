@@ -1,0 +1,461 @@
+"""Spec 027 RT-17…RT-26: who was plugged in, a cable already in at setup, a car that left.
+
+Same acceptance rule as ``test_interruption_fixed_price``: the interrupted runs and the
+uninterrupted run ("none") are held to stated expected values; allowed differences are
+named in each test.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from custom_components.ev_charging_manager.charger_profiles import CHARGER_PROFILES
+from custom_components.ev_charging_manager.const import (
+    DEFERRED_RECOVERY_TIMEOUT_MIN,
+    SessionEngineState,
+    SessionSubState,
+)
+from tests.session_rig import (
+    INTERRUPTIONS,
+    TRX_GFIX,
+    TRX_PAUL,
+    Interruption,
+    Rig,
+    restart,
+    scenario_a,
+)
+
+PLUG_ANCHORED_PROFILES = {
+    key for key, profile in CHARGER_PROFILES.items() if profile["supports_plug_anchored_model"]
+}
+
+
+def test_p1_guard_counter_belongs_to_the_connection() -> None:
+    """PRELIMINARY P-1 (spec 027 § 10), guard.
+
+    Assumption: with the cable in, the charger's energy counter (go-e ``wh``) is the
+    energy of the current connection — it keeps its value after the unplug and restarts
+    at zero at the next plug-in. D-44 and D-46 therefore start a session with
+    energy_start_kwh = 0.0 when the connection began before start-up (exercised by
+    RT-17 and RT-23). Evidence: three plug-ins in the owner's debug log (2026-11-08,
+    -10, -13). A profile that reuses the plug-anchored engine must restate it here.
+    """
+    assert PLUG_ANCHORED_PROFILES == {"goe_gemini"}
+
+
+def test_p2_guard_card_value_belongs_to_the_connection() -> None:
+    """PRELIMINARY P-2 (spec 027 § 10), guard.
+
+    Assumption: the card value (go-e ``trx``) does not change within one connection, so
+    a different card at recovery means a new connection and D-44 splits the session
+    (exercised by RT-17 and RT-20). Evidence: hardware test 2026-05-19 and one 12-hour
+    connection in the field log; released by the pre-release field test with two cards.
+    A profile that reuses the plug-anchored engine must restate it here.
+    """
+    assert PLUG_ANCHORED_PROFILES == {"goe_gemini"}
+
+
+def _summary(rig: Rig) -> list[tuple]:
+    return [
+        (m["user"], m["energy"], m["cost"], m["charge_price"], m["record_energy"])
+        for m in rig.money()
+    ]
+
+
+async def _swap_users(rig: Rig, *, fire: bool = True) -> None:
+    """Paul's car leaves at 10:30 (3.5 kWh); the guest plugs in at 10:35, the counter
+    restarts at zero with the new connection, and charges 1.0 kWh by 10:44."""
+    await rig.goto("10:30:00", fire=fire)
+    await rig.set(energy=3.5)
+    await rig.set(power=0)
+    await rig.unplug()
+    await rig.set(trx="null")
+    await rig.goto("10:35:00", fire=fire)
+    await rig.set(energy=0.0)
+    await rig.plug_in(TRX_GFIX)
+    await rig.goto("10:44:00", fire=fire)
+    await rig.set(energy=1.0)
+    await rig.goto("10:45:00", fire=fire)
+
+
+async def _swap_users_while_down(rig: Rig) -> None:
+    await _swap_users(rig, fire=False)
+
+
+async def scenario_h(rig: Rig, interruption: Interruption | None, *, trx: str = TRX_PAUL):
+    """Research 027 scenario H: the first user leaves and another plugs in, 10:22–10:45."""
+    await rig.setup()
+    await rig.goto("10:06:00")
+    if trx == "null":
+        await rig.set(plug="on", lock="Locked")
+        await rig.set(power=7000)
+    else:
+        await rig.plug_in(trx)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:22:00")
+    if interruption is None:
+        await _swap_users(rig)
+    else:
+        await interruption(rig)
+    await rig.goto("10:55:00")
+    await rig.set(energy=2.0)
+    await rig.goto("10:56:00")
+    await rig.set(power=0)
+    await rig.goto("11:05:00")
+    await rig.unplug()
+    await rig.goto("11:06:00")
+
+
+GUEST_2KWH = ("Gaest", 2.0, 5.0, 10.0, 2.0)
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present", "restart-late"])
+async def test_rt17_another_user_plugged_in_during_the_outage(
+    hass, hass_storage, freezer, intr
+) -> None:
+    """RT-17: two sessions; Paul gets the snapshot's energy, the guest the whole counter.
+
+    Allowed difference: Paul's 0.5 kWh delivered after the last snapshot (10:20) cannot
+    be known once the guest's connection restarted the counter, so Paul has 3.0 kWh
+    instead of 3.5. Neither user gets the other's energy.
+    """
+    interruption = {
+        "none": None,
+        "restart-present": restart(during=_swap_users_while_down),
+        "restart-late": restart("late", during=_swap_users_while_down),
+    }[intr]
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_h(rig, interruption)
+
+    paul_energy = 3.5 if intr == "none" else 3.0
+    assert _summary(rig) == [
+        ("Paul", paul_energy, paul_energy * 2.5, None, paul_energy),
+        GUEST_2KWH,
+    ]
+    assert len(rig.started) == 2
+    assert rig.stats.user_stats["Paul"].total_energy_kwh == pytest.approx(paul_energy)
+    assert rig.stats.guest_last.charge_price_kr == 10.0
+    assert rig.snapshot() is None
+
+
+async def _counter_restart(rig: Rig, *, fire: bool = True) -> None:
+    """The charger reboots at 10:25; its counter restarts at zero and reaches 1.0 kWh."""
+    await rig.goto("10:25:00", fire=fire)
+    await rig.set(energy=0.0)
+    await rig.goto("10:35:00", fire=fire)
+    await rig.set(energy=1.0)
+
+
+async def _counter_restart_while_down(rig: Rig) -> None:
+    await _counter_restart(rig, fire=False)
+
+
+@pytest.mark.parametrize("base", [0.0, 10.0])
+@pytest.mark.parametrize("intr", ["none", "restart-present"])
+async def test_rt18_same_card_counter_restarted_during_the_outage(
+    hass, hass_storage, freezer, intr, base
+) -> None:
+    """RT-18: one session for the same user, the snapshot's energy kept.
+
+    D-38 replays the present reading through the live reset rule, which takes the first
+    reading after a reset as the new baseline. Live, that reading is 0.0 and nothing is
+    lost (5.0 kWh). Across the outage it is 1.0, so the session keeps the snapshot's
+    3.0 kWh plus the 1.0 kWh counted after start-up: 4.0 kWh. That 1.0 kWh difference is
+    the D-38 rule as decided (§ 3 wins over RT-18's prose; spec 027 § 12, X-1).
+    """
+    rig = Rig(hass, freezer, hass_storage, energy0=str(base))
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=base + 1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=base + 3.0)
+    await rig.goto("10:22:00")
+    if intr == "none":
+        await _counter_restart(rig)
+    else:
+        await restart(during=_counter_restart_while_down)(rig)
+    await rig.goto("10:45:00")
+    await rig.set(energy=2.0)
+    await rig.goto("10:46:00")
+    await rig.set(power=0)
+    await rig.goto("10:50:00")
+    await rig.unplug()
+
+    energy = 5.0 if intr == "none" else 4.0
+    assert _summary(rig) == [("Paul", energy, energy * 2.5, None, energy)]
+    assert len(rig.started) == 1
+
+
+async def _card_cleared_while_down(rig: Rig) -> None:
+    await rig.set(trx="null")
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present", "restart-late"])
+async def test_rt19_no_card_at_recovery_resumes(hass, hass_storage, freezer, intr) -> None:
+    """RT-19: plug on, no card on the charger: the snapshot is resumed (as RT-01)."""
+    interruption = {
+        "none": _card_cleared_while_down,
+        "restart-present": restart(during=_card_cleared_while_down),
+        "restart-late": restart("late", during=_card_cleared_while_down),
+    }[intr]
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_a(rig, TRX_PAUL, {"mid": interruption})
+    assert _summary(rig) == [("Paul", 4.0, 10.0, None, 4.0)]
+    assert len(rig.started) == 1
+
+
+async def _paul_plugs_in_after_unknown(rig: Rig, *, fire: bool = True) -> None:
+    """The open-access car leaves at 10:30 (3.5 kWh); Paul plugs in with his card."""
+    await rig.goto("10:30:00", fire=fire)
+    await rig.set(energy=3.5)
+    await rig.set(power=0)
+    await rig.unplug()
+    await rig.goto("10:35:00", fire=fire)
+    await rig.set(energy=0.0)
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:44:00", fire=fire)
+    await rig.set(energy=1.0)
+    await rig.goto("10:45:00", fire=fire)
+
+
+async def _paul_plugs_in_after_unknown_while_down(rig: Rig) -> None:
+    await _paul_plugs_in_after_unknown(rig, fire=False)
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present"])
+async def test_rt20_snapshot_without_card_and_a_card_now_present(
+    hass, hass_storage, freezer, intr
+) -> None:
+    """RT-20: an open-access (Unknown) snapshot and Paul's card at recovery: split.
+
+    Allowed difference: as RT-17, the Unknown session has its snapshot's 3.0 kWh.
+    """
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.set(plug="on", lock="Locked")
+    await rig.set(power=7000)  # power during the RFID wait: open access, Unknown
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:22:00")
+    assert rig.engine.active_session.rfid_index is None
+    if intr == "none":
+        await _paul_plugs_in_after_unknown(rig)
+    else:
+        await restart(during=_paul_plugs_in_after_unknown_while_down)(rig)
+    await rig.goto("10:55:00")
+    await rig.set(energy=2.0)
+    await rig.set(power=0)
+    await rig.goto("11:05:00")
+    await rig.unplug()
+
+    unknown = 3.5 if intr == "none" else 3.0
+    assert _summary(rig) == [
+        ("Unknown", unknown, unknown * 2.5, None, unknown),
+        ("Paul", 2.0, 5.0, None, 2.0),
+    ]
+
+
+async def test_rt21_recovery_waits_for_the_rfid_entity(hass, hass_storage, freezer) -> None:
+    """RT-21: plug valid, RFID entity not yet: recovery and the engine wait; when the
+    guest's card appears the snapshot splits as in RT-17."""
+    late_trx = ["plug", "lock", "power", "energy", "car", "eto"]
+
+    async def interruption(rig: Rig) -> None:
+        await restart("late", during=_swap_users_while_down, order=late_trx)(rig)
+        engine = rig.engine
+        assert engine.state == SessionEngineState.IDLE
+        assert engine.active_session is None
+        assert rig.snapshot()["user_name"] == "Paul", "the snapshot waits on disk"
+        assert rig.completed == []
+        await rig.set(trx=TRX_GFIX)
+
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_h(rig, interruption)
+    assert _summary(rig) == [("Paul", 3.0, 7.5, None, 3.0), GUEST_2KWH]
+
+
+async def test_rt21_timeout_still_completes_the_snapshot(hass, hass_storage, freezer) -> None:
+    """RT-21: the RFID entity never becomes valid: after the timeout the snapshot is
+    completed with its own energy, and the cable gets its normal plug-on handling."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.5)
+    await rig.goto("10:15:30")  # the periodic save at 10:15 holds 1.5 kWh
+    await restart("late", absent=["trx"], order=[])(rig)
+    assert rig.engine.active_session is None and rig.completed == []
+
+    assert DEFERRED_RECOVERY_TIMEOUT_MIN == 60
+    await rig.goto("11:16:30")
+
+    assert _summary(rig) == [("Paul", 1.5, 3.75, None, 1.5)]
+    assert rig.engine.get_status_sub_state() == SessionSubState.WAITING_FOR_RFID
+
+
+async def scenario_v(rig: Rig, interruption: Interruption | None) -> None:
+    """Research 027 scenario V: cable in at 10:06 without a card; the card at 10:10."""
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.set(plug="on", lock="Locked")
+    await rig.goto("10:08:00")
+    if interruption is not None:
+        await interruption(rig)
+    assert rig.engine.get_status_sub_state() == SessionSubState.WAITING_FOR_RFID
+    await rig.goto("10:10:00")
+    await rig.set(trx=TRX_PAUL)
+    await rig.set(power=7000)
+    await rig.goto("10:20:00")
+    await rig.set(energy=2.0)
+    await rig.goto("10:30:00")
+    await rig.set(energy=4.0)
+    await rig.goto("10:31:00")
+    await rig.set(power=0)
+    await rig.goto("10:40:00")
+    await rig.unplug()
+
+
+@pytest.mark.parametrize("intr", ["none", "reload", "restart-present"])
+async def test_rt22_waiting_for_rfid_at_the_interruption(hass, hass_storage, freezer, intr):
+    """RT-22: one session with full energy and cost after the blip.
+
+    Allowed difference: connected_at is the start-up time, the plug-in was not observed.
+    """
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_v(rig, INTERRUPTIONS[intr])
+    assert _summary(rig) == [("Paul", 4.0, 10.0, None, 4.0)]
+    assert len(rig.started) == 1
+
+
+async def _card_and_cable_while_down(rig: Rig) -> None:
+    """Paul shows his card and plugs in at 10:10 while down; 2.0 kWh by 10:20."""
+    await rig.goto("10:10:00", fire=False)
+    await rig.set(trx=TRX_PAUL)
+    await rig.set(plug="on", lock="Locked")
+    await rig.set(power=7000)
+    await rig.goto("10:20:00", fire=False)
+    await rig.set(energy=2.0)
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present"])
+async def test_rt23_cable_and_card_in_at_setup_without_snapshot(
+    hass, hass_storage, freezer, intr
+) -> None:
+    """RT-23 (and P-1): the session starts at setup with energy_start_kwh 0.0 and takes
+    the whole counter of the connection (4.0 kWh), not only what follows start-up."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    if intr == "none":
+        await rig.goto("10:10:00")
+        await rig.plug_in(TRX_PAUL)
+        await rig.goto("10:20:00")
+        await rig.set(energy=2.0)
+    else:
+        await restart(during=_card_and_cable_while_down)(rig)
+        session = rig.engine.active_session
+        assert session.energy_start_kwh == 0.0
+        assert (session.energy_kwh, session.cost_total_kr) == (2.0, 5.0)
+    await rig.goto("10:30:00")
+    await rig.set(energy=4.0)
+    await rig.set(power=0)
+    await rig.goto("10:40:00")
+    await rig.unplug()
+
+    assert _summary(rig) == [("Paul", 4.0, 10.0, None, 4.0)]
+    assert len(rig.started) == 1
+
+
+async def test_rt24_cable_in_while_recovery_is_deferred(hass, hass_storage, freezer) -> None:
+    """RT-24: with the RFID entity missing at setup the recovery defers and D-46 does not
+    run: no RFID wait, and power flowing meanwhile starts no session."""
+
+    async def interruption(rig: Rig) -> None:
+        await restart("late", absent=["trx"], order=[])(rig)
+        engine = rig.engine
+        assert engine.state == SessionEngineState.IDLE
+        assert engine.get_status_sub_state() == SessionSubState.IDLE
+        await rig.set(power=7100)
+        assert engine.active_session is None and len(rig.started) == 1
+        await rig.set(trx=TRX_PAUL)
+
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_a(rig, TRX_PAUL, {"mid": interruption})
+    assert _summary(rig) == [("Paul", 4.0, 10.0, None, 4.0)]
+    assert len(rig.started) == 1
+
+
+async def _guest_leaves(rig: Rig, *, after_unplug: str | None, fire: bool = True) -> None:
+    await rig.goto("10:30:00", fire=fire)
+    await rig.set(energy=3.8, eto=1003.8)
+    await rig.set(power=0)
+    await rig.unplug()
+    await rig.set(trx="null")
+    if after_unplug is not None:
+        await rig.set(energy=after_unplug)
+    await rig.goto("10:45:00", fire=fire)
+
+
+async def scenario_u(rig: Rig, trx: str, *, after_unplug: str | None, interrupted: bool):
+    """Research 027 scenario U: the car leaves at 10:30 with 3.8 kWh (down 10:22–10:45)."""
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(trx)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:22:00")
+    if not interrupted:
+        await _guest_leaves(rig, after_unplug=after_unplug)
+    else:
+
+        async def during(rig: Rig) -> None:
+            await _guest_leaves(rig, after_unplug=after_unplug, fire=False)
+
+        await restart(during=during)(rig)
+    await rig.goto("10:46:00")
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present"])
+async def test_rt25_car_left_counter_kept(hass, hass_storage, freezer, intr) -> None:
+    """RT-25: energy from the final counter (D-47), cost recomputed (D-37), charger
+    totals present. Allowed difference: the end time is the start-up time."""
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_u(rig, TRX_PAUL, after_unplug=None, interrupted=intr != "none")
+    assert _summary(rig) == [("Paul", 3.8, 9.5, None, 3.8)]
+    (record,) = rig.records()
+    assert (record["charger_total_before_kwh"], record["charger_total_after_kwh"]) == (
+        1000.0,
+        1003.8,
+    )
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present"])
+async def test_rt25_spot_car_left_closes_the_stored_hour(hass, hass_storage, freezer, intr):
+    """RT-25, spot (D-39): the remaining energy closes into the stored hour at its price."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await scenario_u(rig, TRX_PAUL, after_unplug=None, interrupted=intr != "none")
+    (money,) = rig.money()
+    assert money["details"] == [("10:00", 3.8, 1.0, False)]
+    assert (money["energy"], money["cost"], money["details_kwh"]) == (3.8, 3.8, 3.8)
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present"])
+async def test_rt26_car_left_counter_below_the_snapshot(hass, hass_storage, freezer, intr):
+    """RT-26: the counter reads 0.0 after the unplug: the snapshot's 3.0 kWh are kept and
+    the session is not discarded. Allowed difference: the 0.8 kWh after the last
+    snapshot (10:20) are unknown."""
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_u(rig, TRX_GFIX, after_unplug="0.0", interrupted=intr != "none")
+    energy = 3.8 if intr == "none" else 3.0
+    assert _summary(rig) == [("Gaest", energy, energy * 2.5, energy * 5.0, energy)]
+    assert rig.snapshot() is None

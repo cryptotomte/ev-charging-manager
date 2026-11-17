@@ -143,6 +143,8 @@ class _RfidWaitState:
     """
 
     plug_on_at: datetime
+    # Spec 027 D-46: the counter baseline for a wait entered at setup; None = live reading.
+    energy_start_kwh: float | None = None
 
 
 class PlugAnchoredSessionEngine:
@@ -564,37 +566,64 @@ class PlugAnchoredSessionEngine:
             self._state = SessionEngineState.IDLE
             self._active_session = None
 
+    def _recovery_inputs_ready(self) -> bool:
+        """Whether the plug and the RFID entity both have a valid state (spec 027 D-43).
+
+        The plug must read a usable value (BUG-3). For the RFID entity "null" is a valid
+        state (no card on the charger); only an absent, unavailable or unknown entity
+        is not.
+        """
+        if self._entry.options.get(CONF_PLUG_ENTITY) and self._get_plug() is None:
+            return False
+        rfid_entity_id = self._entry.data.get(CONF_RFID_ENTITY)
+        if not rfid_entity_id:
+            return True
+        rfid_state = self._hass.states.get(rfid_entity_id)
+        return rfid_state is not None and rfid_state.state not in (
+            STATE_UNAVAILABLE,
+            STATE_UNKNOWN,
+        )
+
+    def _present_card_index(self) -> int | None:
+        """The card index the charger shows now (trx - 1), or None when no card is shown."""
+        try:
+            index = int(self._get_trx()) - 1
+        except (TypeError, ValueError):
+            return None
+        return index if index >= 0 else None
+
     async def _async_do_recover(self, snapshot: dict) -> None:
-        """Execute the plug-anchored restart recovery logic.
+        """Execute the plug-anchored restart recovery logic (spec 027 § 6.2).
 
         BUG-3 fix: when the plug entity is not yet available (None — unavailable /
         unknown / entity not loaded at boot), DO NOT silently treat the plug as
         off. That would prematurely complete the session with the wrong disconnect
-        time. Instead, defer recovery until a valid plug state arrives.
+        time. Instead, defer recovery until a valid plug state arrives; spec 027
+        D-43 waits for the RFID entity as well.
         """
         now = dt_util.utcnow()
-
-        # Read current charger state — plug may be None if entity not yet loaded.
-        current_plug = self._get_plug()
         plug_entity_id = self._entry.options.get(CONF_PLUG_ENTITY)
+        rfid_entity_id = self._entry.data.get(CONF_RFID_ENTITY)
 
-        if current_plug is None and plug_entity_id:
-            # Plug entity not yet reporting a usable value — defer recovery (BUG-3).
+        if not self._recovery_inputs_ready():
             if self._debug_logger:
                 snap_id = snapshot.get("id", "?")
                 self._debug_logger.log(
                     DEBUG_CAT_HA_RESTART_DETECTED,
-                    "RECOVERY_DEFERRED_WAITING_FOR_PLUG — plug entity unavailable at "
-                    f"recovery time (entity_id={plug_entity_id} snapshot_id={snap_id})",
+                    "RECOVERY_DEFERRED_WAITING_FOR_PLUG — plug or RFID entity unavailable "
+                    f"at recovery time (plug={plug_entity_id} rfid={rfid_entity_id} "
+                    f"snapshot_id={snap_id})",
                 )
             _LOGGER.info(
-                "PlugAnchoredSessionEngine recovery: deferring — plug entity %s "
-                "not yet available; will retry on first valid state",
+                "PlugAnchoredSessionEngine recovery: deferring — plug entity %s or RFID "
+                "entity %s not yet available; will retry on first valid state",
                 plug_entity_id,
+                rfid_entity_id,
             )
-            await self._defer_recovery_until_plug_ready(snapshot, plug_entity_id)
+            await self._defer_recovery_until_ready(snapshot)
             return
 
+        current_plug = self._get_plug()
         current_cable_lock = self._get_cable_lock()
         # PR-27 FR-001: keep None when the energy entity is unavailable — an
         # absent reading is "no evidence", never a counter reset.
@@ -610,68 +639,79 @@ class PlugAnchoredSessionEngine:
                 f"power={current_power:.0f}W energy={energy_str}",
             )
 
-        energy_start = float(snapshot.get("energy_start_kwh", 0.0))
-        # Effective energy for downstream use: when the live reading is missing,
-        # reconstruct it from the snapshot (start + accumulated) so the session
-        # completes with its last known values (PR-27 FR-001).
-        effective_energy = (
-            current_energy
-            if current_energy is not None
-            else energy_start + float(snapshot.get("energy_kwh", 0.0))
-        )
+        saved_energy = float(snapshot.get("energy_kwh", 0.0))
+        card = self._present_card_index()
 
-        # Determine whether plug is currently on (explicit string compare;
-        # None was handled by the early return above).
-        plug_on = current_plug == "on"
-
-        if plug_on:
-            # Cable still in — resume the session (FR-026). A counter below the
-            # snapshot's is handled inside the resume (spec 027 D-38).
-            await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
-        else:
-            # Cable removed — complete the old session (FR-027)
+        if current_plug != "on":
+            # Cable removed — complete the old session (FR-027). Spec 027 D-47: the
+            # counter keeps the session's final value until the next plug-in, but is
+            # never trusted below the snapshot.
             reason = "plug was off at restart"
+            energy = saved_energy
+            if current_energy is not None:
+                energy = max(
+                    saved_energy, current_energy - float(snapshot.get("energy_start_kwh", 0.0))
+                )
             _LOGGER.info(
                 "PlugAnchoredSessionEngine recovery: completing old session (%s) id=%s",
                 reason,
                 snapshot.get("id", "?"),
             )
-            await self._complete_snapshot_as_session(snapshot, effective_energy, now)
+            await self._complete_snapshot_as_session(
+                snapshot, energy, now, charger_total_after_kwh=self._get_eto()
+            )
+        # PRELIMINARY P-2 (spec 027 § 10): the card value does not change within one
+        # connection, so a different card means a new connection. No card is no
+        # evidence (spec 027 § 4.6).
+        elif card is not None and card != snapshot.get("rfid_index"):
+            # Spec 027 D-44: the counter belongs to the new connection, so the old
+            # session keeps its snapshot energy and the new one takes the whole counter.
+            reason = "another card on the charger at restart"
+            await self._complete_snapshot_as_session(snapshot, saved_energy, now)
+            self._state = SessionEngineState.TRACKING
+            # PRELIMINARY P-1 (spec 027 § 10): with the cable in, the counter is the
+            # energy of the current connection.
+            await self._async_start_session(energy_start_kwh=0.0)
+        else:
+            # Cable still in — resume the session (FR-026). A counter below the
+            # snapshot's is handled inside the resume (spec 027 D-38).
+            await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
+            return
 
-            if self._debug_logger:
-                self._debug_logger.log(
-                    DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
-                    f"session ended at restart — reason={reason} id={snapshot.get('id', '?')}",
-                )
+        if self._debug_logger:
+            self._debug_logger.log(
+                DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
+                f"session ended at restart — reason={reason} id={snapshot.get('id', '?')}",
+            )
 
-    async def _defer_recovery_until_plug_ready(self, snapshot: dict, plug_entity_id: str) -> None:
-        """Register a one-shot listener that re-runs recovery when plug entity is valid.
+    async def _defer_recovery_until_ready(self, snapshot: dict) -> None:
+        """Register a listener that re-runs recovery when plug and RFID entity are valid.
 
         BUG-3 fix: avoids the silent-corruption path where current_plug == None at
         boot causes the engine to assume plug is off and prematurely complete the
-        session with the restart timestamp as disconnected_at.
+        session with the restart timestamp as disconnected_at. Spec 027 D-43 waits
+        for the RFID entity too, because the card decides between resume and split.
 
         HIGH-1 fix: also registers a timeout (DEFERRED_RECOVERY_TIMEOUT_MIN). If
-        the plug entity never reports a valid state within the window (e.g. user
+        the entities never report a valid state within the window (e.g. user
         has a typo in their plug entity ID, charger is permanently offline), the
         engine fires a persistent notification and force-completes the snapshot
         rather than staying deferred forever.
         """
+        plug_entity_id = self._entry.options.get(CONF_PLUG_ENTITY)
+        watched = [e for e in (plug_entity_id, self._entry.data.get(CONF_RFID_ENTITY)) if e]
         # PR-27 FR-005: fresh mutual-exclusion flag for this deferral round.
         self._recovery_resolved = False
 
-        async def _on_plug_ready(event: Event) -> None:
-            new_state = event.data.get("new_state")
-            if new_state is None:
-                return
-            if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        async def _on_entity_ready(_event: Event) -> None:
+            if not self._recovery_inputs_ready():
                 return
             # PR-27 FR-005: check-and-set before any await — if the timeout
             # already resolved the recovery, this callback is a no-op.
             if self._recovery_resolved:
                 return
             self._recovery_resolved = True
-            # Plug entity now has a valid state — cancel listener + timeout and resume recovery.
+            # Both entities are valid now — cancel listener + timeout and resume recovery.
             if self._deferred_recovery_unsub is not None:
                 self._deferred_recovery_unsub()
                 self._deferred_recovery_unsub = None
@@ -681,7 +721,8 @@ class PlugAnchoredSessionEngine:
             if self._debug_logger:
                 self._debug_logger.log(
                     DEBUG_CAT_HA_RESTART_DETECTED,
-                    f"plug entity now valid ({new_state.state!r}) — running deferred recovery",
+                    f"plug entity now valid ({self._get_plug()!r}) and RFID entity valid "
+                    "— running deferred recovery",
                 )
             try:
                 await self._async_do_recover(snapshot)
@@ -700,7 +741,7 @@ class PlugAnchoredSessionEngine:
             if self._recovery_resolved:
                 return
             self._recovery_resolved = True
-            # Cancel the plug-state listener (it will no longer be needed).
+            # Cancel the state listener (it will no longer be needed).
             if self._deferred_recovery_unsub is not None:
                 try:
                     self._deferred_recovery_unsub()
@@ -710,12 +751,12 @@ class PlugAnchoredSessionEngine:
             self._deferred_recovery_timeout_unsub = None
 
             snap_id = snapshot.get("id", "?")
+            entities = " / ".join(watched)
             _LOGGER.error(
                 "PlugAnchoredSessionEngine: deferred recovery timed out after %d min "
-                "— plug entity %s never reported a valid state; force-completing "
-                "snapshot id=%s",
+                "— %s never reported a valid state; force-completing snapshot id=%s",
                 DEFERRED_RECOVERY_TIMEOUT_MIN,
-                plug_entity_id,
+                entities,
                 snap_id,
             )
 
@@ -723,7 +764,7 @@ class PlugAnchoredSessionEngine:
                 self._debug_logger.log(
                     DEBUG_CAT_RECOVERY_TIMEOUT,
                     f"deferred recovery timed out after {DEFERRED_RECOVERY_TIMEOUT_MIN} min "
-                    f"— plug entity {plug_entity_id} never valid; "
+                    f"— {entities} never valid; "
                     f"force-completing snapshot id={snap_id}",
                 )
 
@@ -732,7 +773,7 @@ class PlugAnchoredSessionEngine:
                 persistent_notification.async_create(
                     self._hass,
                     message=(
-                        f"The plug entity **{plug_entity_id}** did not report a valid "
+                        f"The plug or RFID entity (**{entities}**) did not report a valid "
                         f"state within {DEFERRED_RECOVERY_TIMEOUT_MIN} minutes after Home "
                         "Assistant restart. The previously active session has been "
                         "force-completed with a data gap.\n\n"
@@ -755,14 +796,17 @@ class PlugAnchoredSessionEngine:
             # path but with restart-time as disconnected_at).
             try:
                 now = dt_util.utcnow()
+                saved_energy = float(snapshot.get("energy_kwh", 0.0))
+                energy_start = float(snapshot.get("energy_start_kwh", 0.0))
                 # PR-27 FR-001: explicit None check — a genuine 0.0 reading is
                 # evidence and must not fall through to the snapshot fallback.
                 current_energy = self._get_energy()
-                if current_energy is None:
-                    current_energy = float(snapshot.get("energy_start_kwh", 0.0)) + float(
-                        snapshot.get("energy_kwh", 0.0)
-                    )
-                await self._complete_snapshot_as_session(snapshot, current_energy, now)
+                energy = (
+                    current_energy - energy_start
+                    if current_energy is not None and current_energy >= energy_start
+                    else saved_energy
+                )
+                await self._complete_snapshot_as_session(snapshot, energy, now)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error(
                     "PlugAnchoredSessionEngine: force-complete after recovery timeout "
@@ -772,9 +816,13 @@ class PlugAnchoredSessionEngine:
                 )
                 self._state = SessionEngineState.IDLE
                 self._active_session = None
+            # A plug that turned valid during the deferral was held back (see
+            # _handle_plug_on); give it its normal handling now.
+            if self._state == SessionEngineState.IDLE and self._get_plug() == "on":
+                self._handle_plug_on()
 
         self._deferred_recovery_unsub = async_track_state_change_event(
-            self._hass, [plug_entity_id], _on_plug_ready
+            self._hass, watched, _on_entity_ready
         )
         self._engine_unsubs.append(self._deferred_recovery_unsub)
 
@@ -1103,16 +1151,20 @@ class PlugAnchoredSessionEngine:
         self._eto_start = session.charger_total_before_kwh
 
     async def _complete_snapshot_as_session(
-        self, snapshot: dict, current_energy: float, now: datetime
+        self,
+        snapshot: dict,
+        energy_kwh: float,
+        now: datetime,
+        *,
+        charger_total_after_kwh: float | None = None,
     ) -> None:
-        """Complete a snapshot as a reconstructed session with best available data."""
+        """Complete a snapshot as a reconstructed session with the energy the caller chose.
+
+        The engine is COMPLETING until it returns, so a plug event arriving during the
+        store write cannot start a session that the final IDLE would strand.
+        """
+        self._state = SessionEngineState.COMPLETING
         energy_start = float(snapshot.get("energy_start_kwh", 0.0))
-        saved_energy_kwh = float(snapshot.get("energy_kwh", 0.0))
-        best_energy = (
-            max(0.0, current_energy - energy_start)
-            if current_energy >= energy_start
-            else saved_energy_kwh
-        )
 
         connected_at_str = snapshot.get("connected_at") or snapshot.get(
             "started_at", now.isoformat()
@@ -1156,11 +1208,17 @@ class PlugAnchoredSessionEngine:
             charging_duration_s=charging_duration_s,
             charging_window_count=int(snapshot.get("charging_window_count", 0)),
             energy_start_kwh=energy_start,
-            energy_kwh=round(best_energy, 3),
+            energy_kwh=round(energy_kwh, 3),
             cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
             cost_method=snapshot.get("cost_method", "static"),
             price_details=snapshot.get("price_details"),
             charger_total_before_kwh=snapshot.get("charger_total_before_kwh"),
+            # Only as a pair with the total at session start, as the live completion.
+            charger_total_after_kwh=(
+                charger_total_after_kwh
+                if snapshot.get("charger_total_before_kwh") is not None
+                else None
+            ),
             max_power_w=float(snapshot.get("max_power_w", 0.0)),
             reconstructed=True,
             data_gap=True,
@@ -1304,6 +1362,13 @@ class PlugAnchoredSessionEngine:
             state = self._hass.states.get(entity_id)
             if state and state.state not in _INVALID_STATES:
                 setattr(self, attr_name, state.state)
+
+        # Spec 027 D-46: a cable already in at setup gets its normal plug-on handling
+        # (spec 020: the RFID wait is re-derived from the entity values). PRELIMINARY
+        # P-1 (spec 027 § 10): with the cable in, the counter is this connection's
+        # energy, so the session takes all of it.
+        if self._state == SessionEngineState.IDLE and self._get_plug() == "on":
+            self._handle_plug_on(energy_start_kwh=0.0)
 
     # -----------------------------------------------------------------------
     # State change dispatch (T028)
@@ -1488,7 +1553,7 @@ class PlugAnchoredSessionEngine:
                     f"plug entity reports unrecognised value {new_val!r}; ignored",
                 )
 
-    def _handle_plug_on(self) -> None:
+    def _handle_plug_on(self, energy_start_kwh: float | None = None) -> None:
         """Plug transitioned off → on: start a new session or enter RFID wait (PR-24).
 
         If called while already TRACKING (transient disconnect resolved),
@@ -1499,6 +1564,9 @@ class PlugAnchoredSessionEngine:
         session immediately (fast path, FR-006).
         trx="0" (open-access sentinel at go-e) is NOT in _INVALID_STATES and
         triggers the immediate-start path.
+
+        ``energy_start_kwh`` is the counter baseline of the session this plug-on
+        starts; None takes the live reading (spec 027 D-46 passes 0.0).
         """
         if self._state == SessionEngineState.TRACKING:
             # Plug returned during a transient disconnect
@@ -1507,6 +1575,12 @@ class PlugAnchoredSessionEngine:
 
         if self._state != SessionEngineState.IDLE:
             # Already completing — ignore
+            return
+
+        # Spec 027 D-43: while a recovery waits for the RFID entity, the recovery decides
+        # what this cable is; a session started here (e.g. by power during an RFID wait)
+        # would be overwritten by it. The timeout path hands the plug back afterwards.
+        if self._deferred_recovery_unsub is not None:
             return
 
         # Cancel any lingering disconnect timer (defensive)
@@ -1520,11 +1594,13 @@ class PlugAnchoredSessionEngine:
         if current_trx in _INVALID_STATES:
             # trx is null/unavailable at plug-on → enter event-driven RFID wait (FR-001)
             now = dt_util.utcnow()
-            self._start_rfid_wait(now)
+            self._start_rfid_wait(now, energy_start_kwh)
         else:
             # trx is already non-null (fast path: blip-before-plug, or open-access)
             # → immediate session start (FR-006)
-            self._hass.async_create_task(self._async_start_session())
+            self._hass.async_create_task(
+                self._async_start_session(energy_start_kwh=energy_start_kwh)
+            )
 
     def _handle_plug_off(self) -> None:
         """Plug transitioned on → off: validate with cable_lock before ending (PR-22 FR-002/FR-003).
@@ -1831,7 +1907,7 @@ class PlugAnchoredSessionEngine:
     # (trx non-null, power > 0, plug-off). No new listener registration needed.
     # -----------------------------------------------------------------------
 
-    def _start_rfid_wait(self, plug_on_at: datetime) -> None:
+    def _start_rfid_wait(self, plug_on_at: datetime, energy_start_kwh: float | None = None) -> None:
         """Enter the event-driven RFID wait after plug-on with trx=null (FR-001).
 
         Creates a _RfidWaitState recording the plug-on timestamp and logs the
@@ -1844,11 +1920,12 @@ class PlugAnchoredSessionEngine:
 
         Args:
             plug_on_at: UTC timestamp of the plug-on event (becomes session.connected_at, FR-007).
+            energy_start_kwh: counter baseline for the session the wait starts (D-46).
         """
         # Cancel any stale wait state (defensive)
         self._cancel_rfid_wait()
 
-        self._rfid_wait = _RfidWaitState(plug_on_at=plug_on_at)
+        self._rfid_wait = _RfidWaitState(plug_on_at=plug_on_at, energy_start_kwh=energy_start_kwh)
 
         if self._debug_logger:
             self._debug_logger.log(
@@ -1880,6 +1957,7 @@ class PlugAnchoredSessionEngine:
 
         # Save plug_on_at BEFORE cancelling (cancel clears the state)
         saved_plug_on_at = self._rfid_wait.plug_on_at
+        energy_start_kwh = self._rfid_wait.energy_start_kwh
 
         # Clear the wait state
         self._cancel_rfid_wait()
@@ -1889,7 +1967,11 @@ class PlugAnchoredSessionEngine:
         # so as long as the new_val is already in the entity state by now
         # (which it is — this callback fires after the state change), it will
         # be resolved by RfidLookup.
-        self._hass.async_create_task(self._async_start_session(connected_at=saved_plug_on_at))
+        self._hass.async_create_task(
+            self._async_start_session(
+                connected_at=saved_plug_on_at, energy_start_kwh=energy_start_kwh
+            )
+        )
 
     # -----------------------------------------------------------------------
     # Power handling: charging window lifecycle (T025, T026)
@@ -1922,6 +2004,7 @@ class PlugAnchoredSessionEngine:
                 # Power began flowing while waiting for RFID — open-access charger.
                 # Save plug_on_at and clear wait before starting session (FR-007).
                 plug_on_at = self._rfid_wait.plug_on_at
+                energy_start_kwh = self._rfid_wait.energy_start_kwh
                 self._cancel_rfid_wait()
                 if self._debug_logger:
                     self._debug_logger.log(
@@ -1933,6 +2016,7 @@ class PlugAnchoredSessionEngine:
                     self._async_start_session(
                         connected_at=plug_on_at,
                         reason=UnknownReason.OPEN_ACCESS_INFERRED,
+                        energy_start_kwh=energy_start_kwh,
                     )
                 )
                 return
@@ -2194,6 +2278,7 @@ class PlugAnchoredSessionEngine:
         self,
         connected_at: datetime | None = None,
         reason: UnknownReason | None = None,
+        energy_start_kwh: float | None = None,
     ) -> None:
         """Create a new session on plug-on event — INITIALIZING state.
 
@@ -2207,6 +2292,9 @@ class PlugAnchoredSessionEngine:
                 Used by the open-access inference path (FR-003, PR-24) to record
                 UnknownReason.OPEN_ACCESS_INFERRED instead of the default
                 UnknownReason.TRX_NULL when trx is null but power flow started.
+            energy_start_kwh: Counter baseline; None takes the reading now. Spec 027
+                D-44/D-46 pass 0.0 for a connection that began before start-up, and
+                the session then holds the whole counter at once.
         """
         # Idempotency guard: a late-arriving scheduled task (e.g. from trx-resolve
         # callback) must abort if the engine has moved on between task scheduling
@@ -2247,6 +2335,7 @@ class PlugAnchoredSessionEngine:
             # Snapshot energy at session start
             energy = self._get_energy() or 0.0
             self._last_energy_kwh = energy
+            start_kwh = energy if energy_start_kwh is None else energy_start_kwh
 
             power = self._get_power() or 0.0
             self._last_power_w = power
@@ -2276,8 +2365,8 @@ class PlugAnchoredSessionEngine:
                 # PR-22 canonical — plug-on time (may predate session start when set via
                 # the RFID wait path or open-access inference; PR-24 FR-007)
                 connected_at=connected_at_iso,
-                energy_start_kwh=energy,
-                energy_kwh=0.0,
+                energy_start_kwh=start_kwh,
+                energy_kwh=max(0.0, energy - start_kwh),
             )
 
             # Reset window tracker for this session
@@ -2319,6 +2408,9 @@ class PlugAnchoredSessionEngine:
                 self._capture_hour_price()
                 self._arm_hourly_spot_callback()
 
+            if energy_start_kwh is not None:
+                self._recompute_derived(self._active_session)
+
             # Story 07: check for unmapped RFID and trigger passive notification if needed
             if session_user_type == "unknown" and resolution is not None:
                 if resolution.reason in ("unmapped", "rfid_inactive", "type_error"):
@@ -2333,7 +2425,7 @@ class PlugAnchoredSessionEngine:
                 self._debug_logger.log(
                     "ENGINE_DECISION",
                     f"IDLE → TRACKING (trigger: plug=on + rfid_resolved) "
-                    f"energy_start={energy:.3f}kWh",
+                    f"energy_start={start_kwh:.3f}kWh",
                 )
 
             # FR-004 (PR-28): full tag values only at debug level in the HA log

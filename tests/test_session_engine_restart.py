@@ -908,23 +908,17 @@ async def test_ha_restart_during_rfid_wait_re_enters_wait_state(
     entity values and correctly enters waiting_for_rfid — exactly as it would in a
     live session.  No active session snapshot exists (the wait was pre-session).
 
-    The test simulates the post-restart scenario: after HA loads the integration
-    (engine listener is now registered), the charger entities fire their restored
-    state-change events.  This is how HA communicates "plug is on at restart" to
-    the engine — via a state_changed event, not via a separate boot hook.
-
-    Per spec.md Edge Cases (A4 / restart handling) and contracts/engine-state-machine.md:
-    on the first plug=on event with trx=null (and no active snapshot), the engine
-    must enter waiting_for_rfid rather than starting a session.
+    Spec 020 (line 103) and spec 027 D-46: the plug already reads on when the
+    integration is set up, and no state-change event follows; setup itself must
+    run the plug-on handling. (This test used to set up with the plug off and
+    then fire a plug event, which is a live plug-in, not a restart.)
     """
-    # Create the entry with plug=off (idle). _make_engine_entry only sets states and
-    # returns the entry — it does NOT call add_to_hass or async_setup.
     entry = await _make_engine_entry(
         hass,
-        plug_state="off",
-        cable_lock_state="Unlocked",
+        plug_state="on",
+        cable_lock_state="Locked",
         power_state="0.0",
-        energy_state="0.0",
+        energy_state="0.4",  # this connection's counter (spec 027 P-1)
     )
     # Complete setup (no snapshot → active_snapshot is None → no async_recover).
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
@@ -933,17 +927,6 @@ async def test_ha_restart_during_rfid_wait_re_enters_wait_state(
         await hass.async_block_till_done()
 
     engine = _get_engine(hass, entry)
-    assert engine.state == SessionEngineState.IDLE, (
-        "SF7 pre-condition: engine must be IDLE before simulating restart-plug-on"
-    )
-
-    with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
-        # Simulate HA restoring the plug entity state after restart — the charger
-        # has been plugged in since before the restart (cable_lock=Locked confirms it).
-        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
-        hass.states.async_set(MOCK_TRX_ENTITY, "null")  # no RFID blip before restart
-        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
-        await hass.async_block_till_done()
 
     # The engine must be TRACKING with no active session (RFID wait re-entered)
     assert engine.state == SessionEngineState.TRACKING, (
@@ -976,6 +959,9 @@ async def test_ha_restart_during_rfid_wait_re_enters_wait_state(
     )
     assert engine._rfid_wait is None, (  # noqa: SLF001
         "SF7: _rfid_wait must be cleared after session starts"
+    )
+    assert engine.active_session.energy_start_kwh == 0.0, (
+        "spec 027 D-46: the session of a cable already in at setup takes the whole counter"
     )
 
 
@@ -1126,11 +1112,11 @@ async def test_deferred_resume_clears_rfid_wait_and_session_survives(
     leave an RFID wait armed — the next unplug completes AND persists the
     session, and a subsequent plug-in starts a new session.
 
-    Adversarial ordering: the engine's plug handler arms the RFID wait
-    (plug=on, trx=null) BEFORE the deferred-recovery resume installs the
-    recovered session. HA's eager-task semantics normally hide this ordering
-    (the resume runs synchronously first); per plan.md the fix must not RELY
-    on eager semantics, so the ordering is driven explicitly here.
+    Adversarial residue: an RFID wait is armed when the deferred-recovery resume
+    installs the recovered session. Spec 027 D-43 keeps the engine's own plug
+    handler from arming one while a recovery is deferred, so the residue is
+    injected directly; the resume must still clear it (per plan.md the fix must
+    not RELY on eager semantics or on that guard).
     """
     snapshot = _make_snapshot(energy_start_kwh=0.0, energy_kwh=5.0)
     snap_id = snapshot["id"]
@@ -1140,10 +1126,8 @@ async def test_deferred_resume_clears_rfid_wait_and_session_survives(
     assert engine._deferred_recovery_unsub is not None, "recovery must be deferred"
 
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
-        # Adversarial step 1: the engine's own plug handler sees plug=on first
-        # (trx is null) and arms the event-driven RFID wait.
-        engine._handle_plug_change("on")
-        assert engine._rfid_wait is not None, "precondition: RFID wait armed before resume"
+        # Adversarial step 1: an RFID wait is armed before the resume.
+        engine._rfid_wait = _RfidWaitState(plug_on_at=dt_util.utcnow())
 
         # Adversarial step 2: the plug entity state becomes valid — the deferred
         # resume runs and installs the recovered session over the armed wait.

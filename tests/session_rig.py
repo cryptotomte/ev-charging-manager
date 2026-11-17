@@ -370,7 +370,7 @@ def restart(
         await hass.config_entries.async_setup(rig.entry.entry_id)
         await hass.async_block_till_done()
         default = ["plug", "lock", "trx", "power", "energy", "car", "eto", "spot"]
-        for eid in [NAMES[n] for n in (order or default)]:
+        for eid in [NAMES[n] for n in (default if order is None else order)]:
             if eid in saved:
                 hass.states.async_set(eid, saved[eid])
                 await hass.async_block_till_done()

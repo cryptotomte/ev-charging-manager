@@ -136,10 +136,15 @@ async def _add_petra_user_and_rfid(hass: HomeAssistant, entry_id: str) -> None:
     user_id = user_subs[-1].subentry_id
 
     # Add RFID mapping: card_index=1 → trx="2"
-    result = await hass.config_entries.subentries.async_init(
-        (entry_id, "rfid_mapping"),
-        context={"source": "user"},
-    )
+    # see tests/test_sensors.py::_add_rfid
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=None,
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (entry_id, "rfid_mapping"),
+            context={"source": "user"},
+        )
     await hass.config_entries.subentries.async_configure(
         result["flow_id"],
         {"card_index": "1", "user_id": user_id},

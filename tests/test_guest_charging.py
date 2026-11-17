@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
-from homeassistant.const import STATE_UNAVAILABLE
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, STATE_UNAVAILABLE
+from homeassistant.core import HomeAssistant, callback
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_capture_events
 
 from custom_components.ev_charging_manager.const import DOMAIN, EVENT_SESSION_COMPLETED
@@ -132,6 +132,10 @@ async def _setup_stats_engine(
         with patch.object(store._store, "async_save", new_callable=AsyncMock):
             engine = StatsEngine(hass, entry, store)
             await engine.async_setup()
+            # see tests/test_stats_engine.py::_setup_engine
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, callback(lambda _: engine.async_teardown())
+            )
             hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})["stats_engine"] = engine
             return engine, store, entry
 

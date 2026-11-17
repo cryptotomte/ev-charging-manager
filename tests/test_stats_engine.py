@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant, callback
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_time_changed,
@@ -68,6 +69,11 @@ async def _setup_engine(hass: HomeAssistant) -> tuple[StatsEngine, StatsStore, M
         with patch.object(store._store, "async_save", new_callable=AsyncMock):
             engine = StatsEngine(hass, entry, store)
             await engine.async_setup()
+            # The entry is never loaded, so the teardown the engine registers via
+            # entry.async_on_unload never runs; tear down at the test's hass stop.
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, callback(lambda _: engine.async_teardown())
+            )
             # Register in hass.data so sensors can find it
             hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})["stats_engine"] = engine
             return engine, store, entry
@@ -180,6 +186,9 @@ async def test_load_restores_state_from_store(hass: HomeAssistant) -> None:
         with patch.object(store._store, "async_save", new_callable=AsyncMock):
             engine = StatsEngine(hass, entry, store)
             await engine.async_setup()
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, callback(lambda _: engine.async_teardown())
+            )  # see _setup_engine
 
     assert "Petra" in engine.user_stats
     assert engine.user_stats["Petra"].total_energy_kwh == 100.0
@@ -597,6 +606,9 @@ async def test_previous_month_accumulation_survives_store_roundtrip(
     ):
         engine = StatsEngine(hass, entry, store)
         await engine.async_setup()
+        hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, callback(lambda _: engine.async_teardown())
+        )  # see _setup_engine
         engine._user_stats["Petra"] = _make_april_user_after_rollover()
 
         # Late session completing after the rollover (FR-001 path)

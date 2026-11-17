@@ -137,6 +137,7 @@ async def test_log_performs_no_file_io(hass: HomeAssistant, tmp_path) -> None:
 
     assert any("buffered only" in ln for ln in logger._buffer)
     assert not os.path.exists(logger.file_path)
+    await logger.async_disable()
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +504,7 @@ async def test_first_flush_failure_warns_immediately(hass: HomeAssistant, tmp_pa
     assert len(warnings) == 1, "Exactly one warning on the first failure"
     assert "flush" in warnings[0].message
     assert logger.file_path in warnings[0].message
+    await logger.async_disable()
 
 
 async def test_flush_failure_warning_throttled(hass: HomeAssistant, tmp_path, caplog) -> None:
@@ -521,6 +523,7 @@ async def test_flush_failure_warning_throttled(hass: HomeAssistant, tmp_path, ca
     assert len(warnings) == 2  # failure #1 (immediate) + failure #5 (throttled)
     assert "consecutive" in warnings[1].message
     assert "5" in warnings[1].message
+    await logger.async_disable()
 
 
 async def test_failure_count_resets_on_successful_flush(hass: HomeAssistant, tmp_path) -> None:
@@ -853,3 +856,4 @@ async def test_clear_truncates_active_only_dot1_remains(hass: HomeAssistant, tmp
 
     assert _read_text(logger) == ""
     assert open(logger.rotated_file_path, encoding="utf-8").read() == "ROTATED GENERATION\n"
+    await logger.async_disable()

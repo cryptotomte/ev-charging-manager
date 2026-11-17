@@ -53,14 +53,26 @@ async def test_unload_entry(hass: HomeAssistant, mock_config_entry: MockConfigEn
     assert mock_config_entry.state is ConfigEntryState.NOT_LOADED
 
 
+def _charger_device(hass: HomeAssistant, entry_id: str) -> dr.DeviceEntry | None:
+    # DeviceRegistry.async_get_device raises in newer HA and its replacement is
+    # missing in 2026.2; this lookup works in both.
+    return next(
+        (
+            device
+            for device in dr.async_entries_for_config_entry(dr.async_get(hass), entry_id)
+            if (DOMAIN, entry_id) in device.identifiers
+        ),
+        None,
+    )
+
+
 async def test_device_created(hass: HomeAssistant, mock_config_entry: MockConfigEntry) -> None:
     """Device is registered with correct name and manufacturer after setup."""
     mock_config_entry.add_to_hass(hass)
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    device_registry = dr.async_get(hass)
-    device = device_registry.async_get_device(identifiers={(DOMAIN, mock_config_entry.entry_id)})
+    device = _charger_device(hass, mock_config_entry.entry_id)
 
     assert device is not None
     assert device.name == "My go-e Charger"
@@ -123,9 +135,8 @@ async def test_multiple_instances(hass: HomeAssistant) -> None:
     assert entry1.state is ConfigEntryState.LOADED
     assert entry2.state is ConfigEntryState.LOADED
 
-    device_registry = dr.async_get(hass)
-    device1 = device_registry.async_get_device(identifiers={(DOMAIN, entry1.entry_id)})
-    device2 = device_registry.async_get_device(identifiers={(DOMAIN, entry2.entry_id)})
+    device1 = _charger_device(hass, entry1.entry_id)
+    device2 = _charger_device(hass, entry2.entry_id)
 
     assert device1 is not None
     assert device2 is not None

@@ -445,3 +445,15 @@ async def test_vehicle_and_mapping_changes_leave_stats_entities_alone(
 
     assert registry_events == []
     assert [e for e in state_events if e.data["entity_id"] in stats_ids] == []
+
+
+async def test_delete_legacy_user_named_unknown_keeps_unknown_bucket(hass: HomeAssistant) -> None:
+    """Spec 026 § 4.4: the Unknown bucket and its sensors are never removed."""
+    entry = await _setup(hass, _user("Unknown"))
+    await _completed(hass, "Unknown", 3.0, 7.5, "unknown")
+    entity_ids = _entity_ids(hass, entry, "Unknown")
+
+    await _delete_user(hass, entry, "Unknown")
+
+    assert _engine(hass, entry).user_stats["Unknown"].total_energy_kwh == 3.0
+    assert _entity_ids(hass, entry, "Unknown") == entity_ids

@@ -28,6 +28,7 @@ from tests.session_rig import (
     TRX_PAUL,
     Interruption,
     Rig,
+    reload,
     restart,
     scenario_a,
 )
@@ -42,7 +43,7 @@ def test_p1_guard_counter_belongs_to_the_connection() -> None:
 
     Assumption: with the cable in, the charger's energy counter (go-e ``wh``) is the
     energy of the current connection — it keeps its value after the unplug and restarts
-    at zero at the next plug-in. D-44 and D-46 therefore start a session with
+    at zero at the next plug-in. D-50 and D-51 therefore start a session with
     energy_start_kwh = 0.0 when the connection began before start-up (exercised by
     RT-17 and RT-23). Evidence: three plug-ins in the owner's debug log (2026-11-08,
     -10, -13). A profile that reuses the plug-anchored engine must restate it here.
@@ -54,8 +55,8 @@ def test_p2_guard_card_value_belongs_to_the_connection() -> None:
     """PRELIMINARY P-2 (spec 027 § 10), guard.
 
     Assumption: the card value (go-e ``trx``) does not change within one connection, so
-    a different card at recovery means a new connection and D-44 splits the session
-    (exercised by RT-17 and RT-20). Evidence: hardware test 2026-05-19 and one 12-hour
+    a different card at recovery means a new connection and D-50 splits a session that
+    has a card (exercised by RT-17). Evidence: hardware test 2026-05-19 and one 12-hour
     connection in the field log; released by the pre-release field test with two cards.
     A profile that reuses the plug-anchored engine must restate it here.
     """
@@ -234,40 +235,99 @@ async def _paul_plugs_in_after_unknown_while_down(rig: Rig) -> None:
     await _paul_plugs_in_after_unknown(rig, fire=False)
 
 
-@pytest.mark.parametrize("intr", ["none", "restart-present"])
-async def test_rt20_snapshot_without_card_and_a_card_now_present(
-    hass, hass_storage, freezer, intr
-) -> None:
-    """RT-20: an open-access (Unknown) snapshot and Paul's card at recovery: split.
+LATE_ORDERS = {"none": None, "restart-present": None, **{
+    "restart-late-field": FIELD_ORDER, "restart-late-pluglast": PLUG_LAST,
+}}  # fmt: skip
 
-    Allowed difference: as RT-17, the Unknown session has its snapshot's 3.0 kWh.
-    """
-    rig = Rig(hass, freezer, hass_storage)
+
+def _restart_in(intr: str, during: Interruption | None = None) -> Interruption:
+    """The restart of ``LATE_ORDERS[intr]``: entities present, or late in that order."""
+    order = LATE_ORDERS[intr]
+    if order is None:
+        return restart(during=during)
+    return restart("late", during=during, order=order)
+
+
+async def _open_access_session(rig: Rig, *, card_after_power: bool = False) -> None:
+    """Cable in at 10:06, power before any card: an Unknown session, 3.0 kWh by 10:18."""
     await rig.setup()
     await rig.goto("10:06:00")
     await rig.set(plug="on", lock="Locked")
     await rig.set(power=7000)  # power during the RFID wait: open access, Unknown
+    if card_after_power:
+        await rig.set(trx=TRX_PAUL)  # a moment later: logged, the session is kept
     await rig.goto("10:12:00")
     await rig.set(energy=1.0)
     await rig.goto("10:18:00")
     await rig.set(energy=3.0)
     await rig.goto("10:22:00")
     assert rig.engine.active_session.rfid_index is None
+
+
+@pytest.mark.parametrize("intr", list(LATE_ORDERS))
+async def test_rt20_card_on_a_new_connection_after_a_cardless_snapshot(
+    hass, hass_storage, freezer, intr
+) -> None:
+    """RT-20 (D-50): the Unknown car leaves during the outage and Paul plugs in with his
+    card. A snapshot without a card is resumed whatever the charger shows, so there is
+    one session and no energy is counted twice.
+
+    Allowed difference (D-50, D-57): Paul's connection is added to the Unknown session
+    through the live reset rule (4.0 kWh in one session for Unknown 3.5 + Paul 2.0).
+    """
+    rig = Rig(hass, freezer, hass_storage)
+    await _open_access_session(rig)
     if intr == "none":
         await _paul_plugs_in_after_unknown(rig)
     else:
-        await restart(during=_paul_plugs_in_after_unknown_while_down)(rig)
+        await _restart_in(intr, _paul_plugs_in_after_unknown_while_down)(rig)
     await rig.goto("10:55:00")
     await rig.set(energy=2.0)
     await rig.set(power=0)
     await rig.goto("11:05:00")
     await rig.unplug()
 
-    unknown = 3.5 if intr == "none" else 3.0
-    assert _summary(rig) == [
-        ("Unknown", unknown, unknown * 2.5, None, unknown),
-        ("Paul", 2.0, 5.0, None, 2.0),
-    ]
+    if intr == "none":
+        assert _summary(rig) == [
+            ("Unknown", 3.5, 8.75, None, 3.5),
+            ("Paul", 2.0, 5.0, None, 2.0),
+        ]
+    else:
+        assert _summary(rig) == [("Unknown", 4.0, 10.0, None, 4.0)]
+        assert len(rig.started) == 1
+
+
+@pytest.mark.parametrize("intr", ["reload", *LATE_ORDERS])
+async def test_rt20_card_after_power_in_the_same_connection(
+    hass, hass_storage, freezer, intr
+) -> None:
+    """RT-20 (D-50): power beat the card at the plug-in, so the session has no card and
+    the card shows a moment later in the same connection. Any interruption resumes it:
+    one session with the whole 5.0 kWh, as on main."""
+    rig = Rig(hass, freezer, hass_storage)
+    await _open_access_session(rig, card_after_power=True)
+    if intr == "reload":
+        await reload(rig)
+    elif intr != "none":
+        await _restart_in(intr)(rig)
+    await rig.goto("10:55:00")
+    await rig.set(energy=5.0)
+    await rig.set(power=0)
+    await rig.goto("11:05:00")
+    await rig.unplug()
+
+    assert _summary(rig) == [("Unknown", 5.0, 12.5, None, 5.0)]
+    assert len(rig.started) == 1
+
+
+@pytest.mark.parametrize("intr", ["restart-present", "restart-late-field"])
+async def test_d50_split_session_is_flagged_reconstructed(hass, hass_storage, freezer, intr):
+    """D-50: the session started for the other card at recovery is flagged
+    ``reconstructed`` and ``data_gap``; the snapshot's session as every reconstruction."""
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_h(rig, _restart_in(intr, _swap_users_while_down))
+    assert [(ev.data["user_name"], ev.data["reconstructed"], ev.data["data_gap"])
+            for ev in rig.completed] == [("Paul", True, True), ("Gaest", True, True)]  # fmt: skip
 
 
 async def _tick(rig: Rig, seconds: int) -> None:
@@ -534,11 +594,6 @@ async def scenario_u(
         else:
             await restart("late", during=during, order=order)(rig)
     await rig.goto("10:46:00")
-
-
-LATE_ORDERS = {"none": None, "restart-present": None, **{
-    "restart-late-field": FIELD_ORDER, "restart-late-pluglast": PLUG_LAST,
-}}  # fmt: skip
 
 
 @pytest.mark.parametrize("intr", list(LATE_ORDERS))

@@ -664,11 +664,13 @@ class PlugAnchoredSessionEngine:
 
         saved_energy = float(snapshot.get("energy_kwh", 0.0))
         card = self._present_card_index()
+        snapshot_card = snapshot.get("rfid_index")
         # PRELIMINARY P-2 (spec 027 § 10): the card value does not change within one
         # connection, so a different card means a new connection. No card is no
-        # evidence (spec 027 § 4.6).
-        if card is not None and card != snapshot.get("rfid_index"):
-            # Spec 027 D-44: the counter belongs to the new connection, so the old
+        # evidence (spec 027 § 4.6), and neither is a card on a snapshot without one:
+        # "no card, then a card" is the normal order of authorisation (D-50).
+        if snapshot_card is not None and card is not None and card != snapshot_card:
+            # Spec 027 D-50: the counter belongs to the new connection, so the old
             # session keeps its snapshot energy and the new one takes the whole counter.
             await self._complete_snapshot_as_session(snapshot, saved_energy, now)
             if self._debug_logger:
@@ -680,7 +682,7 @@ class PlugAnchoredSessionEngine:
             self._state = SessionEngineState.TRACKING
             # PRELIMINARY P-1 (spec 027 § 10): with the cable in, the counter is the
             # energy of the current connection.
-            await self._async_start_session(energy_start_kwh=0.0)
+            await self._async_start_session(energy_start_kwh=0.0, reconstructed=True)
             return
 
         # Cable still in — resume the session (FR-026). A counter below the
@@ -2391,6 +2393,7 @@ class PlugAnchoredSessionEngine:
         connected_at: datetime | None = None,
         reason: UnknownReason | None = None,
         energy_start_kwh: float | None = None,
+        reconstructed: bool = False,
     ) -> None:
         """Create a new session on plug-on event — INITIALIZING state.
 
@@ -2405,8 +2408,10 @@ class PlugAnchoredSessionEngine:
                 UnknownReason.OPEN_ACCESS_INFERRED instead of the default
                 UnknownReason.TRX_NULL when trx is null but power flow started.
             energy_start_kwh: Counter baseline; None takes the reading now. Spec 027
-                D-44/D-46 pass 0.0 for a connection that began before start-up, and
+                D-50/D-51 pass 0.0 for a connection that began before start-up, and
                 the session then holds the whole counter at once.
+            reconstructed: the plug-in was not observed (spec 027 D-50/D-51); the
+                session is flagged ``reconstructed`` and ``data_gap``.
         """
         # Idempotency guard: a late-arriving scheduled task (e.g. from trx-resolve
         # callback) must abort if the engine has moved on between task scheduling
@@ -2483,7 +2488,9 @@ class PlugAnchoredSessionEngine:
 
             # Reset window tracker for this session
             self._window_tracker = ChargingWindowTracker()
-            self._data_gap = False
+            self._data_gap = reconstructed
+            self._active_session.reconstructed = reconstructed
+            self._active_session.data_gap = reconstructed
             self._eto_start = self._get_eto()
             # Spec 027 D-41: stored at start so an interruption cannot lose it.
             self._active_session.charger_total_before_kwh = self._eto_start

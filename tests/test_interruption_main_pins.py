@@ -17,6 +17,35 @@ def _summary(rig: Rig) -> list[tuple]:
     ]
 
 
+async def test_pin_main_card_after_power_then_reload(hass, hass_storage, freezer) -> None:
+    """Finding A: power beat the card at the plug-in (an Unknown session), the card
+    shows a moment later, and an options save reloads the entry. The first version
+    split the session and counted the connection twice (8.0 kWh); main records one
+    session with 5.0 kWh."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.set(plug="on", lock="Locked")
+    await rig.set(power=7000)
+    await rig.set(trx=TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:22:00")
+    await reload(rig)
+    await rig.goto("10:55:00")
+    await rig.set(energy=5.0)
+    await rig.goto("10:56:00")
+    await rig.set(power=0)
+    await rig.goto("11:05:00")
+    await rig.unplug()
+    await rig.goto("11:06:00")
+
+    assert _summary(rig) == [("Unknown", 5.0, 12.5, None, 5.0)]
+    assert len(rig.started) == 1
+
+
 async def test_pin_main_rfid_entity_invalid_while_another_user_charges(
     hass, hass_storage, freezer
 ) -> None:

@@ -592,59 +592,41 @@ async def test_options_flow_pr23_out_of_range_value_rejected(
 async def test_options_flow_pr23_ui_dispatch_interval_1_to_9_rejected(
     hass: HomeAssistant,
 ) -> None:
-    """T008-f: ui_dispatch_interval_s values 1-9 are rejected by the two-band validator.
+    """T008-f: ui_dispatch_interval_s accepts 0 or 10..300; 1-9 re-shows init with an error.
 
-    The spec (IC-3) allows 0 (disable) or 10..300 (active range). Values 1-9 are
-    rejected because they would create excessive UI fan-out.
-
-    Verifies: 0 accepted, 10 accepted, 300 accepted, 5 rejected.
+    The band check runs in the step handler (see config_flow.OptionsFlowHandler.
+    async_step_init). A rejected value must save nothing, stay on init and keep the
+    user's submitted values in the re-shown form.
     """
-    import voluptuous as vol
-
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
     await setup_session_engine(hass, entry)
 
-    result = await hass.config_entries.options.async_init(entry.entry_id)
-    schema = result["data_schema"]
+    for accepted in (0, 10, 300):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_UI_DISPATCH_INTERVAL_S: accepted}
+        )
+        assert result["step_id"] == "pricing", f"ui_dispatch_interval_s={accepted} must pass"
+        hass.config_entries.options.async_abort(result["flow_id"])
 
-    base_input = {
-        CONF_MIN_SESSION_DURATION_S: DEFAULT_MIN_SESSION_DURATION_S,
-        CONF_MIN_SESSION_ENERGY_WH: DEFAULT_MIN_SESSION_ENERGY_WH,
-        CONF_PERSISTENCE_INTERVAL_S: DEFAULT_PERSISTENCE_INTERVAL_S,
-        CONF_MAX_STORED_SESSIONS: DEFAULT_MAX_STORED_SESSIONS,
-    }
-
-    # Accepted: 0 (disable sentinel)
-    try:
-        schema({**base_input, CONF_UI_DISPATCH_INTERVAL_S: 0})
-        accepted_0 = True
-    except vol.Invalid:
-        accepted_0 = False
-    assert accepted_0, "ui_dispatch_interval_s=0 must be accepted (disable sentinel)"
-
-    # Accepted: 10 (lower bound of active range)
-    try:
-        schema({**base_input, CONF_UI_DISPATCH_INTERVAL_S: 10})
-        accepted_10 = True
-    except vol.Invalid:
-        accepted_10 = False
-    assert accepted_10, "ui_dispatch_interval_s=10 must be accepted (active range lower bound)"
-
-    # Accepted: 300 (upper bound of active range)
-    try:
-        schema({**base_input, CONF_UI_DISPATCH_INTERVAL_S: 300})
-        accepted_300 = True
-    except vol.Invalid:
-        accepted_300 = False
-    assert accepted_300, "ui_dispatch_interval_s=300 must be accepted (active range upper bound)"
-
-    # Rejected: 5 (in gap between 0 and 10)
-    try:
-        schema({**base_input, CONF_UI_DISPATCH_INTERVAL_S: 5})
-        rejected_5 = False
-    except vol.Invalid:
-        rejected_5 = True
-    assert rejected_5, "ui_dispatch_interval_s=5 must be rejected (gap 1-9 is invalid per IC-3)"
+    for rejected in (1, 5, 9):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {CONF_MIN_SESSION_DURATION_S: 123, CONF_UI_DISPATCH_INTERVAL_S: rejected},
+        )
+        assert result["type"] == "form"
+        assert result["step_id"] == "init"
+        assert result["errors"] == {CONF_UI_DISPATCH_INTERVAL_S: "ui_dispatch_interval_invalid"}
+        defaults = {
+            str(k): k.default()
+            for k in result["data_schema"].schema
+            if hasattr(k, "default") and callable(k.default)
+        }
+        assert defaults[CONF_UI_DISPATCH_INTERVAL_S] == rejected
+        assert defaults[CONF_MIN_SESSION_DURATION_S] == 123
+        assert CONF_UI_DISPATCH_INTERVAL_S not in entry.options
+        hass.config_entries.options.async_abort(result["flow_id"])
 
 
 # ---------------------------------------------------------------------------

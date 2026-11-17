@@ -144,7 +144,8 @@
         },
         "error": {
             "entity_not_found": "Entity not found in Home Assistant. Check the entity ID and try again.",
-            "entity_invalid": "Entity exists but has a non-numeric state. A spot price sensor must report a number."
+            "entity_invalid": "Entity exists but has a non-numeric state. A spot price sensor must report a number.",
+            "ui_dispatch_interval_invalid": "UI update interval must be 0 (disabled) or between 10 and 300 seconds."
         }
     },
     "entity": {

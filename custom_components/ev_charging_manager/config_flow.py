@@ -488,21 +488,6 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
 # ---------------------------------------------------------------------------
 
 
-def _validate_ui_dispatch(value: int) -> int:
-    """Validate ui_dispatch_interval_s: accept 0 (disable) or 10..300 (active range).
-
-    Values 1-9 are rejected because they would create excessive UI fan-out (IC-3).
-    """
-    if value == 0:
-        return 0
-    if UI_DISPATCH_INTERVAL_S_ACTIVE_MIN <= value <= UI_DISPATCH_INTERVAL_S_MAX:
-        return value
-    raise vol.Invalid(
-        f"ui_dispatch_interval_s must be 0 (disabled) or "
-        f"{UI_DISPATCH_INTERVAL_S_ACTIVE_MIN}..{UI_DISPATCH_INTERVAL_S_MAX}"
-    )
-
-
 class OptionsFlowHandler(OptionsFlow):
     """Handle EV Charging Manager options."""
 
@@ -512,7 +497,15 @@ class OptionsFlowHandler(OptionsFlow):
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Manage the options — session thresholds."""
-        if user_input is not None:
+        errors: dict[str, str] = {}
+        # Values 1-9 would create excessive UI fan-out (IC-3); 0 disables. The band
+        # check lives here, not in the schema: HA serializes every form schema for
+        # the frontend and a plain-function validator makes that raise (HTTP 500).
+        if user_input is not None and (
+            0 < user_input[CONF_UI_DISPATCH_INTERVAL_S] < UI_DISPATCH_INTERVAL_S_ACTIVE_MIN
+        ):
+            errors[CONF_UI_DISPATCH_INTERVAL_S] = "ui_dispatch_interval_invalid"
+        elif user_input is not None:
             # Store thresholds and proceed to pricing step.
             # Explicitly write None for absent observation-slot keys so that
             # migration sees conf_key in entry.options and skips re-filling a
@@ -533,7 +526,7 @@ class OptionsFlowHandler(OptionsFlow):
             self._new_options.setdefault(CONF_NOTIFY_UNMAPPED_RFID, DEFAULT_NOTIFY_UNMAPPED_RFID)
             return await self.async_step_pricing()
 
-        opts = self.config_entry.options
+        opts = user_input if errors else self.config_entry.options
         schema = vol.Schema(
             {
                 vol.Optional(
@@ -635,7 +628,6 @@ class OptionsFlowHandler(OptionsFlow):
                         )
                     ),
                     vol.Coerce(int),
-                    _validate_ui_dispatch,
                 ),
                 vol.Optional(
                     CONF_NOTIFY_UNMAPPED_RFID,
@@ -670,7 +662,7 @@ class OptionsFlowHandler(OptionsFlow):
             }
         )
 
-        return self.async_show_form(step_id="init", data_schema=schema)
+        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
 
     async def async_step_pricing(
         self, user_input: dict[str, Any] | None = None

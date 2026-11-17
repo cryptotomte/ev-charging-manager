@@ -126,7 +126,8 @@
         },
         "error": {
             "entity_not_found": "Entiteten hittades inte i Home Assistant. Kontrollera entitets-ID och försök igen.",
-            "entity_invalid": "Entiteten finns men har ett icke-numeriskt tillstånd. En spotprisenhet måste rapportera ett tal."
+            "entity_invalid": "Entiteten finns men har ett icke-numeriskt tillstånd. En spotprisenhet måste rapportera ett tal.",
+            "ui_dispatch_interval_invalid": "UI-uppdateringsintervallet måste vara 0 (av) eller mellan 10 och 300 sekunder."
         }
     },
     "entity": {

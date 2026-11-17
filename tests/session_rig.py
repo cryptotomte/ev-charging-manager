@@ -54,8 +54,9 @@ NAMES = {
     "spot": SPOT,
 }
 CHARGER = [PLUG, LOCK, TRX, ENERGY, POWER, CAR, ETO]
-# The order in which the charger's entities became valid at three restarts in the
-# owner's log (spec 027 § 2.4, § 13.1): this integration is set up first.
+# Plug first, energy last: the start order in which the plug decides while the energy
+# value is not yet valid (spec 027 D-49). Not the order of the owner's log, where the
+# energy value came with the plug (§ 13.1); this integration is set up first in both.
 FIELD_ORDER = ["plug", "lock", "trx", "power", "energy", "car", "eto"]
 PLUG_LAST = ["energy", "power", "trx", "lock", "car", "eto", "plug"]
 DAY = "2026-11-17"
@@ -361,7 +362,9 @@ def restart(
         default ``FIELD_ORDER``).
     during: runs while the integration is down (time passes, the charger changes).
     absent: which entities are absent for "late" (default: all charger entities).
-    spot_late: the spot price entity is absent at setup as well and appears last.
+    spot_late: the spot price entity is absent (or, with ``unavailable``, unavailable) at
+        setup as well. With the default ``order`` it appears after the charger's entities;
+        an ``order`` without "spot" leaves it absent.
     unavailable: the late entities read "unavailable" at setup instead of being absent
         (restored from the entity registry before their integration has loaded).
     """

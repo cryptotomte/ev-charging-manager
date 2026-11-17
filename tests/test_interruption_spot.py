@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from tests.session_rig import (
+    B_TRUTH,
     ETO,
     INTERRUPTIONS,
     LOCK,
@@ -22,63 +23,9 @@ from tests.session_rig import (
     finish_while_down,
     reload,
     restart,
+    scenario_b,
     scenario_f,
 )
-
-# Scenario B uninterrupted: 4.0 kWh @1.0 + 3.0 kWh @2.0 + 2.0 kWh @3.0.
-B_DETAILS = [("10:00", 4.0, 1.0, False), ("11:00", 3.0, 2.0, False), ("12:00", 2.0, 3.0, False)]
-B_TRUTH = {
-    "user": "Paul",
-    "energy": 9.0,
-    "cost": 16.0,
-    "charge_price": None,
-    "charge_method": None,
-    "record_energy": 9.0,
-    "record_cost": 16.0,
-    "record_charge_price": None,
-    "details_kwh": 9.0,
-    "details": B_DETAILS,
-}
-
-
-async def scenario_b(rig: Rig, trx: str, at: dict[str, Interruption]) -> None:
-    """Spot charge across two hour boundaries, 10:06–12:21 (research 027 scenario B)."""
-    await rig.setup()
-    await rig.goto("10:06:00")
-    await rig.plug_in(trx)
-    await rig.goto("10:30:00")
-    await rig.set(energy=3.0)
-    await rig.goto("10:40:00")
-    if "h1" in at:
-        await at["h1"](rig)
-    await rig.goto("10:50:00")
-    if "span" in at:
-        await at["span"](rig)
-    await rig.goto("10:55:00")
-    await rig.set(energy=4.0)
-    await rig.goto("10:59:00")
-    await rig.set(spot=2.0)
-    await rig.goto("11:30:00")
-    await rig.set(energy=6.0)
-    await rig.goto("11:40:00")
-    if "h2" in at:
-        await at["h2"](rig)
-    await rig.goto("11:55:00")
-    await rig.set(energy=7.0)
-    await rig.goto("11:59:00")
-    await rig.set(spot=3.0)
-    await rig.goto("12:10:00")
-    await rig.set(energy=8.0)
-    await rig.goto("12:15:00")
-    if "final" in at:
-        await at["final"](rig)
-    await rig.goto("12:20:00")
-    await rig.set(energy=9.0)
-    await rig.goto("12:21:00")
-    await rig.set(power=0)
-    await rig.goto("12:30:00")
-    await rig.unplug()
-    await rig.goto("12:31:00")
 
 
 async def _down_across_one_boundary(rig: Rig) -> None:

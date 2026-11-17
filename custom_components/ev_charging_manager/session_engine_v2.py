@@ -1070,8 +1070,9 @@ class PlugAnchoredSessionEngine:
         """Restore what the session started with from the snapshot's ``resume_state``.
 
         Spec 027 D-36 (pricing), D-39 (spot hour), D-40 (guest rate), D-41 (charger
-        total). An absent ``resume_state`` or part falls back per D-45; a malformed part
-        also logs a warning.
+        total). A snapshot written by 0.4.7 has no ``resume_state`` and takes the
+        fallbacks of D-45; a ``resume_state`` with a missing or malformed part takes
+        the same fallback for that part and logs a warning (RT-31).
         """
         state = snapshot.get("resume_state")
         if state is not None and not isinstance(state, dict):
@@ -1082,47 +1083,52 @@ class PlugAnchoredSessionEngine:
                 state,
             )
             state = None
+        written_by_047 = state is None
         state = state or {}
 
-        def malformed(part: str) -> None:
-            _LOGGER.warning(
-                "PlugAnchoredSessionEngine: resume_state.%s of snapshot id=%s is malformed "
-                "(%r) — using the fallback of spec 027 D-45",
-                part,
-                session.id,
-                state[part],
-            )
+        def fallback(part: str) -> None:
+            if not written_by_047:
+                _LOGGER.warning(
+                    "PlugAnchoredSessionEngine: resume_state.%s of snapshot id=%s is "
+                    "missing or malformed (%r) — using the fallback of spec 027 D-45",
+                    part,
+                    session.id,
+                    state.get(part),
+                )
 
         pricing = state.get("pricing")
-        if pricing is not None:
-            mode = pricing.get("mode") if isinstance(pricing, dict) else None
-            spot_keys = (
-                CONF_SPOT_ADDITIONAL_COST_KWH,
-                CONF_SPOT_VAT_MULTIPLIER,
-                CONF_SPOT_FALLBACK_PRICE_KWH,
-            )
-            if not (
-                (mode == "static" and _is_number(pricing.get(CONF_STATIC_PRICE_KWH)))
-                or (
-                    mode == "spot"
-                    and isinstance(pricing.get(CONF_SPOT_PRICE_ENTITY), str)
-                    and all(_is_number(pricing.get(key)) for key in spot_keys)
-                )
-            ):
-                malformed("pricing")
-                pricing = None
-        self._apply_pricing(dict(pricing) if pricing else self._entry_pricing_params())
+        mode = pricing.get("mode") if isinstance(pricing, dict) else None
+        spot_keys = (
+            CONF_SPOT_ADDITIONAL_COST_KWH,
+            CONF_SPOT_VAT_MULTIPLIER,
+            CONF_SPOT_FALLBACK_PRICE_KWH,
+        )
+        if (mode == "static" and _is_number(pricing.get(CONF_STATIC_PRICE_KWH))) or (
+            mode == "spot"
+            and isinstance(pricing.get(CONF_SPOT_PRICE_ENTITY), str)
+            and all(_is_number(pricing.get(key)) for key in spot_keys)
+        ):
+            self._apply_pricing(dict(pricing))
+        else:
+            fallback("pricing")
+            self._apply_pricing(self._entry_pricing_params())
 
         guest: GuestPricing | None = None
         raw_guest = state.get("guest_pricing")
-        if raw_guest is not None:
-            method = raw_guest.get("method") if isinstance(raw_guest, dict) else None
-            if (method == "fixed" and _is_number(raw_guest.get("price_per_kwh"))) or (
-                method == "markup" and _is_number(raw_guest.get("markup_factor"))
-            ):
-                guest = GuestPricing.from_dict(raw_guest)
-            else:
-                malformed("guest_pricing")
+        method = raw_guest.get("method") if isinstance(raw_guest, dict) else None
+        if (method == "fixed" and _is_number(raw_guest.get("price_per_kwh"))) or (
+            method == "markup" and _is_number(raw_guest.get("markup_factor"))
+        ):
+            guest = GuestPricing.from_dict(raw_guest)
+        elif raw_guest is not None or "guest_pricing" not in state:
+            fallback("guest_pricing")
+            # Spec 027 D-45: look the card up again; its rate counts only while the
+            # card still names the same guest.
+            index = session.rfid_index
+            if isinstance(index, int):
+                resolution = RfidLookup(self._config_store.data).resolve(index + 1)
+                if resolution.user_name == session.user_name and resolution.guest_pricing:
+                    guest = GuestPricing.from_dict(resolution.guest_pricing)
         self._guest_pricing = guest
         session.charge_price_method = guest.method if guest is not None else None
 
@@ -1132,19 +1138,16 @@ class PlugAnchoredSessionEngine:
                 detail.get("kwh", 0.0) for detail in session.price_details or []
             )
             spot_hour = state.get("spot_hour")
-            if spot_hour is not None:
-                try:
-                    datetime.fromisoformat(spot_hour["start"])
-                    valid = spot_hour["price"] is None or _is_number(spot_hour["price"])
-                except (KeyError, TypeError, ValueError):
-                    valid = False
-                if not valid:
-                    malformed("spot_hour")
-                    spot_hour = None
-            if spot_hour is not None:
+            try:
+                datetime.fromisoformat(spot_hour["start"])
+                valid = spot_hour["price"] is None or _is_number(spot_hour["price"])
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            if valid:
                 self._hour_start_time = spot_hour["start"]
                 self._current_hour_price = spot_hour["price"]
             else:
+                fallback("spot_hour")
                 self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
                 self._capture_hour_price()
 

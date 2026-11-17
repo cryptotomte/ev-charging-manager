@@ -93,16 +93,34 @@
                     "min_session_energy_wh": "Minsta sessionsenergi (Wh)",
                     "persistence_interval_s": "Intervall för autosparning (sekunder)",
                     "max_stored_sessions": "Maximalt antal lagrade sessioner",
+                    "eto_entity": "Laddarens totala energimätare",
+                    "plug_entity": "Binär sensor för ansluten kabel",
+                    "cable_lock_entity": "Sensor för kabellås",
+                    "model_status_entity": "Laddarens modellstatussensor",
+                    "error_entity": "Laddarens felsensor",
+                    "charging_idle_timeout_min": "Tidsgräns för laddningsuppehåll (minuter)",
+                    "disconnect_grace_min": "Väntetid vid frånkoppling (minuter)",
+                    "notify_unmapped_rfid": "Avisera om okopplade RFID-taggar",
                     "heartbeat_log_interval_min": "Heartbeat i loggen (minuter, 0 = av)",
-                    "ui_dispatch_interval_s": "UI-uppdateringsintervall (sekunder, 0 = av)"
+                    "ui_dispatch_interval_s": "UI-uppdateringsintervall (sekunder, 0 = av)",
+                    "debug_logging": "Aktivera felsökningslogg"
                 },
                 "data_description": {
                     "min_session_duration_s": "Sessioner kortare än detta kasseras som mikrosessioner (0–3600 s, standard 60)",
                     "min_session_energy_wh": "Sessioner med mindre energi än detta kasseras (0–10000 Wh, standard 50)",
                     "persistence_interval_s": "Hur ofta en aktiv session sparas till disk vid HA-omstart (60–3600 s, standard 300)",
                     "max_stored_sessions": "Äldsta sessioner tas bort när denna gräns överskrids (100–10000, standard 1000)",
+                    "eto_entity": "Valfri. Används för att jämföra sessionens uppmätta energi med laddarens totala energimätare vid sessionens start och slut. En varning loggas om avvikelsen är större än 5 %.",
+                    "plug_entity": "Valfri. Binär sensor som rapporterar om kabeln är ansluten (t.ex. binary_sensor.goe_123456_car_0). Används för PLUG_STATE-loggning.",
+                    "cable_lock_entity": "Valfri. Sensor som rapporterar kabellåsets status (t.ex. sensor.goe_123456_cus_value). Används för CABLE_LOCK-loggning.",
+                    "model_status_entity": "Valfri. Sensor som rapporterar laddarens modellstatus (t.ex. sensor.goe_123456_modelstatus_value). Används för MODEL_STATUS-loggning.",
+                    "error_entity": "Valfri. Sensor som rapporterar laddarens felkod (t.ex. sensor.goe_123456_err_value). Används för ERR_STATE-loggning.",
+                    "charging_idle_timeout_min": "Hur länge effekten måste ligga på 0 W innan ett laddfönster stängs (3–30 min, standard 5). Öka värdet för fordon som ofta gör korta laddpauser.",
+                    "disconnect_grace_min": "Hur länge integrationen väntar efter en tillfällig frånkoppling innan sessionen avslutas (5–30 min, standard 10). Gäller bara när kabellåset inte visar Unlocked.",
+                    "notify_unmapped_rfid": "Avisera när laddaren läser en RFID-tagg som inte är kopplad till någon användare i integrationen. Energin från sådana sessioner räknas på användaren ''Unknown''. Stäng bara av om du hanterar sådana luckor med automationer.",
                     "heartbeat_log_interval_min": "Minuter mellan HEARTBEAT-rader i felsökningsloggen under aktiv laddning (0–30, standard 5). Sätt till 0 för att avaktivera.",
-                    "ui_dispatch_interval_s": "Sekunder mellan levande sensoruppdateringar under aktiv laddning (10–300, standard 60). Sätt till 0 för att avaktivera."
+                    "ui_dispatch_interval_s": "Sekunder mellan levande sensoruppdateringar under aktiv laddning (10–300, standard 60). Sätt till 0 för att avaktivera.",
+                    "debug_logging": "Skriv laddhändelser till ev_charging_manager_debug.log i Home Assistants konfigurationskatalog för felsökning. Stäng av när felsökningen är klar."
                 }
             },
             "pricing": {
@@ -156,9 +174,6 @@
             "session_soc_added": {
                 "name": "SoC tillagd"
             },
-            "charging_duration": {
-                "name": "Laddningstid"
-            },
             "status": {
                 "name": "Status",
                 "state": {
@@ -169,6 +184,15 @@
                     "charging": "Laddar",
                     "charged": "Färdigladdad"
                 }
+            },
+            "charging_duration": {
+                "name": "Laddningstid"
+            },
+            "last_session_charging_duration": {
+                "name": "Senaste sessionens laddningstid"
+            },
+            "last_session_connection_duration": {
+                "name": "Senaste sessionens anslutningstid"
             },
             "user_total_energy": {
                 "name": "{user} total energi"
@@ -190,11 +214,22 @@
             },
             "guest_last_charge_price": {
                 "name": "Gästens senaste laddpris"
+            },
+            "guest_total_energy": {
+                "name": "Gästernas totala energi"
+            },
+            "guest_total_cost": {
+                "name": "Gästernas totala kostnad"
             }
         },
         "binary_sensor": {
             "charging": {
                 "name": "Laddar"
+            }
+        },
+        "button": {
+            "clear_debug_log": {
+                "name": "Rensa felsökningslogg"
             }
         }
     },
@@ -285,9 +320,6 @@
                     "data_description": {
                         "name": "Personens namn",
                         "active": "Om denna användare är aktiv. Inaktivering kaskaderar till RFID-kopplingar."
-                    },
-                    "description_placeholders": {
-                        "type": "Användartyp: {type}"
                     }
                 },
                 "reconfigure_guest_pricing": {
@@ -316,15 +348,38 @@
                 "user": "Lägg till RFID-koppling"
             },
             "step": {
-                "user": {
+                "select_card": {
+                    "title": "Upptäckta RFID-kort",
+                    "description": "Följande RFID-kort är programmerade i laddaren. Välj ett kort att koppla till en användare. {last_uid}",
+                    "data": {
+                        "card_index": "Välj kort"
+                    },
+                    "data_description": {
+                        "card_index": "Välj kortet som du vill koppla till en användare"
+                    }
+                },
+                "map_card": {
+                    "title": "Koppla kort till användare",
+                    "description": "Kort #{card_index}: {card_name} ({card_energy}). Koppla kortet till en användare.",
+                    "data": {
+                        "user_id": "Användare",
+                        "vehicle_id": "Fordon (valfritt)"
+                    },
+                    "data_description": {
+                        "user_id": "Användaren som detta RFID-kort är tilldelat",
+                        "vehicle_id": "Fordonet kopplat till detta kort (valfritt)"
+                    }
+                },
+                "manual": {
                     "title": "Lägg till RFID-koppling",
+                    "description": "Välj kortplats och koppla den till en användare. Tips: starta en laddning med kortet och se sedan RFID-indexet under Utvecklarverktyg. {discovery_error}",
                     "data": {
                         "card_index": "Kortplats",
                         "user_id": "Användare",
                         "vehicle_id": "Fordon (valfritt)"
                     },
                     "data_description": {
-                        "card_index": "RFID-kortplatsindex (0–9, motsvarar go-e app plats 1–10)",
+                        "card_index": "RFID-kortplatsens index (0-9, motsvarar laddarens platser 1-10)",
                         "user_id": "Användaren som detta RFID-kort är tilldelat",
                         "vehicle_id": "Fordonet kopplat till detta kort (valfritt, t.ex. för gäster utan bil)"
                     }
@@ -340,15 +395,15 @@
                         "user_id": "Användaren som detta RFID-kort är tilldelat",
                         "vehicle_id": "Fordonet kopplat till detta kort (valfritt)",
                         "active": "Om denna koppling är aktiv"
-                    },
-                    "description_placeholders": {
-                        "card_index": "Kortplats: {card_index}"
                     }
                 }
             },
             "error": {
                 "already_mapped": "Denna kortplats är redan tilldelad en annan användare.",
                 "no_available_slots": "Alla 10 kortplatser (0–9) är redan i bruk."
+            },
+            "abort": {
+                "no_users": "Det finns inga aktiva användare. Lägg till minst en användare innan du skapar RFID-kopplingar."
             }
         }
     }

@@ -280,8 +280,8 @@ class PlugAnchoredSessionEngine:
         # The CAPTURED pair prices the hour when it closes — never a fresh read
         # at the tick (Nordpool-style sensors flip to the new hour's price at
         # the boundary, racing the tick). None price means "unavailable at
-        # capture" → fallback pricing for the whole hour. In-memory only; dies
-        # with the session (resume recaptures).
+        # capture" → fallback pricing for the whole hour. Kept in the snapshot's
+        # resume_state, so a resume in the same hour keeps it (spec 027 D-39).
         self._current_hour_price: float | None = None
         # Spec 027 D-39: a resume found the stored hour passed but had no counter
         # reading yet; the first reading closes the stored hour.
@@ -1575,9 +1575,9 @@ class PlugAnchoredSessionEngine:
             # Already completing — ignore
             return
 
-        # Spec 027 D-43: while a recovery waits for the RFID entity, the recovery decides
-        # what this cable is; a session started here (e.g. by power during an RFID wait)
-        # would be overwritten by it. The timeout path hands the plug back afterwards.
+        # Spec 027 D-43: while a recovery is deferred, the recovery decides what this
+        # cable is; a session started here (e.g. by power during an RFID wait) would be
+        # overwritten by it. The timeout path hands the plug back afterwards (§ 12, X-3).
         if self._deferred_recovery_unsub is not None:
             return
 
@@ -2241,8 +2241,9 @@ class PlugAnchoredSessionEngine:
     def _recompute_derived(self, session: Session) -> None:
         """Recompute cost, guest charge price and SoC from the session's energy.
 
-        Spec 027 D-37: runs on every energy update, at the end of a resume and before
-        every completion, so no stored value is older than the energy it belongs to.
+        Spec 027 D-37: runs on every energy update, at the end of a resume and when a
+        snapshot is completed, so no stored value is older than the energy it belongs
+        to; a live session is therefore current when it completes.
         """
         # Mode-aware cost update
         if self._pricing.mode == "static":

@@ -9,6 +9,7 @@ from custom_components.ev_charging_manager.const import (
     CONF_CABLE_LOCK_ENTITY,
     CONF_DEBUG_LOGGING,
     CONF_ERROR_ENTITY,
+    CONF_ETO_ENTITY,
     CONF_HEARTBEAT_LOG_INTERVAL_MIN,
     CONF_MAX_STORED_SESSIONS,
     CONF_MIN_SESSION_DURATION_S,
@@ -22,6 +23,7 @@ from custom_components.ev_charging_manager.const import (
     CONF_SPOT_PRICE_ENTITY,
     CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
+    CONF_TOTAL_ENERGY_ENTITY,
     CONF_UI_DISPATCH_INTERVAL_S,
     DEFAULT_MAX_STORED_SESSIONS,
     DEFAULT_MIN_SESSION_DURATION_S,
@@ -766,3 +768,62 @@ async def test_options_flow_tolerates_stale_rfid_grace_seconds_key(
     assert refreshed.state.value == "loaded", (
         f"Entry must be in 'loaded' state, got: {refreshed.state.value!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Spec 026 D-18, D-19: saving the options form
+# ---------------------------------------------------------------------------
+
+
+async def _save_options(hass: HomeAssistant, entry: MockConfigEntry, init_input: dict) -> None:
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(result["flow_id"], init_input)
+    assert result["step_id"] == "pricing"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: DEFAULT_STATIC_PRICE_KWH},
+    )
+    assert result["type"] == "create_entry"
+    await hass.async_block_till_done()
+
+
+async def test_options_clearing_eto_survives_reload(hass: HomeAssistant) -> None:
+    """T-46: a cleared ETO field is stored as None and not re-seeded by the reload."""
+    eto = "sensor.charger_total_energy"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, CONF_TOTAL_ENERGY_ENTITY: eto},
+        title="Test Charger",
+    )
+    await setup_session_engine(hass, entry)
+    assert entry.options[CONF_ETO_ENTITY] == eto
+
+    await _save_options(hass, entry, {CONF_MIN_SESSION_DURATION_S: 60})
+
+    assert CONF_ETO_ENTITY in entry.options
+    assert entry.options[CONF_ETO_ENTITY] is None
+
+
+async def test_options_save_keeps_keys_the_form_does_not_own(hass: HomeAssistant) -> None:
+    """T-47: promote_* and unknown keys survive; form keys take the submitted values."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={
+            "promote_duration_s": 30,
+            "promote_energy_kwh": 0.2,
+            "some_future_key": "kept",
+            CONF_MIN_SESSION_DURATION_S: 60,
+            CONF_PLUG_ENTITY: "binary_sensor.goe_abc123_car_0",
+        },
+        title="Test Charger",
+    )
+    await setup_session_engine(hass, entry)
+
+    await _save_options(hass, entry, {CONF_MIN_SESSION_DURATION_S: 120})
+
+    assert entry.options["promote_duration_s"] == 30
+    assert entry.options["promote_energy_kwh"] == 0.2
+    assert entry.options["some_future_key"] == "kept"
+    assert entry.options[CONF_MIN_SESSION_DURATION_S] == 120
+    assert entry.options[CONF_PLUG_ENTITY] is None

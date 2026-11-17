@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from unittest.mock import patch
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -12,12 +13,19 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.ev_charging_manager.const import (
     CONF_CABLE_LOCK_ENTITY,
     CONF_ERROR_ENTITY,
+    CONF_ETO_ENTITY,
     CONF_MODEL_STATUS_ENTITY,
     CONF_PLUG_ENTITY,
+    CONF_TOTAL_ENERGY_ENTITY,
     DOMAIN,
 )
 
-from .conftest import MOCK_CHARGER_DATA, setup_entry_with_subentries
+from .conftest import (
+    MOCK_CHARGER_DATA,
+    setup_entry_with_subentries,
+    setup_session_engine,
+    start_charging_session,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -820,3 +828,69 @@ async def test_mig_06_missing_serial_slots_unset(
     assert any(
         "charger serial missing" in r.message or "skipped" in r.message for r in caplog.records
     ), "Expected warning about missing charger serial"
+
+
+# ---------------------------------------------------------------------------
+# Spec 026 D-18: eto_entity seeded from the total-energy entity of first setup
+# ---------------------------------------------------------------------------
+
+_ETO = "sensor.charger_total_energy"
+
+
+async def test_eto_seeded_from_total_energy_entity(hass: HomeAssistant) -> None:
+    """T-43: the option is written at setup and the engine reads the entity."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, CONF_TOTAL_ENERGY_ENTITY: _ETO},
+        options={"min_session_duration_s": 0, "min_session_energy_wh": 0},
+        title="Test Charger",
+    )
+    hass.states.async_set(_ETO, "100.0")
+    await setup_session_engine(hass, entry)
+
+    assert entry.options[CONF_ETO_ENTITY] == _ETO
+    await start_charging_session(hass, trx_value="2")
+    assert hass.data[DOMAIN][entry.entry_id]["session_engine"]._eto_start == 100.0
+
+
+@pytest.mark.parametrize(
+    ("total_energy_entity", "options", "expected"),
+    [
+        (_ETO, {CONF_ETO_ENTITY: None}, {CONF_ETO_ENTITY: None}),
+        (None, {}, {}),
+    ],
+)
+async def test_eto_not_seeded(
+    hass: HomeAssistant, total_energy_entity, options: dict, expected: dict
+) -> None:
+    """T-44: a present option (even None) is kept; no total-energy entity adds no key."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, CONF_TOTAL_ENERGY_ENTITY: total_energy_entity},
+        options=options,
+        title="Test Charger",
+    )
+    await setup_entry_with_subentries(hass, entry)
+
+    assert dict(entry.options) == expected
+
+
+async def test_eto_seed_runs_once(hass: HomeAssistant) -> None:
+    """T-45: the second setup writes nothing."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, CONF_TOTAL_ENERGY_ENTITY: _ETO},
+        title="Test Charger",
+    )
+    await setup_entry_with_subentries(hass, entry)
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch.object(
+        hass.config_entries, "async_update_entry", wraps=hass.config_entries.async_update_entry
+    ) as update:
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    update.assert_not_called()
+    assert entry.options[CONF_ETO_ENTITY] == _ETO

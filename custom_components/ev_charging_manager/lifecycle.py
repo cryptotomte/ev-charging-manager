@@ -13,8 +13,10 @@ from .const import (
     CONF_CHARGER_PROFILE,
     CONF_CHARGER_SERIAL,
     CONF_ERROR_ENTITY,
+    CONF_ETO_ENTITY,
     CONF_MODEL_STATUS_ENTITY,
     CONF_PLUG_ENTITY,
+    CONF_TOTAL_ENERGY_ENTITY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,8 +41,11 @@ async def async_migrate_observation_slots(
     untouched once it has been set.  This makes the function idempotent:
     calling it twice on the same entry produces the same result.
 
-    For profiles without observation-entity patterns (e.g. 'generic') this
-    function is a no-op.
+    For profiles without observation-entity patterns (e.g. 'generic') no slot
+    is filled.
+
+    Also seeds eto_entity from the total-energy entity chosen at first setup,
+    under the same "only when absent" rule (spec 026 D-18).
     """
     profile_key = entry.data.get(CONF_CHARGER_PROFILE, "")
     profile = CHARGER_PROFILES.get(profile_key, {})
@@ -64,6 +69,10 @@ async def async_migrate_observation_slots(
             continue
         resolved = pattern.replace("{serial}", serial)
         new_options[conf_key] = resolved
+
+    total_energy_entity = entry.data.get(CONF_TOTAL_ENERGY_ENTITY)
+    if CONF_ETO_ENTITY not in entry.options and total_energy_entity:
+        new_options[CONF_ETO_ENTITY] = total_energy_entity
 
     if new_options:
         merged = {**entry.options, **new_options}

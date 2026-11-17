@@ -506,12 +506,16 @@ class OptionsFlowHandler(OptionsFlow):
             if 0 < user_input[CONF_UI_DISPATCH_INTERVAL_S] < UI_DISPATCH_INTERVAL_S_ACTIVE_MIN:
                 errors[CONF_UI_DISPATCH_INTERVAL_S] = "ui_dispatch_interval_invalid"
             else:
-                # Store thresholds and proceed to pricing step.
-                # Explicitly write None for absent observation-slot keys so that
+                # Store thresholds and proceed to pricing step. Keys the form
+                # does not show (promote_*, read by the legacy engine) survive
+                # the save (D-19); every form key is overwritten, because the
+                # optional fields without a default are written below.
+                self._new_options = {**self.config_entry.options, **user_input}
+                # Explicitly write None for absent entity keys so that the setup
                 # migration sees conf_key in entry.options and skips re-filling a
-                # slot the user deliberately cleared.
-                self._new_options = dict(user_input)
+                # field the user deliberately cleared (D-18 for eto_entity).
                 for conf_key in (
+                    CONF_ETO_ENTITY,
                     CONF_PLUG_ENTITY,
                     CONF_CABLE_LOCK_ENTITY,
                     CONF_MODEL_STATUS_ENTITY,

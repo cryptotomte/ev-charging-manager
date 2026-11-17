@@ -17,6 +17,7 @@ from homeassistant.config_entries import SOURCE_USER
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.json import json_bytes
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ev_charging_manager.const import (
@@ -50,7 +51,11 @@ from .conftest import MOCK_CHARGER_DATA, setup_entry_with_subentries, setup_sess
 def _assert_serializable(result: dict, step_id: str) -> None:
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == step_id
-    voluptuous_serialize.convert(result["data_schema"], custom_serializer=cv.custom_serializer)
+    converted = voluptuous_serialize.convert(
+        result["data_schema"], custom_serializer=cv.custom_serializer
+    )
+    # HomeAssistantView.json encodes the response with json_bytes.
+    json_bytes(converted)
 
 
 def _subentry_id(hass: HomeAssistant, entry_id: str, subentry_type: str, name: str) -> str:

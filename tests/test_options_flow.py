@@ -625,8 +625,53 @@ async def test_options_flow_pr23_ui_dispatch_interval_1_to_9_rejected(
         }
         assert defaults[CONF_UI_DISPATCH_INTERVAL_S] == rejected
         assert defaults[CONF_MIN_SESSION_DURATION_S] == 123
-        assert CONF_UI_DISPATCH_INTERVAL_S not in entry.options
         hass.config_entries.options.async_abort(result["flow_id"])
+
+
+async def test_options_flow_ui_dispatch_interval_rejected_then_corrected_saves(
+    hass: HomeAssistant,
+) -> None:
+    """A rejected ui_dispatch_interval_s is corrected in the same flow; only the fix is saved."""
+    stored_plug = "binary_sensor.stored_plug"
+    submitted_plug = "binary_sensor.submitted_plug"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        options={CONF_PLUG_ENTITY: stored_plug},
+        title="Test Charger",
+    )
+    await setup_session_engine(hass, entry)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_UI_DISPATCH_INTERVAL_S: 5, CONF_PLUG_ENTITY: submitted_plug},
+    )
+    assert result["type"] == "form"
+    assert result["step_id"] == "init"
+    assert result["errors"] == {CONF_UI_DISPATCH_INTERVAL_S: "ui_dispatch_interval_invalid"}
+    suggested = {
+        str(k): k.description.get("suggested_value")
+        for k in result["data_schema"].schema
+        if isinstance(getattr(k, "description", None), dict)
+    }
+    assert suggested[CONF_PLUG_ENTITY] == submitted_plug
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_UI_DISPATCH_INTERVAL_S: 10, CONF_PLUG_ENTITY: submitted_plug},
+    )
+    assert result["step_id"] == "pricing"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: DEFAULT_STATIC_PRICE_KWH},
+    )
+    await hass.async_block_till_done()
+    assert result["type"] == "create_entry"
+
+    saved = hass.config_entries.async_get_entry(entry.entry_id).options
+    assert saved[CONF_UI_DISPATCH_INTERVAL_S] == 10
+    assert saved[CONF_PLUG_ENTITY] == submitted_plug
 
 
 # ---------------------------------------------------------------------------

@@ -57,10 +57,16 @@ async def _add_user(hass, entry_id, name="Petra") -> str:
 
 
 async def _add_rfid(hass, entry_id, card_index, user_id, vehicle_id=None) -> None:
-    result = await hass.config_entries.subentries.async_init(
-        (entry_id, "rfid_mapping"),
-        context={"source": "user"},
-    )
+    # Discovery off: the add step then shows the manual form, and a go-e entry
+    # would otherwise query the charger over the network.
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=None,
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (entry_id, "rfid_mapping"),
+            context={"source": "user"},
+        )
     user_input = {"card_index": str(card_index), "user_id": user_id}
     if vehicle_id:
         user_input["vehicle_id"] = vehicle_id

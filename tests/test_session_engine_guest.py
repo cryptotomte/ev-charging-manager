@@ -62,10 +62,15 @@ async def _add_guest_user(hass, entry_id) -> str:
 
 async def _add_rfid(hass, entry_id, card_index: int, user_id: str) -> None:
     """Add an RFID mapping via the subentry config flow."""
-    result = await hass.config_entries.subentries.async_init(
-        (entry_id, "rfid_mapping"),
-        context={"source": "user"},
-    )
+    # see tests/test_sensors.py::_add_rfid
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=None,
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (entry_id, "rfid_mapping"),
+            context={"source": "user"},
+        )
     await hass.config_entries.subentries.async_configure(
         result["flow_id"],
         {"card_index": str(card_index), "user_id": user_id},

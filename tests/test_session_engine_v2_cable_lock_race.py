@@ -129,10 +129,15 @@ async def _add_user(hass: HomeAssistant, entry_id: str, name: str) -> str:
 
 async def _add_rfid(hass: HomeAssistant, entry_id: str, card_index: int, user_id: str) -> None:
     """Add an RFID mapping via the subentry config flow (card_index N → trx N+1)."""
-    result = await hass.config_entries.subentries.async_init(
-        (entry_id, "rfid_mapping"),
-        context={"source": "user"},
-    )
+    # see tests/test_sensors.py::_add_rfid
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=None,
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (entry_id, "rfid_mapping"),
+            context={"source": "user"},
+        )
     await hass.config_entries.subentries.async_configure(
         result["flow_id"],
         {"card_index": str(card_index), "user_id": user_id},

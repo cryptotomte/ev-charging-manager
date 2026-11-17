@@ -257,8 +257,9 @@ restart and a crash:
   session is closed with the energy saved for it, and the new card gets a
   session of its own.
 - **Waiting at start-up:** recovery waits for the plug sensor; if it has not
-  reported after 60 minutes, the session is closed with the larger of its saved
-  energy and the charger's counter, and a notification is shown. Once the plug
+  reported after 60 minutes, the session is closed with what the charger's
+  counter has counted since the session started, never less than its saved
+  energy, and a notification is shown. Once the plug
   has reported, recovery waits at most 30 seconds for the energy or card sensor.
 - **Can differ (money):**
   - A second car that charges and leaves within the same outage is added to the
@@ -275,11 +276,18 @@ restart and a crash:
     the hour that was in progress when it went down, or at the current hour for
     a session that starts at start-up. If the hour changes before the first
     counter reading after start-up, that energy is priced at the later hour. An
-    hour is on the fallback price when the price sensor does not report within
-    that hour.
+    hour is on the fallback price when the price sensor has no price at the
+    hour's start; a sensor that has not reported since the integration was last
+    set up or reloaded is waited for within the hour. A price still missing when
+    the session was saved stays on the fallback if it resumes in the same hour.
+  - A car plugged in without a card while Home Assistant was down, after the
+    previous car left, is added to the resumed session unless the charger shows
+    a different card at start-up.
+  - A session that began entirely while Home Assistant was down is counted from
+    start-up: what the counter already showed then is not billed.
 - **Can differ (not money):** charging time and window count, the plug-in or
-  unplug time when it was not observed, and a car that was briefly unplugged
-  during the interruption becomes two sessions (the total is right). Every
+  unplug time when it was not observed, and a car that is still unplugged at
+  start-up after a brief unplug becomes two sessions (the total is right). Every
   recovered session, and every session started with the cable already in, is
   marked `reconstructed` and `data_gap`.
 

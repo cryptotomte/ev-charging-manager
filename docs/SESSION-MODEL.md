@@ -207,10 +207,10 @@ A cable that is already in when there is nothing to recover is handled like a
 plug-in: the engine waits for a card (`waiting_for_rfid`), starts a session for
 the card shown, or, when no card is shown and power is already flowing, starts
 an open-access session at once. This applies at setup and whenever the plug
-entity goes from no value to `on`. Such a session takes the whole counter,
-because with the cable in the counter belongs to the current connection; after
-a snapshot was completed at the 60-minute timeout it starts from the counter's
-reading instead, so that snapshot's energy is not counted again.
+entity goes from no value to `on`. Such a session starts from the counter's
+reading at that moment, as a live plug-in does: at a real plug-in the counter can
+still show the previous connection for a moment, so it cannot be taken as this
+connection's energy.
 
 ### Prices across an interruption
 
@@ -224,10 +224,11 @@ reading instead, so that snapshot's energy is not counted again.
   billed in that hour at its captured price, and a new hour starts with the
   price read at start-up. A clock that reads earlier than the stored hour does
   not close it.
-- If the spot price sensor has not reported since start-up when an hour starts,
-  the hour takes the sensor's first value within that hour; only if the hour
-  ends first does it use the fallback price. A sensor that had reported and is
-  merely unavailable at the hour's start gives the fallback price, as before.
+- If the spot price sensor has not reported since the integration was last set
+  up or reloaded when an hour starts, the hour takes the sensor's first value
+  within that hour; only if the hour ends first does it use the fallback price.
+  A sensor that had reported and is merely unavailable at the hour's start gives
+  the fallback price, as before.
 
 ### What an interruption still changes
 
@@ -244,8 +245,15 @@ Money can still differ in these cases:
   progress when Home Assistant went down, or at the current hour for a session
   that starts at start-up. If the hour tick comes before the first counter
   reading after a resume, the outage energy is priced at the later hour.
-- A spot hour is on the fallback price when the price sensor does not report
-  within that hour.
+- A spot hour is on the fallback price when the price sensor has no price at the
+  hour's start and, if it has not reported since the integration was last set up
+  or reloaded, does not report within that hour. A price still missing when the
+  session was saved stays on the fallback if the session resumes in the same hour.
+- A car plugged in without a card while Home Assistant was down, after the
+  previous car left, is added to the resumed session unless the charger shows a
+  different card at start-up.
+- A session that began entirely while Home Assistant was down is counted from
+  start-up: what the counter already showed then is not billed.
 - Energy that cannot be known is not attributed to anyone: when another
   person's connection restarted the counter, or the counter reads below the
   snapshot after the car left, the old session keeps its snapshot energy, and
@@ -259,8 +267,9 @@ These are not money and are deliberately unchanged:
   synthetic window that ends at start-up (see below), and a window that is open
   after start-up counts as a new window.
 - A transient disconnect in progress at the interruption is not continued: the
-  plug state at start-up decides, so a car that is plugged back in becomes a
-  second session (energy and cost are correct in total).
+  plug state at start-up decides, so a car that is still unplugged at start-up
+  and is plugged back in later becomes a second session (energy and cost are
+  correct in total); one plugged back in before start-up continues the session.
 - `connected_at` is the start-up time when the plug-in was not observed, and the
   end time is the start-up time when the car left during the outage.
 

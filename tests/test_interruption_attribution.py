@@ -458,6 +458,38 @@ async def test_rt21_timeout_still_completes_the_snapshot(
     assert rig.engine.state == SessionEngineState.IDLE
 
 
+async def _counter_restarted_below_the_snapshot(rig: Rig) -> None:
+    await rig.set(energy=12.0)
+
+
+@pytest.mark.parametrize("pricing", ["static", "spot"])
+async def test_d52_timeout_never_completes_below_the_snapshot(
+    hass, hass_storage, freezer, pricing
+) -> None:
+    """D-52: the counter restarted during the outage and reads 12.0 kWh, below the
+    snapshot's 15.0 but above its start (10.0). The timeout completes with the
+    snapshot's 5.0 kWh, not 2.0, and spot bills exactly that energy."""
+    rig = Rig(hass, freezer, hass_storage, pricing=pricing, energy0="10.0")
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:30:00")
+    await rig.set(energy=15.0)
+    await rig.goto("10:40:00")  # the periodic save at 10:35 holds 5.0 kWh
+    await restart("late", during=_counter_restarted_below_the_snapshot, absent=["plug"], order=[])(
+        rig
+    )
+    await rig.goto("11:45:00")
+
+    (money,) = rig.money()
+    assert (money["energy"], money["record_energy"]) == (5.0, 5.0)
+    if pricing == "spot":
+        assert money["details"] == [("10:00", 5.0, 1.0, False)]
+        assert (money["details_kwh"], money["cost"]) == (5.0, 5.0)
+    else:
+        assert money["cost"] == 12.5
+
+
 async def scenario_v(rig: Rig, interruption: Interruption | None) -> None:
     """Research 027 scenario V: cable in at 10:06 without a card; the card at 10:10."""
     await rig.setup()

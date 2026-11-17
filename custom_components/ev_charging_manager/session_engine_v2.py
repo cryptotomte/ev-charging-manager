@@ -667,7 +667,6 @@ class PlugAnchoredSessionEngine:
             self._wait_for_recovery_input(snapshot, self._entry.data[CONF_RFID_ENTITY], kind="rfid")
             return
 
-        saved_energy = float(snapshot.get("energy_kwh", 0.0))
         card = self._present_card_index()
         snapshot_card = snapshot.get("rfid_index")
         # PRELIMINARY P-2 (spec 027 § 10): the card value does not change within one
@@ -677,7 +676,9 @@ class PlugAnchoredSessionEngine:
         if snapshot_card is not None and card is not None and card != snapshot_card:
             # Spec 027 D-50: the counter belongs to the new connection, so the old
             # session keeps its snapshot energy and the new one takes the whole counter.
-            await self._complete_snapshot_as_session(snapshot, saved_energy, now)
+            await self._complete_snapshot_as_session(
+                snapshot, self._snapshot_completion_energy(snapshot, None), now
+            )
             if self._debug_logger:
                 self._debug_logger.log(
                     DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
@@ -694,19 +695,24 @@ class PlugAnchoredSessionEngine:
         # snapshot's is handled inside the resume (spec 027 D-38).
         await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
 
+    @staticmethod
+    def _snapshot_completion_energy(snapshot: dict, current_energy: float | None) -> float:
+        """The energy a completed snapshot gets: never less than its own (spec 027 D-52).
+
+        ``current_energy`` is the counter when it still belongs to the snapshot's
+        connection (D-47), None when it does not or has no reading.
+        """
+        saved_energy = float(snapshot.get("energy_kwh", 0.0))
+        if current_energy is None:
+            return saved_energy
+        return max(saved_energy, current_energy - float(snapshot.get("energy_start_kwh", 0.0)))
+
     async def _complete_snapshot_car_left(self, snapshot: dict) -> None:
         """Complete a snapshot whose car left during the outage (FR-027, spec 027 D-47).
 
-        The counter keeps the session's final value until the next plug-in, but is
-        never trusted below the snapshot.
+        The counter keeps the session's final value until the next plug-in.
         """
-        saved_energy = float(snapshot.get("energy_kwh", 0.0))
-        current_energy = self._get_energy()
-        energy = saved_energy
-        if current_energy is not None:
-            energy = max(
-                saved_energy, current_energy - float(snapshot.get("energy_start_kwh", 0.0))
-            )
+        energy = self._snapshot_completion_energy(snapshot, self._get_energy())
         _LOGGER.info(
             "PlugAnchoredSessionEngine recovery: completing old session "
             "(plug was off at restart) id=%s",
@@ -917,16 +923,9 @@ class PlugAnchoredSessionEngine:
             self._recovery_busy = True
             try:
                 now = dt_util.utcnow()
-                saved_energy = float(snapshot.get("energy_kwh", 0.0))
-                energy_start = float(snapshot.get("energy_start_kwh", 0.0))
-                # PR-27 FR-001: explicit None check — a genuine 0.0 reading is
-                # evidence and must not fall through to the snapshot fallback.
-                current_energy = self._get_energy()
-                energy = (
-                    current_energy - energy_start
-                    if current_energy is not None and current_energy >= energy_start
-                    else saved_energy
-                )
+                # PR-27 FR-001: an unavailable counter is no evidence; a genuine 0.0
+                # reading is.
+                energy = self._snapshot_completion_energy(snapshot, self._get_energy())
                 self._force_completed_at_timeout = True
                 await self._complete_snapshot_as_session(snapshot, energy, now)
             except Exception as err:  # noqa: BLE001

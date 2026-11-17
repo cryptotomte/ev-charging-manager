@@ -395,7 +395,8 @@ class GuestLastChargePriceSensor(StatsBaseSensor):
 class GuestTotalEnergySensor(StatsBaseSensor):
     """Lifetime accumulated energy across all guest users (kWh).
 
-    Sums total_energy_kwh for all UserStats where user_type == "guest".
+    Sums total_energy_kwh for all UserStats where user_type == "guest", plus the
+    carry of removed guest buckets (spec 026 D-6).
     """
 
     _attr_device_class = SensorDeviceClass.ENERGY
@@ -418,13 +419,14 @@ class GuestTotalEnergySensor(StatsBaseSensor):
         total = sum(
             s.total_energy_kwh for s in engine.user_stats.values() if s.user_type == "guest"
         )
-        return round(total, 2)
+        return round(total + engine.guest_retired["energy_kwh"], 2)
 
 
 class GuestTotalCostSensor(StatsBaseSensor):
     """Lifetime accumulated cost across all guest users (kr).
 
-    Sums total_cost_kr for all UserStats where user_type == "guest".
+    Sums total_cost_kr for all UserStats where user_type == "guest", plus the
+    carry of removed guest buckets (spec 026 D-6).
     """
 
     _attr_device_class = SensorDeviceClass.MONETARY
@@ -445,48 +447,35 @@ class GuestTotalCostSensor(StatsBaseSensor):
         if engine is None:
             return 0.0
         total = sum(s.total_cost_kr for s in engine.user_stats.values() if s.user_type == "guest")
-        return round(total, 2)
+        return round(total + engine.guest_retired["cost_kr"], 2)
 
 
 # ---------------------------------------------------------------------------
-# Factory function
+# Factory functions
 # ---------------------------------------------------------------------------
 
 
-def create_stats_sensors(
+def create_user_stats_sensors(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    user_names: list[str],
+    user_name: str,
 ) -> list[StatsBaseSensor]:
-    """Create all statistics sensor entities for the given users.
+    """Create the five statistics sensors of one user, at setup and at runtime (spec 026 D-4)."""
+    user_slug = slugify(user_name)
+    return [
+        UserTotalEnergySensor(hass, entry, user_name, user_slug),
+        UserTotalCostSensor(hass, entry, user_name, user_slug),
+        UserSessionCountSensor(hass, entry, user_name, user_slug),
+        UserAvgSessionEnergySensor(hass, entry, user_name, user_slug),
+        UserLastSessionSensor(hass, entry, user_name, user_slug),
+    ]
 
-    Creates 5 sensors per user (total_energy, total_cost, session_count,
-    avg_session_energy, last_session) plus 4 guest sensors.
 
-    user_names should include "Unknown" — callers are responsible for ensuring it.
-    """
-    entities: list[StatsBaseSensor] = []
-
-    for user_name in user_names:
-        user_slug = slugify(user_name)
-        entities.extend(
-            [
-                UserTotalEnergySensor(hass, entry, user_name, user_slug),
-                UserTotalCostSensor(hass, entry, user_name, user_slug),
-                UserSessionCountSensor(hass, entry, user_name, user_slug),
-                UserAvgSessionEnergySensor(hass, entry, user_name, user_slug),
-                UserLastSessionSensor(hass, entry, user_name, user_slug),
-            ]
-        )
-
-    # Guest sensors are always created (not per-user)
-    entities.extend(
-        [
-            GuestLastEnergySensor(hass, entry),
-            GuestLastChargePriceSensor(hass, entry),
-            GuestTotalEnergySensor(hass, entry),
-            GuestTotalCostSensor(hass, entry),
-        ]
-    )
-
-    return entities
+def create_guest_stats_sensors(hass: HomeAssistant, entry: ConfigEntry) -> list[StatsBaseSensor]:
+    """Create the four guest sensors, which exist once per entry."""
+    return [
+        GuestLastEnergySensor(hass, entry),
+        GuestLastChargePriceSensor(hass, entry),
+        GuestTotalEnergySensor(hass, entry),
+        GuestTotalCostSensor(hass, entry),
+    ]

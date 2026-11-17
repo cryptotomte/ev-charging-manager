@@ -13,12 +13,13 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, UnitOfPower, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_CAR_STATUS_ENTITY, DOMAIN, SIGNAL_SESSION_UPDATE, SessionEngineState
-from .stats_sensor import create_stats_sensors
+from .stats_sensor import create_guest_stats_sensors, create_user_stats_sensors
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,15 +66,101 @@ async def async_setup_entry(
         ChargingDurationSensor(hass, entry),
     ]
 
-    # Per-user statistics sensors (PR-04, T011)
+    # Per-user statistics sensors (PR-04, T011), kept per user subentry id so the
+    # update listener can add, remove and rename them at runtime (spec 026 D-4).
     config_store = hass.data[DOMAIN][entry.entry_id]["config_store"]
-    user_names: list[str] = [u["name"] for u in config_store.data.get("users", [])]
+    users = config_store.data.get("users", [])
+    user_entities = {u["id"]: create_user_stats_sensors(hass, entry, u["name"]) for u in users}
+    for user_sensors in user_entities.values():
+        entities.extend(user_sensors)
     # "Unknown" user always exists in stats (FR-007)
-    if "Unknown" not in user_names:
-        user_names.append("Unknown")
-    entities.extend(create_stats_sensors(hass, entry, user_names))
+    if all(u["name"] != "Unknown" for u in users):
+        entities.extend(create_user_stats_sensors(hass, entry, "Unknown"))
+    entities.extend(create_guest_stats_sensors(hass, entry))
 
     async_add_entities(entities)
+    hass.data[DOMAIN][entry.entry_id]["stats_platform"] = {
+        "add_entities": async_add_entities,
+        "user_entities": user_entities,
+    }
+
+
+# Runtime changes to the per-user statistics sensors, called by the update
+# listener (spec 026 § 6.2). Each is a no-op while the sensor platform is not
+# set up (D-4). Registry unique_ids are read from throwaway sensor instances so
+# the format stays defined in one place (stats_sensor.py).
+
+
+def async_add_user_stats_sensors(
+    hass: HomeAssistant, entry: ConfigEntry, subentry_id: str, user_name: str
+) -> None:
+    """Create and add one user's five statistics sensors (D-4)."""
+    platform = hass.data[DOMAIN][entry.entry_id].get("stats_platform")
+    if platform is None:
+        return
+    sensors = create_user_stats_sensors(hass, entry, user_name)
+    platform["user_entities"][subentry_id] = sensors
+    platform["add_entities"](sensors)
+
+
+def async_remove_user_stats_sensors(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    subentry_id: str,
+    user_name: str,
+    remove_registry: bool,
+) -> None:
+    """Remove a deleted user's five registry entries, and with them the live entities (D-5).
+
+    Removing by unique_id also covers entities the user had disabled.
+    """
+    platform = hass.data[DOMAIN][entry.entry_id].get("stats_platform")
+    if platform is None:
+        return
+    platform["user_entities"].pop(subentry_id, None)
+    if not remove_registry:
+        return
+    registry = er.async_get(hass)
+    for sensor in create_user_stats_sensors(hass, entry, user_name):
+        if entity_id := registry.async_get_entity_id("sensor", DOMAIN, sensor.unique_id):
+            registry.async_remove(entity_id)
+
+
+async def async_rename_user_stats_sensors(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    subentry_id: str,
+    old_name: str,
+    new_name: str,
+    move_registry: bool,
+) -> None:
+    """Move a renamed user's registry entries and replace the live entities (D-7).
+
+    Moving the registry entries keeps entity ids and history. An entry already
+    holding a target unique_id is a leftover (D-10 keeps the new slug unique) and
+    is removed first.
+    """
+    platform = hass.data[DOMAIN][entry.entry_id].get("stats_platform")
+    if platform is None:
+        return
+    if move_registry:
+        registry = er.async_get(hass)
+        for old, new in zip(
+            create_user_stats_sensors(hass, entry, old_name),
+            create_user_stats_sensors(hass, entry, new_name),
+            strict=True,
+        ):
+            entity_id = registry.async_get_entity_id("sensor", DOMAIN, old.unique_id)
+            if entity_id is None:
+                continue
+            if stale := registry.async_get_entity_id("sensor", DOMAIN, new.unique_id):
+                registry.async_remove(stale)
+            registry.async_update_entity(entity_id, new_unique_id=new.unique_id)
+    for sensor in platform["user_entities"].pop(subentry_id, []):
+        # Entities never added (disabled, or a legacy duplicate unique_id) have no hass.
+        if sensor.hass is not None:
+            await sensor.async_remove()
+    async_add_user_stats_sensors(hass, entry, subentry_id, new_name)
 
 
 class _SessionSensorBase(SensorEntity):

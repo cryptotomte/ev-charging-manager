@@ -2,7 +2,8 @@
 
 Store key:     ev_charging_manager_stats
 Store version: 1
-Format:        {"user_stats": {...}, "guest_last": {...} | null, "unknown_session_times": [...]}
+Format:        {"user_stats": {...}, "guest_last": {...} | null, "unknown_session_times": [...],
+                "guest_retired": {"energy_kwh": float, "cost_kr": float}}
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from .stats_engine import GuestLastSession, UserStats
 
 _LOGGER = logging.getLogger(__name__)
 
+EMPTY_GUEST_RETIRED: dict[str, float] = {"energy_kwh": 0.0, "cost_kr": 0.0}
+
 
 class StatsStore:
     """Wrap helpers.storage.Store for per-user charging statistics.
@@ -31,16 +34,16 @@ class StatsStore:
 
     async def async_load(
         self,
-    ) -> tuple[dict[str, UserStats], GuestLastSession | None, list[str]]:
+    ) -> tuple[dict[str, UserStats], GuestLastSession | None, list[str], dict[str, float]]:
         """Load statistics from disk.
 
-        Returns (empty dict, None, []) if no file exists yet.
+        Returns (empty dict, None, [], zero carry) if no file exists yet.
         Malformed entries are skipped with a warning.
         """
         stored = await self._store.async_load()
         if stored is None:
             _LOGGER.debug("No existing stats store found, starting fresh")
-            return {}, None, []
+            return {}, None, [], dict(EMPTY_GUEST_RETIRED)
 
         # Deserialize per-user stats
         user_stats: dict[str, UserStats] = {}
@@ -64,14 +67,27 @@ class StatsStore:
         if not isinstance(unknown_session_times, list):
             unknown_session_times = []
 
+        # Spec 026 D-6: optional key; absent reads as zeros.
+        guest_retired = dict(EMPTY_GUEST_RETIRED)
+        raw_retired = stored.get("guest_retired")
+        if raw_retired is not None:
+            try:
+                guest_retired = {
+                    "energy_kwh": float(raw_retired["energy_kwh"]),
+                    "cost_kr": float(raw_retired["cost_kr"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning("Ignoring malformed guest_retired in stats store: %r", raw_retired)
+
         _LOGGER.debug("Loaded stats for %d user(s) from storage", len(user_stats))
-        return user_stats, guest_last, unknown_session_times
+        return user_stats, guest_last, unknown_session_times, guest_retired
 
     async def async_save(
         self,
         user_stats: dict[str, UserStats],
         guest_last: GuestLastSession | None,
         unknown_session_times: list[str] | None = None,
+        guest_retired: dict[str, float] | None = None,
     ) -> None:
         """Persist current statistics to disk."""
         data: dict[str, Any] = {
@@ -80,5 +96,6 @@ class StatsStore:
             "unknown_session_times": unknown_session_times
             if unknown_session_times is not None
             else [],
+            "guest_retired": guest_retired if guest_retired is not None else EMPTY_GUEST_RETIRED,
         }
         await self._store.async_save(data)

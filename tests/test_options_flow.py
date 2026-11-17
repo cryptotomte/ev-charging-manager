@@ -792,7 +792,8 @@ async def test_options_clearing_eto_survives_reload(hass: HomeAssistant) -> None
     eto = "sensor.charger_total_energy"
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={**MOCK_CHARGER_DATA, CONF_TOTAL_ENERGY_ENTITY: eto},
+        # The seed applies only to profiles with a total-energy sensor (D-31).
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini", CONF_TOTAL_ENERGY_ENTITY: eto},
         title="Test Charger",
     )
     await setup_session_engine(hass, entry)

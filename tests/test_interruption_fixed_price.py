@@ -346,3 +346,22 @@ async def test_rt10_guest_unplugged_during_the_outage(hass, hass_storage, freeze
     )
     assert money["charge_method"] == "fixed"
     assert rig.stats.guest_last.charge_price_kr == 19.0
+
+
+async def test_rt09_guest_money_current_right_after_a_resume_without_energy(
+    hass, hass_storage, freezer
+) -> None:
+    """RT-09 (D-37 at the end of a resume): with the energy entity not yet valid, the
+    resumed session's cost and charge price are those of its snapshot energy at once."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_GFIX)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.5)
+    await rig.goto("10:15:30")  # periodic save at 10:15 holds 1.5 kWh
+    await restart("late", order=["plug", "lock", "trx", "power", "car", "eto"])(rig)
+
+    session = rig.engine.active_session
+    assert (session.energy_kwh, session.cost_total_kr) == (1.5, 3.75)
+    assert session.charge_price_total_kr == 7.5

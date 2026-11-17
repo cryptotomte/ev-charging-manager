@@ -2598,7 +2598,6 @@ class PlugAnchoredSessionEngine:
             # the claim above already detached it from self._active_session).
             if self._window_tracker.is_open():
                 self._close_window(now, session)
-            self._recompute_derived(session)
 
             # Compute final durations
             connected_at_str = session.connected_at or session.started_at

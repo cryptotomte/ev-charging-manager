@@ -484,3 +484,23 @@ async def test_d54_price_listener_is_gone_after_unload(hass, hass_storage, freez
     await hass.async_block_till_done()
     await rig.set(spot=1.0)
     assert SPOT not in engine._spot_seen_valid  # noqa: SLF001
+
+
+async def test_d55_stored_hour_later_than_the_clock_awaits_no_close(
+    hass, hass_storage, freezer
+) -> None:
+    """D-55: with the clock behind the stored hour and no counter reading at the resume,
+    the stored hour is not marked for closing at the first reading; it is the hour in
+    progress."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:30:00")
+    await rig.set(energy=3.0)
+    await rig.goto("11:30:00")
+    await restart("late", during=_clock_back_to_10_58, order=["plug", "lock", "trx", "power"])(rig)
+    engine = rig.engine
+    assert engine.active_session is not None
+    assert engine._hour_start_time == f"{DAY}T11:00+00:00"  # noqa: SLF001
+    assert engine._spot_close_pending is False  # noqa: SLF001

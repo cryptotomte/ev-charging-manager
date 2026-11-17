@@ -281,6 +281,9 @@ class PlugAnchoredSessionEngine:
         # capture" → fallback pricing for the whole hour. In-memory only; dies
         # with the session (resume recaptures).
         self._current_hour_price: float | None = None
+        # Spec 027 D-39: a resume found the stored hour passed but had no counter
+        # reading yet; the first reading closes the stored hour.
+        self._spot_close_pending: bool = False
 
         # Story 07 (passive notification): set of notification IDs currently visible,
         # keyed for auto-dismiss when the corresponding mapping is added (FR-022).
@@ -852,19 +855,12 @@ class PlugAnchoredSessionEngine:
         # restart resume) on the engine flag, so completion's
         # `session.data_gap = self._data_gap` transfer cannot wipe it later.
         self._data_gap = True
-        self._restore_session_context(snapshot, session)
+        self._restore_session_context(snapshot, session, now)
 
         # BUG-2 fix: re-arm the spot-pricing hourly snapshot callback after restart.
         # Without this, _hourly_unsub stays None, the hourly callback never fires,
         # and post-restart energy is bundled incorrectly into the "current hour".
-        # Seed hour-state from the current wall clock and energy reading so the
-        # next hourly boundary correctly accounts for energy delivered since restart.
-        if self._pricing.mode == "spot" and self._hourly_unsub is None:
-            self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-            self._hour_energy_snapshot = max(0.0, current_energy_or_last - session.energy_start_kwh)
-            # PR-29 (FR-008): the pre-restart captured price is gone (in-memory)
-            # — recapture at resume for the in-progress hour.
-            self._capture_hour_price()
+        if self._pricing.mode == "spot":
             self._arm_hourly_spot_callback()
             if self._debug_logger:
                 self._debug_logger.log(
@@ -983,6 +979,16 @@ class PlugAnchoredSessionEngine:
         # went backwards during the outage meets the live reset rule.
         if current_energy is not None:
             self._handle_energy_update(str(current_energy))
+        if self._pricing.mode == "spot" and self._hour_start_time != now.strftime(
+            "%Y-%m-%dT%H:00+00:00"
+        ):
+            # Spec 027 D-39: the stored hour has passed — the energy not yet billed,
+            # outage energy included, closes into it at its stored price. Without a
+            # reading the close waits for the first one (spec 027 § 12, X-2).
+            if current_energy is not None:
+                self._async_hourly_snapshot(now)
+            else:
+                self._spot_close_pending = True
         self._recompute_derived(session)
 
         if self._debug_logger:
@@ -1012,11 +1018,12 @@ class PlugAnchoredSessionEngine:
                 err,
             )
 
-    def _restore_session_context(self, snapshot: dict, session: Session) -> None:
+    def _restore_session_context(self, snapshot: dict, session: Session, now: datetime) -> None:
         """Restore what the session started with from the snapshot's ``resume_state``.
 
-        Spec 027 D-36 (pricing), D-40 (guest rate), D-41 (charger total). An absent
-        ``resume_state`` or part falls back per D-45; a malformed part also logs a warning.
+        Spec 027 D-36 (pricing), D-39 (spot hour), D-40 (guest rate), D-41 (charger
+        total). An absent ``resume_state`` or part falls back per D-45; a malformed part
+        also logs a warning.
         """
         state = snapshot.get("resume_state")
         if state is not None and not isinstance(state, dict):
@@ -1070,6 +1077,28 @@ class PlugAnchoredSessionEngine:
                 malformed("guest_pricing")
         self._guest_pricing = guest
         session.charge_price_method = guest.method if guest is not None else None
+
+        if self._pricing.mode == "spot":
+            # Spec 027 D-39: the energy already billed is what price_details holds.
+            self._hour_energy_snapshot = sum(
+                detail.get("kwh", 0.0) for detail in session.price_details or []
+            )
+            spot_hour = state.get("spot_hour")
+            if spot_hour is not None:
+                try:
+                    datetime.fromisoformat(spot_hour["start"])
+                    valid = spot_hour["price"] is None or _is_number(spot_hour["price"])
+                except (KeyError, TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    malformed("spot_hour")
+                    spot_hour = None
+            if spot_hour is not None:
+                self._hour_start_time = spot_hour["start"]
+                self._current_hour_price = spot_hour["price"]
+            else:
+                self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+                self._capture_hour_price()
 
         self._eto_start = session.charger_total_before_kwh
 
@@ -1136,7 +1165,10 @@ class PlugAnchoredSessionEngine:
             reconstructed=True,
             data_gap=True,
         )
-        self._restore_session_context(snapshot, session)
+        self._restore_session_context(snapshot, session, now)
+        if self._pricing.mode == "spot":
+            # Spec 027 D-39: the remaining energy closes into the stored hour.
+            self._bill_open_hour(session, session.energy_kwh)
         self._recompute_derived(session)
 
         if charging_duration_s > 0 and session.energy_kwh > 0:
@@ -2120,6 +2152,8 @@ class PlugAnchoredSessionEngine:
 
         # Energy delta from session start
         session.energy_kwh = max(0.0, energy_kwh - session.energy_start_kwh)
+        if self._spot_close_pending:
+            self._async_hourly_snapshot(dt_util.utcnow())
         self._recompute_derived(session)
 
     def _recompute_derived(self, session: Session) -> None:
@@ -2870,6 +2904,7 @@ class PlugAnchoredSessionEngine:
             self._last_power_w = 0.0
             self._hour_energy_snapshot = 0.0
             self._hour_start_time = ""
+            self._spot_close_pending = False
             self._data_gap = False
             # PR-25: clear the captured plug-off context so a stale timestamp/snapshot
             # cannot be applied to a later, unrelated completion (D7).
@@ -2948,11 +2983,20 @@ class PlugAnchoredSessionEngine:
         boundary, racing this tick). The price read NOW becomes the captured
         price for the hour that starts at this boundary.
         """
+        self._spot_close_pending = False
         if self._active_session is None or self._pricing.mode != "spot":
             return
         session = self._active_session
-        current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
-        kwh_this_hour = max(0.0, current_relative_energy - self._hour_energy_snapshot)
+        self._bill_open_hour(session, (self._last_energy_kwh or 0.0) - session.energy_start_kwh)
+        self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+        # FR-009 (PR-29): capture the price for the hour that starts at this boundary.
+        self._capture_hour_price()
+        self._dispatch_update()
+        self._schedule_snapshot_write()
+
+    def _bill_open_hour(self, session: Session, relative_energy_kwh: float) -> None:
+        """Append the hour in progress to price_details, billed at its captured price."""
+        kwh_this_hour = max(0.0, relative_energy_kwh - self._hour_energy_snapshot)
         detail = self._pricing.calculate_spot_hour(kwh_this_hour, self._current_hour_price)
         detail["hour"] = self._hour_start_time
         detail["kwh"] = round(kwh_this_hour, 3)
@@ -2960,12 +3004,7 @@ class PlugAnchoredSessionEngine:
             session.price_details = []
         session.price_details.append(detail)
         session.cost_total_kr = self._pricing.calculate_spot_total(session.price_details)
-        self._hour_energy_snapshot = current_relative_energy
-        self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-        # FR-009 (PR-29): capture the price for the hour that starts at this boundary.
-        self._capture_hour_price()
-        self._dispatch_update()
-        self._schedule_snapshot_write()
+        self._hour_energy_snapshot = relative_energy_kwh
 
     # -----------------------------------------------------------------------
     # Charger-offline detection (FR-028)

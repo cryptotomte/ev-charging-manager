@@ -22,7 +22,10 @@ from tests.session_rig import (
     TRX_PAUL,
     Interruption,
     Rig,
+    finish_while_down,
     restart,
+    scenario_a,
+    scenario_f,
 )
 
 PLUG_LAST = ["energy", "power", "trx", "lock", "car", "eto", "plug"]
@@ -40,35 +43,6 @@ PAUL_4KWH = {
     "details_kwh": 0,
     "details": [],
 }
-
-
-async def scenario_a(rig: Rig, trx: str, at: dict[str, Interruption]) -> None:
-    """One continuous charge 10:06–10:26, unplug 10:40 (research 027 scenario A)."""
-    await rig.setup()
-    await rig.goto("10:06:00")
-    await rig.plug_in(trx)
-    await rig.goto("10:08:00")
-    await rig.set(energy=0.5, eto=1000.5)
-    await rig.goto("10:08:30")
-    if "young" in at:
-        await at["young"](rig)
-    await rig.goto("10:12:00")
-    await rig.set(energy=1.5, eto=1001.5)
-    await rig.goto("10:17:00")
-    await rig.set(energy=2.5, eto=1002.5)
-    await rig.goto("10:17:30")
-    if "mid" in at:
-        await at["mid"](rig)
-    await rig.goto("10:22:00")
-    if "mid2" in at:
-        await at["mid2"](rig)
-    await rig.goto("10:25:00")
-    await rig.set(energy=4.0, eto=1004.0)
-    await rig.goto("10:26:00")
-    await rig.set(power=0)
-    await rig.goto("10:40:00")
-    await rig.unplug()
-    await rig.goto("10:41:00")
 
 
 def _assert_one_paul_session(rig: Rig) -> None:
@@ -133,38 +107,6 @@ async def test_rt05_orderly_stop_writes_the_engine_state(hass, hass_storage, fre
     assert snapshot["resume_state"]["pricing"] == {"mode": "static", "static_price_kwh": 2.5}
 
 
-async def _finish_charge(rig: Rig, *, fire: bool = True) -> None:
-    """The car charges to 4.0 kWh and stops; with fire=False this happens while down."""
-    await rig.goto("10:25:00", fire=fire)
-    await rig.set(energy=4.0, eto=1004.0)
-    await rig.goto("10:26:00", fire=fire)
-    await rig.set(power=0)
-    await rig.goto("10:35:00", fire=fire)
-
-
-async def scenario_f(rig: Rig, trx: str, interruption: Interruption | None) -> None:
-    """The charge finishes during the outage; no energy update follows start-up (research F)."""
-    await rig.setup()
-    await rig.goto("10:06:00")
-    await rig.plug_in(trx)
-    await rig.goto("10:12:00")
-    await rig.set(energy=1.5, eto=1001.5)
-    await rig.goto("10:17:00")
-    await rig.set(energy=2.5, eto=1002.5)
-    await rig.goto("10:17:30")
-    if interruption is None:
-        await _finish_charge(rig)
-    else:
-        await interruption(rig)
-    await rig.goto("10:40:00")
-    await rig.unplug()
-    await rig.goto("10:41:00")
-
-
-async def _finish_while_down(rig: Rig) -> None:
-    await _finish_charge(rig, fire=False)
-
-
 @pytest.mark.parametrize(
     "intr",
     [
@@ -177,8 +119,8 @@ async def test_rt03_charge_finishes_during_the_outage(hass, hass_storage, freeze
     """RT-03: cost equals energy × price and the SoC estimate is present."""
     interruption = {
         "none": None,
-        "restart-present": restart(during=_finish_while_down),
-        "restart-late": restart("late", during=_finish_while_down),
+        "restart-present": restart(during=finish_while_down),
+        "restart-late": restart("late", during=finish_while_down),
     }[intr]
     rig = Rig(hass, freezer, hass_storage)
     await scenario_f(rig, TRX_PAUL, interruption)

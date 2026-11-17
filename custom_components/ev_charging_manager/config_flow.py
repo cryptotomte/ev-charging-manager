@@ -498,33 +498,36 @@ class OptionsFlowHandler(OptionsFlow):
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Manage the options — session thresholds."""
         errors: dict[str, str] = {}
-        # Values 1-9 would create excessive UI fan-out (IC-3); 0 disables. The band
+        # Values 1-9 would create excessive UI fan-out; 0 disables. The band
         # check lives here, not in the schema: HA serializes every form schema for
         # the frontend and a plain-function validator makes that raise (HTTP 500).
-        if user_input is not None and (
-            0 < user_input[CONF_UI_DISPATCH_INTERVAL_S] < UI_DISPATCH_INTERVAL_S_ACTIVE_MIN
-        ):
-            errors[CONF_UI_DISPATCH_INTERVAL_S] = "ui_dispatch_interval_invalid"
-        elif user_input is not None:
-            # Store thresholds and proceed to pricing step.
-            # Explicitly write None for absent observation-slot keys so that
-            # migration sees conf_key in entry.options and skips re-filling a
-            # slot the user deliberately cleared.
-            self._new_options = dict(user_input)
-            for conf_key in (
-                CONF_PLUG_ENTITY,
-                CONF_CABLE_LOCK_ENTITY,
-                CONF_MODEL_STATUS_ENTITY,
-                CONF_ERROR_ENTITY,
-            ):
-                self._new_options[conf_key] = user_input.get(conf_key)
-            # Preserve timing options with their defaults when absent
-            self._new_options.setdefault(
-                CONF_CHARGING_IDLE_TIMEOUT_MIN, DEFAULT_CHARGING_IDLE_TIMEOUT_MIN
-            )
-            self._new_options.setdefault(CONF_DISCONNECT_GRACE_MIN, DEFAULT_DISCONNECT_GRACE_MIN)
-            self._new_options.setdefault(CONF_NOTIFY_UNMAPPED_RFID, DEFAULT_NOTIFY_UNMAPPED_RFID)
-            return await self.async_step_pricing()
+        if user_input is not None:
+            if 0 < user_input[CONF_UI_DISPATCH_INTERVAL_S] < UI_DISPATCH_INTERVAL_S_ACTIVE_MIN:
+                errors[CONF_UI_DISPATCH_INTERVAL_S] = "ui_dispatch_interval_invalid"
+            else:
+                # Store thresholds and proceed to pricing step.
+                # Explicitly write None for absent observation-slot keys so that
+                # migration sees conf_key in entry.options and skips re-filling a
+                # slot the user deliberately cleared.
+                self._new_options = dict(user_input)
+                for conf_key in (
+                    CONF_PLUG_ENTITY,
+                    CONF_CABLE_LOCK_ENTITY,
+                    CONF_MODEL_STATUS_ENTITY,
+                    CONF_ERROR_ENTITY,
+                ):
+                    self._new_options[conf_key] = user_input.get(conf_key)
+                # Preserve timing options with their defaults when absent
+                self._new_options.setdefault(
+                    CONF_CHARGING_IDLE_TIMEOUT_MIN, DEFAULT_CHARGING_IDLE_TIMEOUT_MIN
+                )
+                self._new_options.setdefault(
+                    CONF_DISCONNECT_GRACE_MIN, DEFAULT_DISCONNECT_GRACE_MIN
+                )
+                self._new_options.setdefault(
+                    CONF_NOTIFY_UNMAPPED_RFID, DEFAULT_NOTIFY_UNMAPPED_RFID
+                )
+                return await self.async_step_pricing()
 
         opts = user_input if errors else self.config_entry.options
         schema = vol.Schema(

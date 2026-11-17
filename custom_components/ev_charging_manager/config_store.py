@@ -39,17 +39,28 @@ class ConfigStore:
         self._data: dict[str, Any] = {**EMPTY_CONFIG}
 
     async def async_load(self) -> dict[str, Any]:
-        """Load config from disk. Returns empty structure on missing file (FR-022)."""
+        """Load config from disk. Returns empty structure on missing file (FR-022).
+
+        Data of the wrong shape is replaced by the empty structure (spec 026 D-20);
+        the next sync rebuilds it from the subentries.
+        """
         stored = await self._store.async_load()
+        if isinstance(stored, dict) and all(
+            isinstance(stored.get(key, []), list)
+            and all(isinstance(item, dict) for item in stored.get(key, []))
+            for key in EMPTY_CONFIG
+        ):
+            self._data = stored
+            return self._data
         if stored is None:
             _LOGGER.debug("No existing config store found, starting with empty config")
-            self._data = {
-                "vehicles": [],
-                "users": [],
-                "rfid_mappings": [],
-            }
         else:
-            self._data = stored
+            _LOGGER.warning("Config store has an unexpected format; rebuilding it from subentries")
+        self._data = {
+            "vehicles": [],
+            "users": [],
+            "rfid_mappings": [],
+        }
         return self._data
 
     async def async_save(self) -> None:

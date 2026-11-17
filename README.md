@@ -101,6 +101,10 @@ Users represent the people who charge at your location. Each user can have RFID 
 
 Guest users have additional billing options (custom price per kWh or markup factor).
 
+Names must be unique, ignoring case, accents, spaces and punctuation ("Anna", "anna" and "Änna" count as the same name). "Guest" and "Unknown" are reserved. A user cannot be renamed while that user's charging session is in progress.
+
+Deleting a user deletes that user's statistics and statistics sensors. The guest totals keep a deleted guest's energy and cost. Stored sessions are not affected.
+
 ### Managing Vehicles
 
 Vehicles store battery specifications used for SoC estimation.
@@ -223,6 +227,7 @@ When a session completes without a recognized user, it is attributed to "Unknown
 1. **No RFID mapping** -- the card used is not mapped to a user. Add an RFID Mapping subentry.
 2. **trx sensor not updating** -- the charger's RFID/transaction sensor is not reporting values. Verify the entity in Developer Tools > States.
 3. **Card not active on charger** -- some chargers require cards to be explicitly enabled. Check your charger's app or configuration.
+4. **The card's user is inactive** -- sessions on a card mapped to a deactivated user are recorded as Unknown. Reactivate the user, or map the card to an active user.
 
 The integration logs a diagnostic reason code for each unknown session. Check the Home Assistant logs for entries containing `unknown_reason` to pinpoint the cause.
 

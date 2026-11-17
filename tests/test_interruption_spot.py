@@ -363,6 +363,46 @@ async def test_d55_stored_hour_later_than_the_clock_continues(
     _assert_billed_once(money)
 
 
+async def test_x9_tick_of_an_earlier_hour_does_not_close_the_stored_hour(
+    hass, hass_storage, freezer
+) -> None:
+    """§ 12 X-9: the stored hour is 12 and the clock reads 10:58 at boot. The tick at
+    11:00 is for an hour earlier than the one in progress: it must not close hour 12 and
+    open hour 11, or the tick at 12:00 would bill hour 12 a second time."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:30:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:59:00")
+    await rig.set(spot=2.0)
+    await rig.goto("11:30:00")
+    await rig.set(energy=5.0)
+    await rig.goto("11:59:00")
+    await rig.set(spot=3.0)
+    await rig.goto("12:20:00")
+    await rig.set(energy=6.0)
+    await rig.goto("12:30:00")  # the periodic save at 12:25 holds hour 12 open
+    await restart(during=_clock_back_to_10_58)(rig)
+    await rig.goto("11:01:00")
+    engine = rig.engine
+    assert [d["hour"][11:16] for d in engine.active_session.price_details] == ["10:00", "11:00"]
+    assert engine._hour_start_time == f"{DAY}T12:00+00:00"  # noqa: SLF001
+    await rig.set(energy=7.0)
+    await rig.set(power=0)
+    await rig.goto("11:10:00")
+    await rig.unplug()
+
+    (money,) = rig.money()
+    assert money["details"] == [
+        ("10:00", 3.0, 1.0, False),
+        ("11:00", 2.0, 2.0, False),
+        ("12:00", 2.0, 3.0, False),
+    ]
+    _assert_billed_once(money)
+
+
 async def _card_and_cable_while_down(rig: Rig) -> None:
     """Paul shows his card and plugs in at 10:10 while down; 2.0 kWh by 10:20."""
     await rig.goto("10:10:00", fire=False)
@@ -389,6 +429,28 @@ async def test_d54_cable_in_session_with_the_price_entity_late(hass, hass_storag
     (money,) = rig.money()
     assert money["details"] == [("10:00", 5.0, 1.0, False)]
     assert money["cost"] == 5.0
+
+
+async def test_d54_pending_price_updates_the_running_cost_and_the_snapshot(
+    hass, hass_storage, freezer
+) -> None:
+    """D-54: when the price entity's first valid state prices the hour in progress, the
+    session's running cost is recomputed and the snapshot stores the hour's price at once,
+    not at the next counter reading or save."""
+    rig = Rig(hass, freezer, hass_storage, pricing="spot")
+    await rig.setup()
+    await restart("late", during=_card_and_cable_while_down, spot_late=True, order=FIELD_ORDER)(rig)
+    await rig.goto("10:22:00")
+    session = rig.engine.active_session
+    assert session.cost_total_kr == 18.0, "2.0 kWh at the fallback while the price is pending"
+    assert rig.snapshot()["resume_state"]["spot_hour"]["price"] is None
+
+    await rig.set(spot=1.0)
+
+    assert session.cost_total_kr == 2.0
+    snapshot = rig.snapshot()
+    assert snapshot["resume_state"]["spot_hour"]["price"] == 1.0
+    assert snapshot["cost_total_kr"] == 2.0
 
 
 async def _paul_leaves_and_the_markup_guest_charges(rig: Rig) -> None:

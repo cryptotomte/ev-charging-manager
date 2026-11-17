@@ -726,6 +726,7 @@ async def test_d58_cable_in_start_after_a_timeout_completion_counts_no_energy_tw
     await rig.set(plug="on")
     session = rig.engine.active_session
     assert (session.energy_start_kwh, session.energy_kwh) == (2.5, 0.0)
+    assert (session.reconstructed, session.data_gap) == (True, True), "X-15"
     await rig.goto("11:30:00")
     await rig.set(energy=3.0)
     await rig.set(power=0)
@@ -733,6 +734,79 @@ async def test_d58_cable_in_start_after_a_timeout_completion_counts_no_energy_tw
     await rig.unplug()
 
     assert _summary(rig) == [("Paul", 2.5, 6.25, None, 2.5), ("Paul", 0.5, 1.25, None, 0.5)]
+
+
+async def _paul_left_while_down(rig: Rig) -> None:
+    """Paul's car leaves at 10:25 with 3.8 kWh on the counter."""
+    await rig.goto("10:25:00", fire=False)
+    await rig.set(energy=3.8, eto=1003.8)
+    await rig.set(power=0, lock="Unlocked", plug="off", trx="null")
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["counter-restarted", "stale-reading-first"])
+async def test_d49_plug_on_during_the_energy_wait_completes_at_once_and_is_handed_back(
+    hass, hass_storage, freezer, stale
+) -> None:
+    """D-49, § 12 X-12 (verification W4/W4b): Paul's car left during the outage and the
+    energy entity is not valid yet, so the completion waits. The guest plugs in during
+    that wait: the plug change ends the wait at once (Paul's snapshot, 1.5 kWh at the
+    10:15 save, is completed without waiting for a reading), and the held plug-on is then
+    handed back as a real plug-in, so the guest gets a session.
+
+    As on main: the guest's baseline is taken while the energy entity still has no
+    reading (0.0), so a first reading that still shows Paul's 3.8 kWh is counted for the
+    guest by the live reset rule (stale-reading-first: 5.8 kWh)."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.5, eto=1001.5)
+    await rig.goto("10:17:30")
+    await restart("late", during=_paul_left_while_down, order=["plug", "lock", "trx", "power"])(rig)
+    assert rig.completed == [], "the completion waits for the energy entity"
+    await rig.set(trx=TRX_GFIX)
+    await rig.set(plug="on", lock="Locked")
+    assert [ev.data["user_name"] for ev in rig.completed] == ["Paul"], "ended by the plug"
+    assert rig.engine.active_session.user_name == "Gaest", "the plug-on was handed back"
+    if stale:
+        await rig.set(energy=3.8)
+    await rig.set(energy=0.0)
+    await rig.set(power=7000)
+    await rig.goto("10:40:00")
+    await rig.set(energy=2.0)
+    await rig.set(power=0)
+    await rig.goto("10:50:00")
+    await rig.unplug()
+
+    guest = 5.8 if stale else 2.0
+    assert _summary(rig) == [
+        ("Paul", 1.5, 3.75, None, 1.5),
+        ("Gaest", guest, guest * 2.5, guest * 5.0, guest),
+    ]
+
+
+async def test_d49_unknown_on_the_rfid_entity_is_no_card(hass, hass_storage, freezer) -> None:
+    """D-49: the RFID entity's first state after start-up is ``unknown``. That is a loaded
+    entity saying "no card", so the decision does not wait out RECOVERY_INPUT_WAIT_S:
+    Paul's snapshot is resumed at once."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.5)
+    await rig.goto("10:17:30")
+    await restart("late", order=["plug", "lock", "power", "energy", "car", "eto"])(rig)
+    assert rig.engine.active_session is None, "the decision waits for the RFID entity"
+    await rig.set(trx="unknown")
+    assert rig.engine.active_session.user_name == "Paul"
+    await rig.goto("10:30:00")
+    await rig.set(energy=4.0, power=0)
+    await rig.goto("10:40:00")
+    await rig.unplug()
+
+    assert _summary(rig) == [("Paul", 4.0, 10.0, None, 4.0)]
 
 
 async def test_v5_no_plug_hand_back_after_unload(hass, hass_storage, freezer) -> None:

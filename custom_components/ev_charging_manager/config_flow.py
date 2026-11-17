@@ -925,6 +925,8 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         self._user_data: dict[str, Any] = {}
         # The first step's input, re-shown when the name fails at the commit point (D-23).
         self._first_input: dict[str, Any] = {}
+        # The pricing input; the first step resets _user_data when it is re-shown (D-23, V-2).
+        self._pricing_input: dict[str, Any] | None = None
 
     def _check_name(
         self, submitted: str, subentry: ConfigSubentry | None
@@ -1009,6 +1011,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            self._pricing_input = dict(user_input)
             method = user_input.get("guest_pricing_method", "fixed")
             price = user_input.get("price_per_kwh")
             markup = user_input.get("markup_factor")
@@ -1034,35 +1037,35 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                     data=self._user_data,
                 )
 
-        return self.async_show_form(
-            step_id="guest_pricing",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("guest_pricing_method"): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=[
-                                {"value": "fixed", "label": "Fixed price"},
-                                {"value": "markup", "label": "Markup"},
-                            ],
-                            mode=selector.SelectSelectorMode.LIST,
-                        )
+        schema = vol.Schema(
+            {
+                vol.Required("guest_pricing_method"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": "fixed", "label": "Fixed price"},
+                            {"value": "markup", "label": "Markup"},
+                        ],
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+                vol.Optional("price_per_kwh"): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(min=0.01, max=100.0, step=0.01)
                     ),
-                    vol.Optional("price_per_kwh"): vol.All(
-                        selector.NumberSelector(
-                            selector.NumberSelectorConfig(min=0.01, max=100.0, step=0.01)
-                        ),
-                        vol.Coerce(float),
+                    vol.Coerce(float),
+                ),
+                vol.Optional("markup_factor"): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(min=1.01, max=10.0, step=0.01)
                     ),
-                    vol.Optional("markup_factor"): vol.All(
-                        selector.NumberSelector(
-                            selector.NumberSelectorConfig(min=1.01, max=10.0, step=0.01)
-                        ),
-                        vol.Coerce(float),
-                    ),
-                }
-            ),
-            errors=errors,
+                    vol.Coerce(float),
+                ),
+            }
         )
+        if self._pricing_input is not None:
+            schema = self.add_suggested_values_to_schema(schema, self._pricing_input)
+
+        return self.async_show_form(step_id="guest_pricing", data_schema=schema, errors=errors)
 
     async def _apply_active_change(
         self, entry: ConfigEntry, subentry_id: str, new_active: bool, was_active: bool
@@ -1154,6 +1157,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            self._pricing_input = dict(user_input)
             method = user_input.get("guest_pricing_method", "fixed")
             price = user_input.get("price_per_kwh")
             markup = user_input.get("markup_factor")
@@ -1195,7 +1199,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
 
         # Pre-fill with existing pricing
         existing_pricing = dict(subentry.data.get("guest_pricing", {}))
-        suggested = {
+        suggested = self._pricing_input or {
             "guest_pricing_method": existing_pricing.get("method", "fixed"),
             "price_per_kwh": existing_pricing.get("price_per_kwh"),
             "markup_factor": existing_pricing.get("markup_factor"),

@@ -1081,6 +1081,39 @@ async def test_guest_rename_rechecked_when_pricing_is_saved(hass: HomeAssistant)
     assert all(m.data["active"] for m in _get_subentries_by_type(loaded, "rfid_mapping"))
 
 
+async def test_guest_reconfigure_keeps_typed_price_after_commit_point_error(
+    hass: HomeAssistant,
+) -> None:
+    """V-2: after the commit-point error the pricing page offers the typed price, not the stored."""
+    entry = _make_entry()
+    await setup_session_engine(hass, entry)
+    await _add_guest_user_fixed(hass, entry.entry_id, "Visitor", price_per_kwh=4.5)
+    guest = _user_sub(hass, entry.entry_id, "Visitor")
+    await _add_rfid_mapping(hass, entry.entry_id, card_index=1, user_id=guest.subentry_id)
+    result = await _reconfigure_user(
+        hass, entry.entry_id, guest.subentry_id, {"name": "Visitor B", "active": True}
+    )
+    await start_charging_session(hass, trx_value="2")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 7.25}
+    )
+    assert result["errors"] == {"name": "user_in_session"}
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Visitor", "active": True}
+    )
+
+    assert result["step_id"] == "reconfigure_guest_pricing"
+    assert _suggested(result)["guest_pricing_method"] == "fixed"
+    assert _suggested(result)["price_per_kwh"] == 7.25
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], _suggested(result)
+    )
+    assert result["reason"] == "reconfigure_successful"
+    sub = hass.config_entries.async_get_entry(entry.entry_id).subentries[guest.subentry_id]
+    assert sub.data["guest_pricing"] == {"method": "fixed", "price_per_kwh": 7.25}
+
+
 async def _start_guest_add(hass: HomeAssistant, entry_id: str, name: str) -> dict:
     result = await hass.config_entries.subentries.async_init(
         (entry_id, "user"), context={"source": "user"}
@@ -1113,6 +1146,34 @@ async def test_guest_add_name_rechecked_when_pricing_is_saved(hass: HomeAssistan
     assert _suggested(result) == {"name": "Petra", "type": "guest"}
     loaded = hass.config_entries.async_get_entry(entry.entry_id)
     assert [u.subentry_id for u in _get_subentries_by_type(loaded, "user")] == [paul.subentry_id]
+
+
+async def test_guest_add_keeps_typed_price_after_commit_point_error(hass: HomeAssistant) -> None:
+    """V-2: after the commit-point error the pricing page offers the price typed before."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_regular_user(hass, entry.entry_id, "Paul")
+    result = await _start_guest_add(hass, entry.entry_id, "Petra")
+    paul = _user_sub(hass, entry.entry_id, "Paul")
+    await _reconfigure_user(
+        hass, entry.entry_id, paul.subentry_id, {"name": "Petra", "active": True}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 7.25}
+    )
+    assert result["errors"] == {"name": "name_not_unique"}
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Gina", "type": "guest"}
+    )
+
+    assert result["step_id"] == "guest_pricing"
+    assert _suggested(result) == {"guest_pricing_method": "fixed", "price_per_kwh": 7.25}
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], _suggested(result)
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"]["guest_pricing"] == {"method": "fixed", "price_per_kwh": 7.25}
 
 
 async def _session_of_deleted_user(hass: HomeAssistant, entry: MockConfigEntry, profile: str):

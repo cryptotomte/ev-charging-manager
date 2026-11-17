@@ -144,6 +144,30 @@ def test_inactive_mapping_returns_unknown(caplog):
     assert "inactive" in caplog.text
 
 
+def test_active_mapping_of_inactive_user_returns_unknown(caplog):
+    """T-12: active mapping, inactive user → Unknown/rfid_inactive; active user still resolves."""
+    import logging
+
+    inactive_petra = {**USER_PETRA, "active": False}
+    lookup = make_lookup(
+        mappings=[MAPPING_PETRA_CARD1], users=[inactive_petra], vehicles=[VEHICLE_PEUGEOT]
+    )
+    with caplog.at_level(logging.WARNING):
+        result = lookup.resolve(2)
+    assert result.user_name == "Unknown"
+    assert result.user_type == "unknown"
+    assert result.reason == "rfid_inactive"
+    assert result.rfid_index == 1
+    assert "inactive user" in caplog.text
+
+    lookup = make_lookup(
+        mappings=[MAPPING_PETRA_CARD1], users=[USER_PETRA], vehicles=[VEHICLE_PEUGEOT]
+    )
+    result = lookup.resolve(2)
+    assert result.user_name == "Petra"
+    assert result.reason == "matched"
+
+
 def test_unexpected_format_returns_unknown(caplog):
     """trx='abc' is unexpected format → Unknown + warning."""
     import logging

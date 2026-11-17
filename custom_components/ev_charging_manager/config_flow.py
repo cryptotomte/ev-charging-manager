@@ -1132,6 +1132,13 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                     pricing["markup_factor"] = markup
                 self._user_data["guest_pricing"] = pricing
 
+                await self._apply_active_change(
+                    entry,
+                    subentry.subentry_id,
+                    self._user_data["active"],
+                    subentry.data.get("active", True),
+                )
+
                 title = self._user_data["name"]
                 if not self._user_data.get("active", True):
                     title = f"{title} (inactive)"

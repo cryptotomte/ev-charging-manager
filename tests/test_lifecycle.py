@@ -238,6 +238,99 @@ async def test_selective_reactivation_fr009(hass: HomeAssistant) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Spec 026 D-11: guest deactivation cascades like a regular user's
+# ---------------------------------------------------------------------------
+
+_GUEST_PRICING = {"guest_pricing_method": "fixed", "price_per_kwh": 4.5}
+
+
+async def _add_guest(hass, entry_id, name="Visitor"):
+    result = await hass.config_entries.subentries.async_init(
+        (entry_id, "user"),
+        context={"source": "user"},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": name, "type": "guest"}
+    )
+    return await hass.config_entries.subentries.async_configure(result["flow_id"], _GUEST_PRICING)
+
+
+async def _reconfigure_guest(hass, entry_id, subentry_id, active, pricing=_GUEST_PRICING):
+    result = await _reconfigure_user(hass, entry_id, subentry_id, "Visitor", active)
+    assert result["step_id"] == "reconfigure_guest_pricing"
+    return await hass.config_entries.subentries.async_configure(result["flow_id"], pricing)
+
+
+async def _guest_with_two_mappings(hass):
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_guest(hass, entry.entry_id)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    guest = _get_subentries_by_type(loaded, "user")[0]
+    await _add_rfid(hass, entry.entry_id, 0, guest.subentry_id)
+    await _add_rfid(hass, entry.entry_id, 1, guest.subentry_id)
+    await hass.async_block_till_done()
+    return entry, guest
+
+
+async def test_guest_deactivation_cascade(hass: HomeAssistant) -> None:
+    """T-09: deactivating a guest deactivates its mappings with user_cascade."""
+    entry, guest = await _guest_with_two_mappings(hass)
+
+    result = await _reconfigure_guest(hass, entry.entry_id, guest.subentry_id, False)
+    await hass.async_block_till_done()
+
+    assert result["type"] == FlowResultType.ABORT
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert loaded.subentries[guest.subentry_id].data["active"] is False
+    mappings = _get_subentries_by_type(loaded, "rfid_mapping")
+    assert len(mappings) == 2
+    for m in mappings:
+        assert m.data["active"] is False
+        assert m.data["deactivated_by"] == "user_cascade"
+
+
+async def test_guest_reactivation_restores_only_cascaded_mappings(hass: HomeAssistant) -> None:
+    """T-10: reactivating a guest restores user_cascade mappings, not individual ones."""
+    entry, guest = await _guest_with_two_mappings(hass)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    mappings = _get_subentries_by_type(loaded, "rfid_mapping")
+    mapping_0 = next(m for m in mappings if m.data["card_index"] == 0)
+    mapping_1 = next(m for m in mappings if m.data["card_index"] == 1)
+    await _reconfigure_rfid(
+        hass, entry.entry_id, mapping_1.subentry_id, guest.subentry_id, active=False
+    )
+
+    await _reconfigure_guest(hass, entry.entry_id, guest.subentry_id, False)
+    await _reconfigure_guest(hass, entry.entry_id, guest.subentry_id, True)
+    await hass.async_block_till_done()
+
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert loaded.subentries[mapping_0.subentry_id].data["active"] is True
+    assert loaded.subentries[mapping_0.subentry_id].data["deactivated_by"] is None
+    assert loaded.subentries[mapping_1.subentry_id].data["active"] is False
+    assert loaded.subentries[mapping_1.subentry_id].data["deactivated_by"] == "individual"
+
+
+async def test_guest_pricing_error_changes_no_mapping(hass: HomeAssistant) -> None:
+    """T-11: a pricing validation error leaves every mapping as it was."""
+    entry, guest = await _guest_with_two_mappings(hass)
+
+    result = await _reconfigure_guest(
+        hass, entry.entry_id, guest.subentry_id, False, {"guest_pricing_method": "fixed"}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "price_required"}
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert loaded.subentries[guest.subentry_id].data["active"] is True
+    for m in _get_subentries_by_type(loaded, "rfid_mapping"):
+        assert m.data["active"] is True
+        assert m.data["deactivated_by"] is None
+
+
+# ---------------------------------------------------------------------------
 # T040: Individual RFID mapping deactivation
 # ---------------------------------------------------------------------------
 

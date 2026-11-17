@@ -42,7 +42,7 @@
                     "total_energy_entity": "Sensor reporting total lifetime energy dispensed",
                     "rfid_uid_entity": "Sensor reporting the last scanned RFID UID (requires rde=true for go-e)",
                     "charger_name": "Friendly name for this charger (shown in device registry)",
-                    "charger_host": "IP address or hostname of the charger (required for go-e direct API access in PR-08)"
+                    "charger_host": "IP address or hostname of the charger (required for go-e direct API access)"
                 }
             },
             "pricing": {
@@ -342,7 +342,7 @@
                 "markup_required": "Markup factor is required when using markup pricing method.",
                 "name_empty": "Enter a name.",
                 "name_reserved": "This name is reserved. A name needs at least one letter or digit and cannot be Guest or Unknown.",
-                "name_not_unique": "Another user already has this name, or one that differs only in case, spacing or accents.",
+                "name_not_unique": "Another user already has this name, or one that differs only in case, accents, spaces or punctuation.",
                 "user_in_session": "This user has a charging session in progress. Change the name after the session has ended.",
                 "name_in_session": "A charging session in progress is recorded under this name. Try again when it has ended."
             }
@@ -408,10 +408,10 @@
                 "no_available_slots": "All 10 card slots (0-9) are already in use.",
                 "discovery_failed": "The cards could not be read from the charger. Choose the card slot manually.",
                 "all_slots_mapped": "All cards programmed in the charger are already mapped. Choose the card slot manually.",
-                "no_programmed_cards": "No cards are programmed in the charger. Program the card in the go-e app, or choose the card slot manually."
+                "no_programmed_cards": "No programmed cards were found in the charger. Program the card in the go-e app, or choose the card slot manually."
             },
             "abort": {
-                "no_users": "No active users found. Please add at least one user before creating RFID mappings."
+                "no_users": "No active users. Add a user or activate one first."
             }
         }
     }

@@ -102,6 +102,31 @@ async def test_rt02_interruption_younger_than_the_periodic_save(
     _assert_one_paul_session(rig)
 
 
+async def test_rt05_orderly_stop_writes_the_engine_state(hass, hass_storage, freezer) -> None:
+    """RT-05: after ``async_stop`` the snapshot on disk holds the engine's energy.
+
+    The last periodic save (10:15) holds 1.5 kWh; the engine holds 2.5 kWh at the stop.
+    """
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.5)
+    await rig.goto("10:17:00")
+    await rig.set(energy=2.5)
+    await rig.goto("10:17:30")
+    engine = rig.engine
+
+    await hass.async_stop()
+
+    snapshot = rig.snapshot()
+    assert snapshot is not None
+    assert snapshot["energy_kwh"] == engine.active_session.energy_kwh == 2.5
+    assert snapshot["cost_total_kr"] == 6.25
+    assert snapshot["resume_state"]["pricing"] == {"mode": "static", "static_price_kwh": 2.5}
+
+
 async def _finish_charge(rig: Rig, *, fire: bool = True) -> None:
     """The car charges to 4.0 kWh and stops; with fire=False this happens while down."""
     await rig.goto("10:25:00", fire=fire)

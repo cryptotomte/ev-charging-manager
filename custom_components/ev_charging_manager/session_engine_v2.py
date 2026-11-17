@@ -303,27 +303,11 @@ class PlugAnchoredSessionEngine:
         # same loop iteration.
         self._recovery_resolved: bool = False
 
-        # Build pricing engine from entry data (immutable at runtime)
-        pricing_mode = entry.data.get("pricing_mode", "static")
-        spot_config: SpotConfig | None = None
-        if pricing_mode == "spot":
-            spot_config = SpotConfig(
-                price_entity=entry.data.get(CONF_SPOT_PRICE_ENTITY, ""),
-                additional_cost_kwh=entry.data.get(
-                    CONF_SPOT_ADDITIONAL_COST_KWH, DEFAULT_SPOT_ADDITIONAL_COST_KWH
-                ),
-                vat_multiplier=entry.data.get(
-                    CONF_SPOT_VAT_MULTIPLIER, DEFAULT_SPOT_VAT_MULTIPLIER
-                ),
-                fallback_price_kwh=entry.data.get(
-                    CONF_SPOT_FALLBACK_PRICE_KWH, DEFAULT_SPOT_FALLBACK_PRICE_KWH
-                ),
-            )
-        self._pricing = PricingEngine(
-            mode=pricing_mode,
-            static_price=entry.data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
-            spot_config=spot_config,
-        )
+        # The price parameters of the session in progress (spec 027 D-35/D-36), stored
+        # with its snapshot; the entry's between sessions.
+        self._pricing_params: dict[str, Any] = {}
+        self._pricing: PricingEngine
+        self._apply_pricing(self._entry_pricing_params())
 
     # -----------------------------------------------------------------------
     # Public interface (coordinator-callable, same as legacy SessionEngine)
@@ -428,10 +412,53 @@ class PlugAnchoredSessionEngine:
         return SessionSubState.INITIALIZING
 
     def get_active_session_dict(self) -> dict | None:
-        """Return the active session as a dict for periodic persistence, or None."""
-        if self._active_session is None:
+        """Return the active snapshot, or None: the session fields plus ``resume_state``.
+
+        Spec 027 D-35: ``resume_state`` holds the values that otherwise exist only in
+        memory and exists only in the active snapshot, never in a completed record.
+        Every snapshot writer goes through here.
+        """
+        session = self._active_session
+        if session is None:
             return None
-        return self._active_session.to_dict()
+        snapshot = session.to_dict()
+        snapshot["resume_state"] = {
+            "pricing": dict(self._pricing_params),
+            "guest_pricing": (
+                None if self._guest_pricing is None else self._guest_pricing.to_dict()
+            ),
+            "spot_hour": (
+                {
+                    "start": self._hour_start_time,
+                    "price": self._current_hour_price,
+                    "fallback": self._current_hour_price is None,
+                }
+                if self._pricing.mode == "spot"
+                else None
+            ),
+        }
+        return snapshot
+
+    async def async_write_snapshot(self, session_id: str | None = None) -> None:
+        """Write the active snapshot (spec 027 D-42).
+
+        With ``session_id``, the write is skipped unless the engine still holds that
+        session, so a late write cannot resurrect a discarded or completed one.
+        """
+        session = self._active_session
+        if session is None or (session_id is not None and session.id != session_id):
+            return
+        try:
+            await self._session_store.async_save_active_session(self.get_active_session_dict())
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: snapshot write failed (id=%s): %s", session.id, err
+            )
+
+    def _schedule_snapshot_write(self) -> None:
+        """Write the snapshot at a session event (spec 027 D-42) for the session held now."""
+        if self._active_session is not None:
+            self._hass.async_create_task(self.async_write_snapshot(self._active_session.id))
 
     async def async_unload(self) -> None:
         """Tear down engine-managed listeners (BUG-6 fix).
@@ -450,7 +477,7 @@ class PlugAnchoredSessionEngine:
         # completion just finished.
         if self._active_session is not None:
             try:
-                await self._session_store.async_save_active_session(self._active_session.to_dict())
+                await self._session_store.async_save_active_session(self.get_active_session_dict())
                 _LOGGER.debug(
                     "PlugAnchoredSessionEngine: final active-session snapshot "
                     "persisted at unload (id=%s)",
@@ -817,6 +844,8 @@ class PlugAnchoredSessionEngine:
         # restart resume) on the engine flag, so completion's
         # `session.data_gap = self._data_gap` transfer cannot wipe it later.
         self._data_gap = True
+        # Spec 027 D-41.
+        self._eto_start = session.charger_total_before_kwh
 
         # BUG-2 fix: re-arm the spot-pricing hourly snapshot callback after restart.
         # Without this, _hourly_unsub stays None, the hourly callback never fires,
@@ -962,7 +991,7 @@ class PlugAnchoredSessionEngine:
         # write is what keeps the on-disk copy fresh; if it fails the original
         # snapshot is still on disk (non-fatal — log and continue tracking).
         try:
-            await self._session_store.async_save_active_session(session.to_dict())
+            await self._session_store.async_save_active_session(self.get_active_session_dict())
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
                 "PlugAnchoredSessionEngine: immediate post-resume snapshot re-persist "
@@ -1459,6 +1488,7 @@ class PlugAnchoredSessionEngine:
                     "treating as transient disconnect, starting grace timer",
                 )
             self._start_grace_timer()
+            self._schedule_snapshot_write()
 
     def _handle_cable_lock_confirmation(self, new_val: str | None) -> None:
         """Confirm a genuine unplug from a late cable_lock→Unlocked (PR-25, FR-001).
@@ -1869,6 +1899,7 @@ class PlugAnchoredSessionEngine:
                 f"energy_start={energy_now:.3f}kWh "
                 f"session_id={session.id}",
             )
+        self._schedule_snapshot_write()
 
     def _start_idle_timer(self, _now: datetime) -> None:
         """Start the charging-idle timer (T026). Fires when power has been 0 for idle_timeout."""
@@ -1947,6 +1978,8 @@ class PlugAnchoredSessionEngine:
                 "session_window_count": session.charging_window_count,
             },
         )
+        # No-op inside a completion: the pipeline has already claimed the session.
+        self._schedule_snapshot_write()
 
     # -----------------------------------------------------------------------
     # Energy tracking (T028)
@@ -2132,6 +2165,8 @@ class PlugAnchoredSessionEngine:
             self._window_tracker = ChargingWindowTracker()
             self._data_gap = False
             self._eto_start = self._get_eto()
+            # Spec 027 D-41: stored at start so an interruption cannot lose it.
+            self._active_session.charger_total_before_kwh = self._eto_start
 
             # Snapshot guest pricing (Constitution §II Snapshot Principle)
             if resolution is not None and resolution.guest_pricing is not None:
@@ -2211,6 +2246,8 @@ class PlugAnchoredSessionEngine:
             if power > 0:
                 self._open_window(now)
                 self._dispatch_update()
+
+            await self.async_write_snapshot()
 
         except Exception as err:  # noqa: BLE001
             _LOGGER.error(
@@ -2843,6 +2880,7 @@ class PlugAnchoredSessionEngine:
         # FR-009 (PR-29): capture the price for the hour that starts at this boundary.
         self._capture_hour_price()
         self._dispatch_update()
+        self._schedule_snapshot_write()
 
     # -----------------------------------------------------------------------
     # Charger-offline detection (FR-028)
@@ -2941,8 +2979,48 @@ class PlugAnchoredSessionEngine:
         except (ValueError, TypeError):
             return None
 
+    def _entry_pricing_params(self) -> dict[str, Any]:
+        """The price parameters configured in the entry, in the ``resume_state`` shape."""
+        data = self._entry.data
+        mode = data.get("pricing_mode", "static")
+        if mode == "spot":
+            return {
+                "mode": mode,
+                CONF_SPOT_PRICE_ENTITY: data.get(CONF_SPOT_PRICE_ENTITY, ""),
+                CONF_SPOT_ADDITIONAL_COST_KWH: data.get(
+                    CONF_SPOT_ADDITIONAL_COST_KWH, DEFAULT_SPOT_ADDITIONAL_COST_KWH
+                ),
+                CONF_SPOT_VAT_MULTIPLIER: data.get(
+                    CONF_SPOT_VAT_MULTIPLIER, DEFAULT_SPOT_VAT_MULTIPLIER
+                ),
+                CONF_SPOT_FALLBACK_PRICE_KWH: data.get(
+                    CONF_SPOT_FALLBACK_PRICE_KWH, DEFAULT_SPOT_FALLBACK_PRICE_KWH
+                ),
+            }
+        return {
+            "mode": mode,
+            CONF_STATIC_PRICE_KWH: data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
+        }
+
+    def _apply_pricing(self, params: dict[str, Any]) -> None:
+        """Price the session with ``params`` (``_entry_pricing_params`` shape)."""
+        self._pricing_params = params
+        spot_config: SpotConfig | None = None
+        if params["mode"] == "spot":
+            spot_config = SpotConfig(
+                price_entity=params[CONF_SPOT_PRICE_ENTITY],
+                additional_cost_kwh=params[CONF_SPOT_ADDITIONAL_COST_KWH],
+                vat_multiplier=params[CONF_SPOT_VAT_MULTIPLIER],
+                fallback_price_kwh=params[CONF_SPOT_FALLBACK_PRICE_KWH],
+            )
+        self._pricing = PricingEngine(
+            mode=params["mode"],
+            static_price=params.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
+            spot_config=spot_config,
+        )
+
     def _read_spot_price(self) -> float | None:
-        entity_id = self._entry.data.get(CONF_SPOT_PRICE_ENTITY)
+        entity_id = self._pricing_params.get(CONF_SPOT_PRICE_ENTITY)
         if not entity_id:
             return None
         state = self._hass.states.get(entity_id)
@@ -2995,7 +3073,7 @@ class PlugAnchoredSessionEngine:
             _LOGGER.warning(
                 "Spot price sensor '%s' unavailable at hour start (%s) — "
                 "fallback %.2f kr/kWh will price this hour",
-                self._entry.data.get(CONF_SPOT_PRICE_ENTITY),
+                self._pricing_params.get(CONF_SPOT_PRICE_ENTITY),
                 self._hour_start_time,
                 self._pricing.fallback_price or 0.0,
             )

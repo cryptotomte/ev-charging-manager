@@ -256,6 +256,7 @@ async def test_rt30_snapshot_written_by_047_spot(hass, hass_storage, freezer) ->
 
 
 BAD_PRICE = {"mode": "static", "static_price_kwh": "4"}
+BAD_HOUR = {"start": "x", "price": 9.0, "fallback": False}
 
 
 @pytest.mark.parametrize(
@@ -265,7 +266,7 @@ BAD_PRICE = {"mode": "static", "static_price_kwh": "4"}
         (TRX_GFIX, "static", {}, (10.0, 20.0)),
         (TRX_PAUL, "static", {"pricing": BAD_PRICE}, (10.0, None)),
         (TRX_GFIX, "static", {"pricing": None, "guest_pricing": {"method": "fixed"}}, (10.0, 20.0)),
-        (TRX_PAUL, "spot", {"pricing": SPOT_PRICING, "spot_hour": {"start": "x"}}, (16.0, None)),
+        (TRX_PAUL, "spot", {"pricing": SPOT_PRICING, "spot_hour": BAD_HOUR}, (16.0, None)),
     ],
     ids=["not-a-dict", "empty", "pricing-malformed", "guest-malformed", "spot-hour-malformed"],
 )  # fmt: skip

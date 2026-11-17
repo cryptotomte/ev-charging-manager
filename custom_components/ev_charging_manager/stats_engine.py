@@ -420,6 +420,14 @@ class StatsEngine:
 
     async def async_rename_user(self, old_name: str, new_name: str) -> None:
         """Move a user's bucket to a new name, totals and months unchanged (spec 026 D-7)."""
+        if new_name in self._user_stats:
+            # D-26: never overwrite another bucket.
+            _LOGGER.warning(
+                "Not moving statistics of %s to %s: a bucket with that name exists",
+                old_name,
+                new_name,
+            )
+            return
         stats = self._user_stats.pop(old_name, None)
         if stats is None:
             return

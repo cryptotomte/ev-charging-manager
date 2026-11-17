@@ -683,7 +683,202 @@ async def test_stats_sensor_helpers_without_platform_data(hass: HomeAssistant) -
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA)
 
     async_add_user_stats_sensors(hass, entry, "sid", "Paul")
-    async_remove_user_stats_sensors(hass, entry, "sid", "Paul", remove_registry=True)
-    await async_rename_user_stats_sensors(hass, entry, "sid", "Paul", "Pelle", move_registry=True)
+    await async_remove_user_stats_sensors(hass, entry, "sid", "Paul", remove_registry=True)
+    await async_rename_user_stats_sensors(
+        hass, entry, "sid", "Paul", "Pelle", move_registry=True, clear_target=True, add_new=True
+    )
 
     assert DOMAIN not in hass.data
+
+
+# ---------------------------------------------------------------------------
+# D-26, D-27, D-28: names and slugs shared with other users, Unknown or the guest totals
+# ---------------------------------------------------------------------------
+
+
+def _guest_total_ids(hass: HomeAssistant, entry: MockConfigEntry) -> tuple[str, str]:
+    registry = er.async_get(hass)
+    return tuple(
+        registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_guest_total_{m}")
+        for m in ("energy", "cost")
+    )
+
+
+async def test_api_rename_onto_configured_name_keeps_both_buckets(hass: HomeAssistant) -> None:
+    """D-26: renaming onto another user's exact name moves and removes no bucket."""
+    entry = await _setup(hass, _user("Paul", "guest"), _user("Eva", "guest"))
+    await _completed(hass, "Paul", 10.0, 40.0, "guest")
+    await _completed(hass, "Eva", 5.0, 20.0, "guest")
+    energy_id, _ = _guest_total_ids(hass, entry)
+
+    _api_rename(hass, entry, "Eva", "Paul")
+    await hass.async_block_till_done()
+
+    engine = _engine(hass, entry)
+    assert engine.user_stats["Paul"].total_energy_kwh == 10.0
+    assert engine.user_stats["Eva"].total_energy_kwh == 5.0
+    assert engine.guest_retired == {"energy_kwh": 0.0, "cost_kr": 0.0}
+    assert _state(hass, energy_id) == "15.0"
+
+
+async def test_api_rename_onto_configured_name_without_bucket(hass: HomeAssistant) -> None:
+    """D-26: the renamed user's bucket does not become the bucket of the name's holder."""
+    entry = await _setup(hass, _user("Paul"), _user("Eva"))
+    await _completed(hass, "Paul", 4.0, 10.0)
+
+    _api_rename(hass, entry, "Paul", "Eva")
+    await hass.async_block_till_done()
+
+    stats = _engine(hass, entry).user_stats
+    assert stats["Paul"].total_energy_kwh == 4.0
+    assert "Eva" not in stats
+
+
+async def test_api_rename_onto_unknown_keeps_unknown_bucket(hass: HomeAssistant) -> None:
+    """D-26: renaming onto "Unknown" leaves the Unknown bucket and the user's own alone."""
+    entry = await _setup(hass, _user("Eva"))
+    await _completed(hass, "Unknown", 30.0, 60.0, "unknown")
+    await _completed(hass, "Eva", 5.0, 20.0)
+
+    _api_rename(hass, entry, "Eva", "Unknown")
+    await hass.async_block_till_done()
+
+    stats = _engine(hass, entry).user_stats
+    assert (stats["Unknown"].total_energy_kwh, stats["Unknown"].user_type) == (30.0, "unknown")
+    assert stats["Eva"].total_energy_kwh == 5.0
+
+
+async def test_rename_user_refuses_to_overwrite_a_bucket(hass: HomeAssistant, caplog) -> None:
+    """D-26: the engine never moves a bucket onto an existing one."""
+    entry = await _setup(hass, _user("Paul"))
+    await _completed(hass, "Paul", 4.0, 10.0)
+    await _completed(hass, "Eva", 5.0, 20.0)
+    engine = _engine(hass, entry)
+
+    await engine.async_rename_user("Paul", "Eva")
+
+    assert engine.user_stats["Paul"].total_energy_kwh == 4.0
+    assert engine.user_stats["Eva"].total_energy_kwh == 5.0
+    assert [r.levelname for r in caplog.records if "Not moving statistics" in r.message] == [
+        "WARNING"
+    ]
+
+
+async def test_rename_removes_stale_entry_when_own_entry_is_missing(hass: HomeAssistant) -> None:
+    """D-26: a leftover at the target unique_id goes even if the user deleted its own entry."""
+    entry = await _setup(hass, _user("Anna"))
+    registry = er.async_get(hass)
+    registry.async_remove(_entity_ids(hass, entry, "Anna")[0])
+    stale = registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        f"{entry.entry_id}_bob_total_energy",
+        suggested_object_id="old_bob_total_energy",
+        config_entry=entry,
+    )
+    await hass.async_block_till_done()
+    registry_events = async_capture_events(hass, er.EVENT_ENTITY_REGISTRY_UPDATED)
+
+    await _rename_user(hass, entry, "Anna", "Bob")
+
+    assert {"action": "remove", "entity_id": stale.entity_id} in [
+        {k: e.data[k] for k in ("action", "entity_id")} for e in registry_events
+    ]
+    # Bob's new sensor re-creates the unique_id, and Home Assistant restores the
+    # deleted entry with its entity id (spec 026 § 13.2).
+    assert _entity_ids(hass, entry, "Bob")[0] == stale.entity_id
+
+
+async def test_delete_legacy_user_named_guest_keeps_guest_total_entries(
+    hass: HomeAssistant,
+) -> None:
+    """D-27: the registry entries of the guest totals survive deleting a user named Guest."""
+    entry = await _setup(hass, _user("Guest", "guest"), _user("Visitor", "guest"))
+    await _completed(hass, "Guest", 100.0, 400.0, "guest")
+    await _completed(hass, "Visitor", 50.0, 200.0, "guest")
+    ids = _guest_total_ids(hass, entry)
+
+    await _delete_user(hass, entry, "Guest")
+
+    assert _guest_total_ids(hass, entry) == ids
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert (_state(hass, ids[0]), _state(hass, ids[1])) == ("150.0", "600.0")
+
+
+async def test_rename_legacy_user_named_guest_keeps_guest_total_entries(
+    hass: HomeAssistant,
+) -> None:
+    """D-27: renaming a user named Guest moves none of the guest totals' registry entries."""
+    entry = await _setup(hass, _user("Guest"))
+    ids = _guest_total_ids(hass, entry)
+
+    await _rename_user(hass, entry, "Guest", "Gina")
+
+    assert _guest_total_ids(hass, entry) == ids
+    assert None not in _entity_ids(hass, entry, "Gina")
+
+
+async def test_rename_legacy_user_named_unknown_hands_sensors_to_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """D-28: after the rename the Unknown sensors show the Unknown bucket without a restart."""
+    entry = await _setup(hass, _user("Unknown"))
+    await _completed(hass, "Unknown", 3.0, 7.5, "unknown")
+    ids = _entity_ids(hass, entry, "Unknown")
+
+    await _rename_user(hass, entry, "Unknown", "Kalle")
+
+    assert _entity_ids(hass, entry, "Unknown") == ids
+    assert _state(hass, ids[0]) == "3.0"
+    await _completed(hass, "Unknown", 1.0, 2.5, "unknown")
+    assert _state(hass, ids[0]) == "4.0"
+    assert _engine(hass, entry).user_stats["Unknown"].total_energy_kwh == 4.0
+    assert None not in _entity_ids(hass, entry, "Kalle")
+
+
+async def test_delete_legacy_user_named_unknown_hands_sensors_to_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """D-28: after the delete the Unknown sensors keep following the Unknown bucket."""
+    entry = await _setup(hass, _user("Unknown"))
+    ids = _entity_ids(hass, entry, "Unknown")
+
+    await _delete_user(hass, entry, "Unknown")
+    await _completed(hass, "Unknown", 1.0, 2.5, "unknown")
+
+    assert _entity_ids(hass, entry, "Unknown") == ids
+    assert _state(hass, ids[0]) == "1.0"
+
+
+async def test_delete_slug_sharer_owning_live_sensors(hass: HomeAssistant) -> None:
+    """D-28: the remaining user of the slug takes over the live sensors at once."""
+    entry = await _setup(hass, _user("paul"), _user("Paul"))  # "paul" is added first
+    await _completed(hass, "Paul", 4.0, 10.0)
+    await _completed(hass, "paul", 1.0, 2.0)
+    ids = _entity_ids(hass, entry, "paul")
+    assert _state(hass, ids[0]) == "1.0"
+
+    await _delete_user(hass, entry, "paul")
+
+    assert _entity_ids(hass, entry, "Paul") == ids
+    assert _state(hass, ids[0]) == "4.0"
+    await _completed(hass, "Paul", 2.0, 5.0)
+    assert _state(hass, ids[0]) == "6.0"
+    tracked = hass.data[DOMAIN][entry.entry_id]["stats_platform"]["user_entities"]
+    assert [s._user_name for s in tracked[_sid(hass, entry, "Paul")]] == ["Paul"] * 5
+
+
+async def test_rename_slug_sharer_owning_live_sensors(hass: HomeAssistant) -> None:
+    """D-28: after the owner's rename the other user's sensors show its bucket at once."""
+    entry = await _setup(hass, _user("Paul"), _user("paul"))  # "Paul" is added first
+    await _completed(hass, "Paul", 4.0, 10.0)
+    await _completed(hass, "paul", 1.0, 2.0)
+    ids = _entity_ids(hass, entry, "paul")
+
+    await _rename_user(hass, entry, "Paul", "Pelle")
+
+    assert _state(hass, ids[0]) == "1.0"
+    assert _state(hass, _entity_ids(hass, entry, "Pelle")[0]) == "4.0"
+    await _completed(hass, "paul", 2.0, 4.0)
+    assert _state(hass, ids[0]) == "3.0"

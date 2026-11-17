@@ -97,33 +97,59 @@ def _stats_platform(hass: HomeAssistant, entry: ConfigEntry) -> dict | None:
 
 
 def async_add_user_stats_sensors(
-    hass: HomeAssistant, entry: ConfigEntry, subentry_id: str, user_name: str
+    hass: HomeAssistant, entry: ConfigEntry, subentry_id: str | None, user_name: str
 ) -> None:
-    """Create and add one user's five statistics sensors (D-4)."""
+    """Create and add one user's five statistics sensors (D-4).
+
+    ``subentry_id`` None is the Unknown bucket, whose sensors are not tracked.
+    """
     platform = _stats_platform(hass, entry)
     if platform is None:
         return
     sensors = create_user_stats_sensors(hass, entry, user_name)
-    platform["user_entities"][subentry_id] = sensors
+    if subentry_id is not None:
+        platform["user_entities"][subentry_id] = sensors
     platform["add_entities"](sensors)
 
 
-def async_remove_user_stats_sensors(
+async def _async_hand_over(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    sensors: list,
+    heir: tuple[str | None, str] | None,
+) -> None:
+    """Remove a user's live sensors; if it had any, the slug's remaining holder gets them (D-28).
+
+    The registry entries stay, so the heir's new sensors take over their entity ids.
+    """
+    # Entities never added (disabled, or a legacy duplicate unique_id) have no hass.
+    live = [sensor for sensor in sensors if sensor.hass is not None]
+    for sensor in live:
+        await sensor.async_remove()
+    if live and heir is not None:
+        async_add_user_stats_sensors(hass, entry, *heir)
+
+
+async def async_remove_user_stats_sensors(
     hass: HomeAssistant,
     entry: ConfigEntry,
     subentry_id: str,
     user_name: str,
     remove_registry: bool,
+    heir: tuple[str | None, str] | None = None,
 ) -> None:
     """Remove a deleted user's five registry entries, and with them the live entities (D-5).
 
-    Removing by unique_id also covers entities the user had disabled.
+    Removing by unique_id also covers entities the user had disabled. When the
+    slug is shared or protected (D-27, D-28) the registry entries stay and only
+    the live entities change hands.
     """
     platform = _stats_platform(hass, entry)
     if platform is None:
         return
-    platform["user_entities"].pop(subentry_id, None)
+    sensors = platform["user_entities"].pop(subentry_id, [])
     if not remove_registry:
+        await _async_hand_over(hass, entry, sensors, heir)
         return
     registry = er.async_get(hass)
     for sensor in create_user_stats_sensors(hass, entry, user_name):
@@ -137,35 +163,38 @@ async def async_rename_user_stats_sensors(
     subentry_id: str,
     old_name: str,
     new_name: str,
+    *,
     move_registry: bool,
+    clear_target: bool,
+    add_new: bool,
+    heir: tuple[str | None, str] | None = None,
 ) -> None:
     """Move a renamed user's registry entries and replace the live entities (D-7).
 
     Moving the registry entries keeps entity ids and history. An entry already
-    holding a target unique_id is a leftover (D-10 keeps the new slug unique) and
-    is removed first.
+    holding a target unique_id that no other user holds is a leftover and is
+    removed (D-26), also when the user has no entry of its own to move.
     """
     platform = _stats_platform(hass, entry)
     if platform is None:
         return
-    if move_registry:
-        registry = er.async_get(hass)
-        for old, new in zip(
-            create_user_stats_sensors(hass, entry, old_name),
-            create_user_stats_sensors(hass, entry, new_name),
-            strict=True,
+    registry = er.async_get(hass)
+    for old, new in zip(
+        create_user_stats_sensors(hass, entry, old_name),
+        create_user_stats_sensors(hass, entry, new_name),
+        strict=True,
+    ):
+        if clear_target and (
+            stale := registry.async_get_entity_id("sensor", DOMAIN, new.unique_id)
         ):
-            entity_id = registry.async_get_entity_id("sensor", DOMAIN, old.unique_id)
-            if entity_id is None:
-                continue
-            if stale := registry.async_get_entity_id("sensor", DOMAIN, new.unique_id):
-                registry.async_remove(stale)
+            registry.async_remove(stale)
+        if move_registry and (
+            entity_id := registry.async_get_entity_id("sensor", DOMAIN, old.unique_id)
+        ):
             registry.async_update_entity(entity_id, new_unique_id=new.unique_id)
-    for sensor in platform["user_entities"].pop(subentry_id, []):
-        # Entities never added (disabled, or a legacy duplicate unique_id) have no hass.
-        if sensor.hass is not None:
-            await sensor.async_remove()
-    async_add_user_stats_sensors(hass, entry, subentry_id, new_name)
+    await _async_hand_over(hass, entry, platform["user_entities"].pop(subentry_id, []), heir)
+    if add_new:
+        async_add_user_stats_sensors(hass, entry, subentry_id, new_name)
 
 
 class _SessionSensorBase(SensorEntity):

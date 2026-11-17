@@ -125,10 +125,20 @@ async def _async_update_user_statistics(
         """Exact names and slugs of the other configured users.
 
         The Unknown bucket counts as one, so its bucket and sensors are never
-        removed or moved (spec 026 § 4.4).
+        removed or moved (spec 026 § 4.4). The slug guest counts as taken: the
+        guest totals hold two of its unique_ids (D-27).
         """
         other_names = {"Unknown", *(n for s, n in names.items() if s != sid)}
-        return other_names, {slugify(n) for n in other_names}
+        return other_names, {"guest", *(slugify(n) for n in other_names)}
+
+    def heir(sid: str, slug: str) -> tuple[str | None, str] | None:
+        """The holder of a shared slug once ``sid`` is gone; the guest totals have none (D-28)."""
+        if slug == "guest":
+            return None
+        for other_sid, name in names.items():
+            if other_sid != sid and slugify(name) == slug:
+                return other_sid, name
+        return (None, "Unknown") if slug == "unknown" else None
 
     for sid, info in removed.items():
         try:
@@ -137,8 +147,14 @@ async def _async_update_user_statistics(
                 await async_cascade_delete_user(hass, entry, sid)
                 name = info["data"]["name"]
                 other_names, other_slugs = others(sid)
-                async_remove_user_stats_sensors(
-                    hass, entry, sid, name, remove_registry=slugify(name) not in other_slugs
+                slug = slugify(name)
+                await async_remove_user_stats_sensors(
+                    hass,
+                    entry,
+                    sid,
+                    name,
+                    remove_registry=slug not in other_slugs,
+                    heir=heir(sid, slug),
                 )
                 if name not in other_names:
                     await stats_engine.async_remove_user(name)
@@ -156,16 +172,21 @@ async def _async_update_user_statistics(
             # D-9: a bucket already under the new name is a leftover, not this user's.
             if new_name not in other_names:
                 await stats_engine.async_remove_user(new_name)
-            if old_name not in other_names:
+            # D-26: a name another user (or Unknown) holds keeps its bucket.
+            if old_name not in other_names and new_name not in other_names:
                 await stats_engine.async_rename_user(old_name, new_name)
-            old_slug = slugify(old_name)
+            old_slug, new_slug = slugify(old_name), slugify(new_name)
+            target_free = new_slug not in other_slugs
             await async_rename_user_stats_sensors(
                 hass,
                 entry,
                 sid,
                 old_name,
                 new_name,
-                move_registry=old_slug != slugify(new_name) and old_slug not in other_slugs,
+                move_registry=old_slug != new_slug and target_free and old_slug not in other_slugs,
+                clear_target=old_slug != new_slug and target_free,
+                add_new=target_free,
+                heir=heir(sid, old_slug) if old_slug in other_slugs else None,
             )
         except Exception:
             _LOGGER.exception("Updating statistics for renamed user %s failed", sid)

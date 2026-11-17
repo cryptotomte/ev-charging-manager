@@ -45,7 +45,7 @@ async def async_migrate_observation_slots(
     is filled.
 
     Also seeds eto_entity from the total-energy entity chosen at first setup,
-    under the same "only when absent" rule (spec 026 D-18).
+    under the same "only when absent" rule (spec 026 D-18, D-31).
     """
     profile_key = entry.data.get(CONF_CHARGER_PROFILE, "")
     profile = CHARGER_PROFILES.get(profile_key, {})
@@ -70,8 +70,14 @@ async def async_migrate_observation_slots(
         resolved = pattern.replace("{serial}", serial)
         new_options[conf_key] = resolved
 
+    # D-31: only a profile that defines a total-energy sensor (kWh); on generic
+    # the entity may report Wh, which would land in charger_total_*_kwh.
     total_energy_entity = entry.data.get(CONF_TOTAL_ENERGY_ENTITY)
-    if CONF_ETO_ENTITY not in entry.options and total_energy_entity:
+    if (
+        profile.get("total_energy_sensor") is not None
+        and CONF_ETO_ENTITY not in entry.options
+        and total_energy_entity
+    ):
         new_options[CONF_ETO_ENTITY] = total_energy_entity
 
     if new_options:

@@ -22,9 +22,12 @@ from custom_components.ev_charging_manager.const import (
 
 from .conftest import (
     MOCK_CHARGER_DATA,
+    MOCK_ENERGY_ENTITY,
+    MOCK_PLUG_ENTITY,
     setup_entry_with_subentries,
     setup_session_engine,
-    start_charging_session,
+    start_profile_session,
+    stop_profile_session,
 )
 
 # ---------------------------------------------------------------------------
@@ -837,51 +840,78 @@ async def test_mig_06_missing_serial_slots_unset(
 _ETO = "sensor.charger_total_energy"
 
 
-async def test_eto_seeded_from_total_energy_entity(hass: HomeAssistant) -> None:
-    """T-43: the option is written at setup and the engine reads the entity."""
-    entry = MockConfigEntry(
+def _eto_entry(profile: str, total_energy_entity: str | None, options: dict) -> MockConfigEntry:
+    return MockConfigEntry(
         domain=DOMAIN,
-        data={**MOCK_CHARGER_DATA, CONF_TOTAL_ENERGY_ENTITY: _ETO},
-        options={"min_session_duration_s": 0, "min_session_energy_wh": 0},
-        title="Test Charger",
-    )
-    hass.states.async_set(_ETO, "100.0")
-    await setup_session_engine(hass, entry)
-
-    assert entry.options[CONF_ETO_ENTITY] == _ETO
-    await start_charging_session(hass, trx_value="2")
-    assert hass.data[DOMAIN][entry.entry_id]["session_engine"]._eto_start == 100.0
-
-
-@pytest.mark.parametrize(
-    ("total_energy_entity", "options", "expected"),
-    [
-        (_ETO, {CONF_ETO_ENTITY: None}, {CONF_ETO_ENTITY: None}),
-        (None, {}, {}),
-    ],
-)
-async def test_eto_not_seeded(
-    hass: HomeAssistant, total_energy_entity, options: dict, expected: dict
-) -> None:
-    """T-44: a present option (even None) is kept; no total-energy entity adds no key."""
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={**MOCK_CHARGER_DATA, CONF_TOTAL_ENERGY_ENTITY: total_energy_entity},
+        data={
+            **MOCK_CHARGER_DATA,
+            "charger_profile": profile,
+            CONF_TOTAL_ENERGY_ENTITY: total_energy_entity,
+        },
         options=options,
         title="Test Charger",
     )
+
+
+async def test_eto_seeded_from_total_energy_entity(hass: HomeAssistant) -> None:
+    """T-43: on goe_gemini the option is written with the slot migration; a session uses it."""
+    entry = _eto_entry(
+        "goe_gemini", _ETO, {"min_session_duration_s": 0, "min_session_energy_wh": 0}
+    )
+    hass.states.async_set(_ETO, "100.0")
+    with patch.object(
+        hass.config_entries, "async_update_entry", wraps=hass.config_entries.async_update_entry
+    ) as update:
+        await setup_session_engine(hass, entry)
+
+    update.assert_called_once()
+    written = update.call_args.kwargs["options"]
+    assert (written[CONF_ETO_ENTITY], written[CONF_PLUG_ENTITY]) == (_ETO, MOCK_PLUG_ENTITY)
+
+    await _add_user(hass, entry.entry_id, "Petra")
+    petra = _get_subentries_by_type(hass.config_entries.async_get_entry(entry.entry_id), "user")[0]
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=None,
+    ):
+        await _add_rfid(hass, entry.entry_id, 1, petra.subentry_id)
+    await hass.async_block_till_done()
+    await start_profile_session(hass, "goe_gemini")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "2.0")
+    hass.states.async_set(_ETO, "102.0")
+    await hass.async_block_till_done()
+    await stop_profile_session(hass, "goe_gemini")
+
+    session = hass.data[DOMAIN][entry.entry_id]["session_store"].sessions[-1]
+    assert session["user_name"] == "Petra"
+    assert (session["charger_total_before_kwh"], session["charger_total_after_kwh"]) == (
+        100.0,
+        102.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile", "total_energy_entity", "options"),
+    [
+        ("goe_gemini", _ETO, {CONF_ETO_ENTITY: None}),
+        ("goe_gemini", None, {}),
+        ("generic", _ETO, {}),
+    ],
+)
+async def test_eto_not_seeded(
+    hass: HomeAssistant, profile: str, total_energy_entity, options: dict
+) -> None:
+    """T-44: a present option (even None) is kept; no total-energy entity adds no key;
+    a profile without a total-energy sensor (generic) is never seeded (D-31)."""
+    entry = _eto_entry(profile, total_energy_entity, options)
     await setup_entry_with_subentries(hass, entry)
 
-    assert dict(entry.options) == expected
+    assert entry.options.get(CONF_ETO_ENTITY, "absent") == options.get(CONF_ETO_ENTITY, "absent")
 
 
 async def test_eto_seed_runs_once(hass: HomeAssistant) -> None:
     """T-45: the second setup writes nothing."""
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={**MOCK_CHARGER_DATA, CONF_TOTAL_ENERGY_ENTITY: _ETO},
-        title="Test Charger",
-    )
+    entry = _eto_entry("goe_gemini", _ETO, {})
     await setup_entry_with_subentries(hass, entry)
     await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

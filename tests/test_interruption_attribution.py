@@ -650,6 +650,30 @@ async def test_d51_open_access_with_power_already_flowing_starts_at_once(
     assert _summary(rig) == [("Unknown", 2.0, 5.0, None, 2.0)]
 
 
+async def test_d51_no_open_access_start_while_the_rfid_entity_is_not_loaded(
+    hass, hass_storage, freezer
+) -> None:
+    """D-51 (verification V-2): cable in and power flowing, but the RFID entity has no
+    state yet. That is not "no card", so the RFID wait is entered instead of an
+    open-access start, and the card that appears next owns the session."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    order = ["energy", "power", "plug", "lock", "trx", "car", "eto"]
+    await restart("late", during=_card_and_cable_while_down, order=order[:4])(rig)
+    engine = rig.engine
+    assert engine.active_session is None
+    assert engine.get_status_sub_state() == SessionSubState.WAITING_FOR_RFID
+    await rig.set(trx=TRX_PAUL)
+    assert engine.active_session.user_name == "Paul"
+    await rig.goto("10:30:00")
+    await rig.set(energy=4.0)
+    await rig.set(power=0)
+    await rig.goto("10:40:00")
+    await rig.unplug()
+
+    assert _summary(rig) == [("Paul", 2.0, 5.0, None, 2.0)]
+
+
 async def test_d58_open_access_start_from_a_stale_counter(hass, hass_storage, freezer) -> None:
     """D-58 (verification V-1): the plug goes from unavailable to on with power flowing
     and no card, while the counter still shows the previous connection's 10.0 kWh; it

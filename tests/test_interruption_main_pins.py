@@ -174,3 +174,36 @@ async def test_pin_main_charger_offline_then_back_plug_first(hass, hass_storage,
     await rig.goto("11:11:00")
 
     assert _summary(rig) == [("Paul", 10.0, 25.0, None, 10.0), ("Gaest", 3.0, 7.5, 15.0, 3.0)]
+
+
+async def _card_and_cable_while_down(rig: Rig) -> None:
+    """Paul shows his card and plugs in at 10:10 while down; 2.0 kWh by 10:20."""
+    await rig.goto("10:10:00", fire=False)
+    await rig.set(trx=TRX_PAUL)
+    await rig.set(plug="on", lock="Locked")
+    await rig.set(power=7000)
+    await rig.goto("10:20:00", fire=False)
+    await rig.set(energy=2.0)
+
+
+@pytest.mark.parametrize("unavailable", [False, True], ids=["absent", "unavailable"])
+async def test_pin_main_power_flowing_before_the_rfid_entity_loads(
+    hass, hass_storage, freezer, unavailable
+) -> None:
+    """Verification V-2: after a restart the energy, power and plug entities are valid
+    before the RFID entity. The fix round started an open-access Unknown session at once;
+    main waits for the card and gives the session to Paul (from the reading at its start)."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    order = ["energy", "power", "plug", "lock", "trx", "car", "eto"]
+    await restart("late", during=_card_and_cable_while_down, order=order, unavailable=unavailable)(
+        rig
+    )
+    await rig.goto("10:30:00")
+    await rig.set(energy=4.0)
+    await rig.set(power=0)
+    await rig.goto("10:40:00")
+    await rig.unplug()
+    await rig.goto("10:41:00")
+
+    assert _summary(rig) == [("Paul", 2.0, 5.0, None, 2.0)]

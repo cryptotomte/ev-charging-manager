@@ -1794,9 +1794,15 @@ class PlugAnchoredSessionEngine:
         # moment, and a zero baseline would bill it to this one (§ 13.5 V-1).
         current_trx = self._get_trx()
 
-        if current_trx in _INVALID_STATES and cable_in and (self._get_power() or 0.0) > 0:
+        if (
+            current_trx in _INVALID_STATES
+            and cable_in
+            and (self._get_power() or 0.0) > 0
+            and not self._rfid_entity_unready()
+        ):
             # Spec 027 D-51: power already flowing produces no power event to resolve
-            # an RFID wait — the open-access inference of FR-003 runs now.
+            # an RFID wait — the open-access inference of FR-003 runs now. Only on a
+            # real "no card": an RFID entity not loaded yet may still show one (V-2).
             self._hass.async_create_task(
                 self._async_start_session(
                     reason=UnknownReason.OPEN_ACCESS_INFERRED, reconstructed=True

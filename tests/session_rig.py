@@ -352,6 +352,7 @@ def restart(
     order: list[str] | None = None,
     absent: list[str] | None = None,
     spot_late: bool = False,
+    unavailable: bool = False,
 ) -> Interruption:
     """An orderly stop or a crash followed by a new setup (see the module docstring).
 
@@ -361,6 +362,8 @@ def restart(
     during: runs while the integration is down (time passes, the charger changes).
     absent: which entities are absent for "late" (default: all charger entities).
     spot_late: the spot price entity is absent at setup as well and appears last.
+    unavailable: the late entities read "unavailable" at setup instead of being absent
+        (restored from the entity registry before their integration has loaded).
     """
 
     async def _restart(rig: Rig) -> None:
@@ -380,7 +383,10 @@ def restart(
             state = hass.states.get(eid)
             if state is not None:
                 saved[eid] = state.state
-                hass.states.async_remove(eid)
+                if unavailable:
+                    hass.states.async_set(eid, "unavailable")
+                else:
+                    hass.states.async_remove(eid)
         await hass.async_block_till_done()
         await hass.config_entries.async_setup(rig.entry.entry_id)
         await hass.async_block_till_done()

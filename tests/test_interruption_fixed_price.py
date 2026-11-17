@@ -112,14 +112,17 @@ async def test_rt05_orderly_stop_writes_the_engine_state(hass, hass_storage, fre
         "none",
         "restart-present",
         "restart-late",
+        "restart-late-pluglast",
     ],
 )
 async def test_rt03_charge_finishes_during_the_outage(hass, hass_storage, freezer, intr) -> None:
-    """RT-03: cost equals energy × price and the SoC estimate is present."""
+    """RT-03: cost equals energy × price and the SoC estimate is present (restart-late is
+    the field order)."""
     interruption = {
         "none": None,
         "restart-present": restart(during=finish_while_down),
         "restart-late": restart("late", during=finish_while_down),
+        "restart-late-pluglast": restart("late", during=finish_while_down, order=PLUG_LAST),
     }[intr]
     rig = Rig(hass, freezer, hass_storage)
     await scenario_f(rig, TRX_PAUL, interruption)

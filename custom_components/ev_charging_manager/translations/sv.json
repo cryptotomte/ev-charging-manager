@@ -102,7 +102,7 @@
                     "persistence_interval_s": "Hur ofta en aktiv session sparas till disk vid HA-omstart (60–3600 s, standard 300)",
                     "max_stored_sessions": "Äldsta sessioner tas bort när denna gräns överskrids (100–10000, standard 1000)",
                     "heartbeat_log_interval_min": "Minuter mellan HEARTBEAT-rader i felsökningsloggen under aktiv laddning (0–30, standard 5). Sätt till 0 för att avaktivera.",
-                    "ui_dispatch_interval_s": "Sekunder mellan levande sensoruppdateringar under aktiv laddning (0–300, standard 60). Sätt till 0 för att avaktivera."
+                    "ui_dispatch_interval_s": "Sekunder mellan levande sensoruppdateringar under aktiv laddning (10–300, standard 60). Sätt till 0 för att avaktivera."
                 }
             },
             "pricing": {
@@ -126,7 +126,8 @@
         },
         "error": {
             "entity_not_found": "Entiteten hittades inte i Home Assistant. Kontrollera entitets-ID och försök igen.",
-            "entity_invalid": "Entiteten finns men har ett icke-numeriskt tillstånd. En spotprisenhet måste rapportera ett tal."
+            "entity_invalid": "Entiteten finns men har ett icke-numeriskt tillstånd. En spotprisenhet måste rapportera ett tal.",
+            "ui_dispatch_interval_invalid": "UI-uppdateringsintervallet måste vara 0 (av) eller mellan 10 och 300 sekunder."
         }
     },
     "entity": {

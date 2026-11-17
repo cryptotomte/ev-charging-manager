@@ -72,13 +72,18 @@ class StatsStore:
         guest_retired = dict(EMPTY_GUEST_RETIRED)
         raw_retired = stored.get("guest_retired")
         if raw_retired is not None:
-            try:
-                guest_retired = {
-                    "energy_kwh": _carry_value(raw_retired["energy_kwh"]),
-                    "cost_kr": _carry_value(raw_retired["cost_kr"]),
-                }
-            except (KeyError, TypeError, ValueError):
-                _LOGGER.warning("Ignoring malformed guest_retired in stats store: %r", raw_retired)
+            malformed = not isinstance(raw_retired, dict)
+            if not malformed:
+                for field, allow_negative in (("energy_kwh", False), ("cost_kr", True)):
+                    try:
+                        guest_retired[field] = _carry_value(raw_retired[field], allow_negative)
+                    except (KeyError, TypeError, ValueError):
+                        malformed = True
+            if malformed:
+                _LOGGER.warning(
+                    "Malformed guest_retired in stats store, invalid fields read as 0: %r",
+                    raw_retired,
+                )
 
         _LOGGER.debug("Loaded stats for %d user(s) from storage", len(user_stats))
         return user_stats, guest_last, unknown_session_times, guest_retired
@@ -102,11 +107,14 @@ class StatsStore:
         await self._store.async_save(data)
 
 
-def _carry_value(raw: Any) -> float:
-    """Return one guest_retired total; raise ValueError or TypeError if it is not one (D-29)."""
+def _carry_value(raw: Any, allow_negative: bool) -> float:
+    """Return one guest_retired total; raise ValueError or TypeError if it is not one (D-29).
+
+    Cost may be negative because spot prices can be (V-1); energy may not.
+    """
     if isinstance(raw, bool):
         raise TypeError("boolean")
     value = float(raw)
-    if not math.isfinite(value) or value < 0:
+    if not math.isfinite(value) or (value < 0 and not allow_negative):
         raise ValueError(value)
     return value

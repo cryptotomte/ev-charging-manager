@@ -176,32 +176,44 @@ async def test_load_without_guest_retired_reads_zeros(hass: HomeAssistant, caplo
 
 
 @pytest.mark.parametrize(
-    "raw",
+    ("raw", "expected"),
     [
-        "oops",
-        [1, 2],
-        {"energy_kwh": 1.0},
-        {"energy_kwh": "x", "cost_kr": 1.0},
-        # D-29: booleans, non-finite and negative totals are malformed too.
-        {"energy_kwh": True, "cost_kr": 1.0},
-        {"energy_kwh": 1.0, "cost_kr": False},
-        {"energy_kwh": float("nan"), "cost_kr": 1.0},
-        {"energy_kwh": float("inf"), "cost_kr": 1.0},
-        {"energy_kwh": 1.0, "cost_kr": float("-inf")},
-        {"energy_kwh": -0.5, "cost_kr": 1.0},
+        ("oops", (0.0, 0.0)),
+        ([1, 2], (0.0, 0.0)),
+        ({"energy_kwh": 1.0}, (1.0, 0.0)),
+        ({"energy_kwh": "x", "cost_kr": 1.0}, (0.0, 1.0)),
+        # D-29: booleans, non-finite and negative energy are malformed too.
+        ({"energy_kwh": True, "cost_kr": 1.0}, (0.0, 1.0)),
+        ({"energy_kwh": 1.0, "cost_kr": False}, (1.0, 0.0)),
+        ({"energy_kwh": float("nan"), "cost_kr": 1.0}, (0.0, 1.0)),
+        ({"energy_kwh": float("inf"), "cost_kr": -1.0}, (0.0, -1.0)),
+        ({"energy_kwh": 1.0, "cost_kr": float("-inf")}, (1.0, 0.0)),
+        ({"energy_kwh": -0.5, "cost_kr": 1.0}, (0.0, 1.0)),
+        ({"energy_kwh": "x", "cost_kr": None}, (0.0, 0.0)),
     ],
 )
-async def test_load_malformed_guest_retired_reads_zeros_with_warning(
-    hass: HomeAssistant, caplog, raw
+async def test_load_malformed_guest_retired_reads_zero_per_field_with_warning(
+    hass: HomeAssistant, caplog, raw, expected
 ) -> None:
-    """T-42: a malformed guest_retired reads as zeros with one warning."""
+    """T-42, V-1: a malformed field reads as zero, the other is kept; one warning per load."""
     store = StatsStore(hass)
     stored = {"user_stats": {}, "guest_retired": raw}
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored):
         *_, guest_retired = await store.async_load()
 
-    assert guest_retired == {"energy_kwh": 0.0, "cost_kr": 0.0}
+    assert guest_retired == {"energy_kwh": expected[0], "cost_kr": expected[1]}
     assert [r.levelname for r in caplog.records if "guest_retired" in r.message] == ["WARNING"]
+
+
+async def test_load_negative_guest_retired_cost_is_kept(hass: HomeAssistant, caplog) -> None:
+    """V-1: spot cost can be negative, so a negative carried cost is valid."""
+    store = StatsStore(hass)
+    stored = {"user_stats": {}, "guest_retired": {"energy_kwh": 10.0, "cost_kr": -3.0}}
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored):
+        *_, guest_retired = await store.async_load()
+
+    assert guest_retired == {"energy_kwh": 10.0, "cost_kr": -3.0}
+    assert "guest_retired" not in caplog.text
 
 
 async def test_guest_retired_roundtrip(hass: HomeAssistant) -> None:

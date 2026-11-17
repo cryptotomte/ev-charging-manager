@@ -274,6 +274,27 @@ async def test_delete_guest_keeps_guest_totals(hass: HomeAssistant, hass_storage
     assert (_state(hass, energy_id), _state(hass, cost_id)) == ("15.0", "65.0")
 
 
+async def test_delete_guest_with_negative_cost_keeps_guest_totals(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    """V-1: a negative carried cost (spot price) survives a reload with the energy."""
+    entry = await _setup(hass, _user("Visitor", "guest"), _user("Other", "guest"))
+    await _completed(hass, "Visitor", 10.0, -3.0, "guest")
+    await _completed(hass, "Other", 5.0, 20.0, "guest")
+    energy_id, cost_id = _guest_total_ids(hass, entry)
+    assert (_state(hass, energy_id), _state(hass, cost_id)) == ("15.0", "17.0")
+
+    await _delete_user(hass, entry, "Visitor")
+
+    assert (_state(hass, energy_id), _state(hass, cost_id)) == ("15.0", "17.0")
+    assert _stored(hass_storage)["guest_retired"] == {"energy_kwh": 10.0, "cost_kr": -3.0}
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert (_state(hass, energy_id), _state(hass, cost_id)) == ("15.0", "17.0")
+    assert _engine(hass, entry).guest_retired == {"energy_kwh": 10.0, "cost_kr": -3.0}
+
+
 async def test_guest_carry_survives_a_later_save(hass: HomeAssistant, hass_storage) -> None:
     """D-6, D-29: a session completed after a guest was deleted keeps the carry in the store."""
     entry = await _setup(hass, _user("Visitor", "guest"), _user("Paul"))

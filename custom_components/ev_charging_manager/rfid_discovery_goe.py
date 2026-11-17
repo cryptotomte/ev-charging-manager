@@ -178,9 +178,9 @@ class GoeRfidDiscovery:
         data = await self._fetch_api(session, GOE_FILTER_FWV, "firmware version query")
 
         fwv = data.get("fwv")
-        # Some firmware reports fwv as a JSON number; bool is an int subclass.
-        if isinstance(fwv, bool) or not isinstance(fwv, (str, int, float)):
+        if fwv is None:
             raise DiscoveryError("Unexpected firmware version format from charger.")
+        # Numeric fwv is read through str() (D-16); bool and other shapes fail int().
         try:
             major_str = str(fwv).split(".")[0]
             return int(major_str)

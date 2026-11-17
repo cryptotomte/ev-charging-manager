@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.helpers import device_registry as dr
+from homeassistant.util import slugify
 
 from .charger_profiles import CHARGER_PROFILES
 from .config_store import ConfigStore
@@ -22,9 +24,20 @@ from .const import (
     DEFAULT_PERSISTENCE_INTERVAL_S,
     DOMAIN,
     PLATFORMS,
+    SUBENTRY_TYPE_USER,
+    SUBENTRY_TYPE_VEHICLE,
 )
 from .debug_logger import DebugLogger, async_cleanup_legacy_file
-from .lifecycle import async_migrate_observation_slots
+from .lifecycle import (
+    async_cascade_delete_user,
+    async_cascade_delete_vehicle,
+    async_migrate_observation_slots,
+)
+from .sensor import (
+    async_add_user_stats_sensors,
+    async_remove_user_stats_sensors,
+    async_rename_user_stats_sensors,
+)
 from .session_engine import SessionEngine
 from .session_engine_v2 import PlugAnchoredSessionEngine
 from .session_store import SessionStore
@@ -43,7 +56,10 @@ def _snapshot_subentries(entry: ConfigEntry) -> dict[str, dict]:
 
 
 async def _on_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle config entry updates (subentry add/edit/delete)."""
+    """Handle config entry updates (subentry add/edit/delete) per spec 026 § 6.2 and D-25.
+
+    Never reloads the entry: a reload during a session loses money (spec 026 D-2).
+    """
     if entry.state is not ConfigEntryState.LOADED:
         return
 
@@ -52,31 +68,139 @@ async def _on_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
     if not config_store:
         return
 
+    # D-3: diff and replace the snapshot before the first await. Each subentry
+    # change made below re-enters this listener eagerly, and every invocation
+    # must handle only its own change.
     prev = domain_data.get("prev_subentries", {})
-    current_ids = set(entry.subentries.keys())
-    prev_ids = set(prev.keys())
+    current = _snapshot_subentries(entry)
+    domain_data["prev_subentries"] = current
+    prev_names = {
+        sid: info["data"]["name"]
+        for sid, info in prev.items()
+        if info["subentry_type"] == SUBENTRY_TYPE_USER
+    }
+    names = {
+        sid: info["data"]["name"]
+        for sid, info in current.items()
+        if info["subentry_type"] == SUBENTRY_TYPE_USER
+    }
+    removed = {sid: info for sid, info in prev.items() if sid not in current}
+    renamed = {
+        sid: (prev_names[sid], name)
+        for sid, name in names.items()
+        if sid in prev_names and prev_names[sid] != name
+    }
+    added = {sid: name for sid, name in names.items() if sid not in prev_names}
 
-    # Detect deleted subentries and run cascade
-    removed_ids = prev_ids - current_ids
-    if removed_ids:
-        from .lifecycle import async_cascade_delete_user, async_cascade_delete_vehicle
-
-        for removed_id in removed_ids:
-            removed_info = prev[removed_id]
-            if removed_info["subentry_type"] == "user":
-                _LOGGER.debug("User subentry %s removed, cascading delete", removed_id)
-                await async_cascade_delete_user(hass, entry, removed_id)
-            elif removed_info["subentry_type"] == "vehicle":
-                _LOGGER.debug("Vehicle subentry %s removed, cascading delete", removed_id)
-                await async_cascade_delete_vehicle(hass, entry, removed_id)
-            else:
-                _LOGGER.debug("RFID mapping subentry %s removed (no cascade)", removed_id)
-
-    # Sync ConfigStore from subentries (source of truth)
+    # D-25: sessions starting from here on see the new users and mappings, even
+    # if the statistics work below fails or waits for an earlier run.
     await config_store.async_sync_from_subentries(entry)
 
-    # Update snapshot for next comparison
-    domain_data["prev_subentries"] = _snapshot_subentries(entry)
+    # D-25: each run's statistics and entity work runs whole, one run at a time.
+    # The runs started by the RFID cascade queue here as separate tasks; the
+    # holder never awaits them, so they cannot deadlock.
+    async with domain_data["listener_lock"]:
+        if (
+            entry.state is not ConfigEntryState.LOADED
+            or hass.data.get(DOMAIN, {}).get(entry.entry_id) is not domain_data
+        ):
+            return
+        await _async_update_user_statistics(
+            hass, entry, domain_data["stats_engine"], names, removed, renamed, added
+        )
+
+
+async def _async_update_user_statistics(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    stats_engine: StatsEngine,
+    names: dict[str, str],
+    removed: dict[str, dict],
+    renamed: dict[str, tuple[str, str]],
+    added: dict[str, str],
+) -> None:
+    """Steps 4-6 of spec 026 § 6.2. A failure for one user does not stop the others (D-25)."""
+
+    def others(sid: str) -> tuple[set[str], set[str]]:
+        """Exact names and slugs of the other configured users.
+
+        The Unknown bucket counts as one, so its bucket and sensors are never
+        removed or moved (spec 026 § 4.4). The slug guest counts as taken: the
+        guest totals hold two of its unique_ids (D-27).
+        """
+        other_names = {"Unknown", *(n for s, n in names.items() if s != sid)}
+        return other_names, {"guest", *(slugify(n) for n in other_names)}
+
+    def heir(sid: str, slug: str) -> tuple[str | None, str] | None:
+        """The holder of a shared slug once ``sid`` is gone; the guest totals have none (D-28)."""
+        if slug == "guest":
+            return None
+        for other_sid, name in names.items():
+            if other_sid != sid and slugify(name) == slug:
+                return other_sid, name
+        return (None, "Unknown") if slug == "unknown" else None
+
+    for sid, info in removed.items():
+        try:
+            if info["subentry_type"] == SUBENTRY_TYPE_USER:
+                _LOGGER.debug("User subentry %s removed, cascading delete", sid)
+                await async_cascade_delete_user(hass, entry, sid)
+                name = info["data"]["name"]
+                other_names, other_slugs = others(sid)
+                slug = slugify(name)
+                await async_remove_user_stats_sensors(
+                    hass,
+                    entry,
+                    sid,
+                    name,
+                    remove_registry=slug not in other_slugs,
+                    heir=heir(sid, slug),
+                )
+                if name not in other_names:
+                    await stats_engine.async_remove_user(name)
+            elif info["subentry_type"] == SUBENTRY_TYPE_VEHICLE:
+                _LOGGER.debug("Vehicle subentry %s removed, cascading delete", sid)
+                await async_cascade_delete_vehicle(hass, entry, sid)
+            else:
+                _LOGGER.debug("RFID mapping subentry %s removed (no cascade)", sid)
+        except Exception:
+            _LOGGER.exception("Updating statistics for removed subentry %s failed", sid)
+
+    for sid, (old_name, new_name) in renamed.items():
+        try:
+            other_names, other_slugs = others(sid)
+            # D-9: a bucket already under the new name is a leftover, not this user's.
+            if new_name not in other_names:
+                await stats_engine.async_remove_user(new_name)
+            # D-26: a name another user (or Unknown) holds keeps its bucket.
+            if old_name not in other_names and new_name not in other_names:
+                await stats_engine.async_rename_user(old_name, new_name)
+            old_slug, new_slug = slugify(old_name), slugify(new_name)
+            target_free = new_slug not in other_slugs
+            await async_rename_user_stats_sensors(
+                hass,
+                entry,
+                sid,
+                old_name,
+                new_name,
+                move_registry=old_slug != new_slug and target_free and old_slug not in other_slugs,
+                clear_target=old_slug != new_slug and target_free,
+                add_new=target_free,
+                heir=heir(sid, old_slug) if old_slug in other_slugs else None,
+            )
+        except Exception:
+            _LOGGER.exception("Updating statistics for renamed user %s failed", sid)
+
+    for sid, name in added.items():
+        try:
+            other_names, other_slugs = others(sid)
+            if name not in other_names:  # D-9
+                await stats_engine.async_remove_user(name)
+            # Another user's sensors already hold this slug's unique_ids (legacy data).
+            if slugify(name) not in other_slugs:
+                async_add_user_stats_sensors(hass, entry, sid, name)
+        except Exception:
+            _LOGGER.exception("Updating statistics for added user %s failed", sid)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -97,6 +221,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id]["config_store"] = config_store
     hass.data[DOMAIN][entry.entry_id]["prev_subentries"] = _snapshot_subentries(entry)
+    hass.data[DOMAIN][entry.entry_id]["listener_lock"] = asyncio.Lock()
 
     # Register update listener for subentry changes
     entry.async_on_unload(entry.add_update_listener(_on_entry_updated))

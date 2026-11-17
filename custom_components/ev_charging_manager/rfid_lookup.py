@@ -120,6 +120,23 @@ class RfidLookup:
                 reason="unmapped",
             )
 
+        # D-12: reuse rfid_inactive so no event payload gains a new reason value.
+        if not user.get("active", True):
+            _LOGGER.warning(
+                "RFID card at index %d is mapped to an inactive user (trx=%r)",
+                rfid_index,
+                redact_tag(trx_value),
+            )
+            return RfidResolution(
+                user_name="Unknown",
+                user_type="unknown",
+                vehicle_name=None,
+                vehicle_battery_kwh=None,
+                efficiency_factor=None,
+                rfid_index=rfid_index,
+                reason="rfid_inactive",
+            )
+
         user_name = user.get("name", "Unknown")
         user_type = user.get("type", "regular")
 

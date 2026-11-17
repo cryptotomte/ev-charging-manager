@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -9,7 +12,14 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ev_charging_manager.const import DOMAIN
 
-from .conftest import MOCK_CHARGER_DATA, setup_entry_with_subentries
+from .conftest import (
+    ENGINE_PROFILES,
+    MOCK_CHARGER_DATA,
+    setup_entry_with_subentries,
+    setup_session_engine,
+    start_charging_session,
+    start_profile_session,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,7 +80,7 @@ async def _add_regular_user(hass: HomeAssistant, entry_id: str, name: str = "Pau
 async def _add_guest_user_fixed(
     hass: HomeAssistant,
     entry_id: str,
-    name: str = "Guest",
+    name: str = "Visitor",
     price_per_kwh: float = 4.50,
 ) -> dict:
     """Add a guest user with fixed pricing and return the flow result."""
@@ -231,7 +241,7 @@ async def test_guest_user_add_fixed_pricing(hass: HomeAssistant) -> None:
 
     users = _get_subentries_by_type(loaded_entry, "user")
     guest = next(u for u in users if u.data["type"] == "guest")
-    assert guest.data["name"] == "Guest"
+    assert guest.data["name"] == "Visitor"
     assert guest.data["active"] is True
     assert guest.data["guest_pricing"]["method"] == "fixed"
     assert guest.data["guest_pricing"]["price_per_kwh"] == 4.50
@@ -410,20 +420,24 @@ async def _add_rfid_mapping(
     vehicle_id: str | None = None,
 ) -> dict:
     """Add an RFID mapping subentry and return the flow result."""
-    result = await hass.config_entries.subentries.async_init(
-        (entry_id, "rfid_mapping"),
-        context={"source": "user"},
-    )
     user_input: dict = {
         "card_index": str(card_index),
         "user_id": user_id,
     }
     if vehicle_id is not None:
         user_input["vehicle_id"] = vehicle_id
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"],
-        user_input,
-    )
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=None,
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (entry_id, "rfid_mapping"),
+            context={"source": "user"},
+        )
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            user_input,
+        )
     return result
 
 
@@ -733,26 +747,483 @@ async def test_rfid_mapping_all_slots_used(hass: HomeAssistant) -> None:
 
 
 # ---------------------------------------------------------------------------
-# T059: Duplicate user names allowed (FR-020)
+# Spec 026 D-10 (supersedes FR-020) and D-8: user names and the rename guard
 # ---------------------------------------------------------------------------
 
 
-async def test_duplicate_user_names_allowed(hass: HomeAssistant) -> None:
-    """Two users with the same name are both persisted (FR-020)."""
+async def _reconfigure_user(hass: HomeAssistant, entry_id: str, subentry_id: str, user_input):
+    result = await hass.config_entries.subentries.async_init(
+        (entry_id, "user"),
+        context={"source": "reconfigure", "subentry_id": subentry_id},
+    )
+    return await hass.config_entries.subentries.async_configure(result["flow_id"], user_input)
+
+
+def _user_sub(hass: HomeAssistant, entry_id: str, name: str):
+    entry = hass.config_entries.async_get_entry(entry_id)
+    return next(s for s in _get_subentries_by_type(entry, "user") if s.data["name"] == name)
+
+
+@pytest.mark.parametrize("name", ["", "   "])
+async def test_add_user_empty_name_rejected(hass: HomeAssistant, name: str) -> None:
+    """T-01: empty or whitespace-only name -> name_empty, nothing created."""
     entry = _make_entry()
     await setup_entry_with_subentries(hass, entry)
 
-    result1 = await _add_regular_user(hass, entry.entry_id, name="Paul")
-    assert result1["type"] == FlowResultType.CREATE_ENTRY
+    result = await _add_regular_user(hass, entry.entry_id, name=name)
 
-    result2 = await _add_regular_user(hass, entry.entry_id, name="Paul")
-    assert result2["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"name": "name_empty"}
+    assert (
+        _get_subentries_by_type(hass.config_entries.async_get_entry(entry.entry_id), "user") == []
+    )
 
-    loaded_entry = hass.config_entries.async_get_entry(entry.entry_id)
-    users = _get_subentries_by_type(loaded_entry, "user")
-    assert len(users) == 2
-    assert all(u.data["name"] == "Paul" for u in users)
 
-    # Both should have unique subentry_ids
-    ids = {u.subentry_id for u in users}
-    assert len(ids) == 2
+@pytest.mark.parametrize("name", ["Guest", "unknown", "!!!"])
+async def test_add_user_reserved_name_rejected(hass: HomeAssistant, name: str) -> None:
+    """T-02: names whose slug is guest or unknown -> name_reserved."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+
+    result = await _add_regular_user(hass, entry.entry_id, name=name)
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"name": "name_reserved"}
+
+
+@pytest.mark.parametrize(
+    ("existing", "candidate"),
+    [("Paul", "Paul"), ("Paul", "PAUL"), ("Paul", "  Paul  "), ("Pal", "Pål")],
+)
+async def test_duplicate_user_names_rejected(
+    hass: HomeAssistant, existing: str, candidate: str
+) -> None:
+    """T-03: a name whose slug equals an existing user's -> name_not_unique."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    assert (await _add_regular_user(hass, entry.entry_id, existing))["type"] == (
+        FlowResultType.CREATE_ENTRY
+    )
+
+    result = await _add_regular_user(hass, entry.entry_id, candidate)
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"name": "name_not_unique"}
+    users = _get_subentries_by_type(hass.config_entries.async_get_entry(entry.entry_id), "user")
+    assert len(users) == 1
+
+
+async def test_add_user_name_stored_stripped(hass: HomeAssistant) -> None:
+    """T-04: '  Eva ' is stored and titled 'Eva'."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+
+    result = await _add_regular_user(hass, entry.entry_id, "  Eva ")
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    sub = _get_subentries_by_type(hass.config_entries.async_get_entry(entry.entry_id), "user")[0]
+    assert sub.data["name"] == "Eva"
+    assert sub.title == "Eva"
+
+
+async def test_add_guest_invalid_name_stays_on_first_step(hass: HomeAssistant) -> None:
+    """T-05: a guest with an invalid name never reaches the pricing step."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "user"), context={"source": "user"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Unknown", "type": "guest"}
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "user"
+    assert result["errors"] == {"name": "name_reserved"}
+
+
+async def test_users_sharing_a_slug_can_still_be_edited(hass: HomeAssistant) -> None:
+    """T-06: legacy users that share a slug can be deactivated and have pricing edited."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        title="My go-e Charger",
+        subentries_data=[
+            {
+                "data": {"name": "Paul", "type": "regular", "active": True},
+                "subentry_type": "user",
+                "title": "Paul",
+                "unique_id": None,
+            },
+            {
+                "data": {
+                    "name": "paul",
+                    "type": "guest",
+                    "active": True,
+                    "guest_pricing": {"method": "fixed", "price_per_kwh": 4.0},
+                },
+                "subentry_type": "user",
+                "title": "paul",
+                "unique_id": None,
+            },
+        ],
+    )
+    await setup_entry_with_subentries(hass, entry)
+    regular = _user_sub(hass, entry.entry_id, "Paul")
+    guest = _user_sub(hass, entry.entry_id, "paul")
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, regular.subentry_id, {"name": "Paul", "active": False}
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert _user_sub(hass, entry.entry_id, "Paul").data["active"] is False
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, guest.subentry_id, {"name": "paul", "active": True}
+    )
+    assert result["step_id"] == "reconfigure_guest_pricing"
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 5.0}
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert _user_sub(hass, entry.entry_id, "paul").data["guest_pricing"]["price_per_kwh"] == 5.0
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, guest.subentry_id, {"name": "paul", "active": False}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 5.0}
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert _user_sub(hass, entry.entry_id, "paul").data["active"] is False
+
+
+@pytest.mark.parametrize(
+    ("new_name", "error"),
+    [("  ", "name_empty"), ("Unknown", "name_reserved"), ("petra", "name_not_unique")],
+)
+async def test_reconfigure_changed_name_validated(
+    hass: HomeAssistant, new_name: str, error: str
+) -> None:
+    """T-07: a changed name gets the three checks; the subentry stays unchanged."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_regular_user(hass, entry.entry_id, "Paul")
+    await _add_regular_user(hass, entry.entry_id, "Petra")
+    paul = _user_sub(hass, entry.entry_id, "Paul")
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, paul.subentry_id, {"name": new_name, "active": True}
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"name": error}
+    assert _user_sub(hass, entry.entry_id, "Paul").subentry_id == paul.subentry_id
+
+
+async def test_reconfigure_own_name_case_change_accepted(hass: HomeAssistant) -> None:
+    """T-07: changing only the case of one's own name is accepted."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_regular_user(hass, entry.entry_id, "Paul")
+    paul = _user_sub(hass, entry.entry_id, "Paul")
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, paul.subentry_id, {"name": "PAUL", "active": True}
+    )
+
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert _user_sub(hass, entry.entry_id, "PAUL").subentry_id == paul.subentry_id
+
+
+def _profile_entry(profile: str) -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": profile},
+        title="My go-e Charger",
+    )
+
+
+def _suggested(result: dict) -> dict:
+    """Return the suggested values of a shown form, keyed by field name."""
+    return {
+        str(key): key.description["suggested_value"]
+        for key in result["data_schema"].schema
+        if key.description and "suggested_value" in key.description
+    }
+
+
+@pytest.mark.parametrize("profile", ENGINE_PROFILES)
+async def test_rename_blocked_while_user_session_active(hass: HomeAssistant, profile: str) -> None:
+    """T-08: rename during own session -> user_in_session; other edits are accepted."""
+    entry = _profile_entry(profile)
+    await setup_session_engine(hass, entry)
+    await _add_regular_user(hass, entry.entry_id, "Petra")
+    await _add_regular_user(hass, entry.entry_id, "Paul")
+    petra = _user_sub(hass, entry.entry_id, "Petra")
+    paul = _user_sub(hass, entry.entry_id, "Paul")
+    await _add_rfid_mapping(hass, entry.entry_id, card_index=1, user_id=petra.subentry_id)
+    await start_profile_session(hass, profile)
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+    assert engine.active_session.user_name == "Petra"
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, petra.subentry_id, {"name": "Petra B", "active": True}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"name": "user_in_session"}
+    assert _user_sub(hass, entry.entry_id, "Petra").data == petra.data
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, petra.subentry_id, {"name": "Petra", "active": False}
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert _user_sub(hass, entry.entry_id, "Petra").data["active"] is False
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, paul.subentry_id, {"name": "Paul B", "active": True}
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert _user_sub(hass, entry.entry_id, "Paul B").subentry_id == paul.subentry_id
+
+
+async def test_reconfigure_changed_name_stored_stripped(hass: HomeAssistant) -> None:
+    """D-10: a changed name is stored stripped."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_regular_user(hass, entry.entry_id, "Paul")
+    paul = _user_sub(hass, entry.entry_id, "Paul")
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, paul.subentry_id, {"name": "  Pelle  ", "active": True}
+    )
+
+    assert result["type"] == FlowResultType.ABORT
+    sub = hass.config_entries.async_get_entry(entry.entry_id).subentries[paul.subentry_id]
+    assert (sub.data["name"], sub.title) == ("Pelle", "Pelle")
+
+
+async def test_unchanged_name_with_stray_space_is_not_validated(hass: HomeAssistant) -> None:
+    """D-30: the stored name with a stray space counts as unchanged and is kept as stored."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        title="My go-e Charger",
+        subentries_data=[
+            {
+                "data": {"name": name, "type": "regular", "active": True},
+                "subentry_type": "user",
+                "title": name,
+                "unique_id": None,
+            }
+            for name in ("Eva", "eva")
+        ],
+    )
+    await setup_entry_with_subentries(hass, entry)
+    eva = _user_sub(hass, entry.entry_id, "Eva")
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, eva.subentry_id, {"name": " Eva ", "active": False}
+    )
+
+    assert result["type"] == FlowResultType.ABORT
+    sub = hass.config_entries.async_get_entry(entry.entry_id).subentries[eva.subentry_id]
+    assert sub.data["name"] == "Eva"
+    assert sub.data["active"] is False
+
+
+async def test_guest_reconfigure_invalid_name_stays_on_first_step(hass: HomeAssistant) -> None:
+    """D-10: a guest's changed name is validated before the pricing step."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_guest_user_fixed(hass, entry.entry_id, "Visitor")
+    guest = _user_sub(hass, entry.entry_id, "Visitor")
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, guest.subentry_id, {"name": "Unknown", "active": True}
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {"name": "name_reserved"}
+
+
+async def test_guest_rename_rechecked_when_pricing_is_saved(hass: HomeAssistant) -> None:
+    """D-23: a session that starts while the pricing step is open blocks the rename at save.
+
+    The first step is shown again with the error and the submitted values, and the
+    guest cascade (D-11) has not run.
+    """
+    entry = _make_entry()
+    await setup_session_engine(hass, entry)
+    await _add_guest_user_fixed(hass, entry.entry_id, "Visitor")
+    guest = _user_sub(hass, entry.entry_id, "Visitor")
+    await _add_rfid_mapping(hass, entry.entry_id, card_index=1, user_id=guest.subentry_id)
+    result = await _reconfigure_user(
+        hass, entry.entry_id, guest.subentry_id, {"name": "Visitor B", "active": False}
+    )
+    assert result["step_id"] == "reconfigure_guest_pricing"
+    await start_charging_session(hass, trx_value="2")
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 5.0}
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {"name": "user_in_session"}
+    assert _suggested(result) == {"name": "Visitor B", "active": False}
+    assert _user_sub(hass, entry.entry_id, "Visitor").data == guest.data
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert all(m.data["active"] for m in _get_subentries_by_type(loaded, "rfid_mapping"))
+
+
+async def test_guest_reconfigure_keeps_typed_price_after_commit_point_error(
+    hass: HomeAssistant,
+) -> None:
+    """V-2: after the commit-point error the pricing page offers the typed price, not the stored."""
+    entry = _make_entry()
+    await setup_session_engine(hass, entry)
+    await _add_guest_user_fixed(hass, entry.entry_id, "Visitor", price_per_kwh=4.5)
+    guest = _user_sub(hass, entry.entry_id, "Visitor")
+    await _add_rfid_mapping(hass, entry.entry_id, card_index=1, user_id=guest.subentry_id)
+    result = await _reconfigure_user(
+        hass, entry.entry_id, guest.subentry_id, {"name": "Visitor B", "active": True}
+    )
+    await start_charging_session(hass, trx_value="2")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 7.25}
+    )
+    assert result["errors"] == {"name": "user_in_session"}
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Visitor", "active": True}
+    )
+
+    assert result["step_id"] == "reconfigure_guest_pricing"
+    assert _suggested(result)["guest_pricing_method"] == "fixed"
+    assert _suggested(result)["price_per_kwh"] == 7.25
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], _suggested(result)
+    )
+    assert result["reason"] == "reconfigure_successful"
+    sub = hass.config_entries.async_get_entry(entry.entry_id).subentries[guest.subentry_id]
+    assert sub.data["guest_pricing"] == {"method": "fixed", "price_per_kwh": 7.25}
+
+
+async def _start_guest_add(hass: HomeAssistant, entry_id: str, name: str) -> dict:
+    result = await hass.config_entries.subentries.async_init(
+        (entry_id, "user"), context={"source": "user"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": name, "type": "guest"}
+    )
+    assert result["step_id"] == "guest_pricing"
+    return result
+
+
+async def test_guest_add_name_rechecked_when_pricing_is_saved(hass: HomeAssistant) -> None:
+    """D-23: a name another user took while the pricing step was open is rejected at save."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_regular_user(hass, entry.entry_id, "Paul")
+    result = await _start_guest_add(hass, entry.entry_id, "Petra")
+    paul = _user_sub(hass, entry.entry_id, "Paul")
+    await _reconfigure_user(
+        hass, entry.entry_id, paul.subentry_id, {"name": "Petra", "active": True}
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 5.0}
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "user"
+    assert result["errors"] == {"name": "name_not_unique"}
+    assert _suggested(result) == {"name": "Petra", "type": "guest"}
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert [u.subentry_id for u in _get_subentries_by_type(loaded, "user")] == [paul.subentry_id]
+
+
+async def test_guest_add_keeps_typed_price_after_commit_point_error(hass: HomeAssistant) -> None:
+    """V-2: after the commit-point error the pricing page offers the price typed before."""
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_regular_user(hass, entry.entry_id, "Paul")
+    result = await _start_guest_add(hass, entry.entry_id, "Petra")
+    paul = _user_sub(hass, entry.entry_id, "Paul")
+    await _reconfigure_user(
+        hass, entry.entry_id, paul.subentry_id, {"name": "Petra", "active": True}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 7.25}
+    )
+    assert result["errors"] == {"name": "name_not_unique"}
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Gina", "type": "guest"}
+    )
+
+    assert result["step_id"] == "guest_pricing"
+    assert _suggested(result) == {"guest_pricing_method": "fixed", "price_per_kwh": 7.25}
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], _suggested(result)
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"]["guest_pricing"] == {"method": "fixed", "price_per_kwh": 7.25}
+
+
+async def _session_of_deleted_user(hass: HomeAssistant, entry: MockConfigEntry, profile: str):
+    """Petra charges, then Petra is deleted; the session runs on under her name."""
+    await _add_regular_user(hass, entry.entry_id, "Petra")
+    petra = _user_sub(hass, entry.entry_id, "Petra")
+    await _add_rfid_mapping(hass, entry.entry_id, card_index=1, user_id=petra.subentry_id)
+    await start_profile_session(hass, profile)
+    hass.config_entries.async_remove_subentry(entry, petra.subentry_id)
+    await hass.async_block_till_done()
+    assert hass.data[DOMAIN][entry.entry_id]["session_engine"].active_session.user_name == "Petra"
+
+
+@pytest.mark.parametrize("profile", ENGINE_PROFILES)
+async def test_name_of_running_session_cannot_be_taken(hass: HomeAssistant, profile: str) -> None:
+    """D-24: neither a new user nor a renamed one may take the running session's name."""
+    entry = _profile_entry(profile)
+    await setup_session_engine(hass, entry)
+    await _add_regular_user(hass, entry.entry_id, "Paul")
+    paul = _user_sub(hass, entry.entry_id, "Paul")
+    await _session_of_deleted_user(hass, entry, profile)
+
+    result = await _add_regular_user(hass, entry.entry_id, " Petra")
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"name": "name_in_session"}
+
+    result = await _reconfigure_user(
+        hass, entry.entry_id, paul.subentry_id, {"name": "Petra", "active": True}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"name": "name_in_session"}
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert [u.data["name"] for u in _get_subentries_by_type(loaded, "user")] == ["Paul"]
+
+
+async def test_guest_add_rechecked_against_session_when_pricing_is_saved(
+    hass: HomeAssistant,
+) -> None:
+    """D-23, D-24: a session under the name, started while pricing was open, blocks the add."""
+    entry = _make_entry()
+    await setup_session_engine(hass, entry)
+    result = await _start_guest_add(hass, entry.entry_id, "Petra")
+    await _session_of_deleted_user(hass, entry, "generic")
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 5.0}
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "user"
+    assert result["errors"] == {"name": "name_in_session"}
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert _get_subentries_by_type(loaded, "user") == []

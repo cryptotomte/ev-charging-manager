@@ -624,7 +624,7 @@ async def test_previous_month_accumulation_survives_store_roundtrip(
         await hass.async_block_till_done()
 
         # Fresh load from the same backing storage — restart simulation
-        user_stats_out, _, _ = await store.async_load()
+        user_stats_out, _, _, _ = await store.async_load()
 
     out = user_stats_out["Petra"]
     assert out.previous_month.month == "2026-03"

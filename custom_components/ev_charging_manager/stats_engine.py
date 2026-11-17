@@ -184,6 +184,8 @@ class StatsEngine:
         self._guest_last: GuestLastSession | None = None
         # PR-07: ISO timestamp list of unknown sessions for proactive warning (US5)
         self._unknown_session_times: list[str] = []
+        # Spec 026 D-6: totals of removed guest buckets, so the guest aggregates never drop.
+        self._guest_retired: dict[str, float] = {"energy_kwh": 0.0, "cost_kr": 0.0}
         self._unsub_event: Callable[[], None] | None = None
         self._unsub_midnight: Callable[[], None] | None = None
 
@@ -197,6 +199,11 @@ class StatsEngine:
         """Return the last guest session data, or None if none has occurred."""
         return self._guest_last
 
+    @property
+    def guest_retired(self) -> dict[str, float]:
+        """Return the carried totals of removed guest buckets (energy_kwh, cost_kr)."""
+        return self._guest_retired
+
     async def async_setup(self) -> None:
         """Load persisted stats, ensure Unknown user exists, subscribe to events."""
         # Load persisted statistics (T003/T010)
@@ -204,6 +211,7 @@ class StatsEngine:
             self._user_stats,
             self._guest_last,
             self._unknown_session_times,
+            self._guest_retired,
         ) = await self._stats_store.async_load()
 
         # Always ensure "Unknown" user entry exists (FR-007, T018)
@@ -361,9 +369,7 @@ class StatsEngine:
                 )
 
         # Persist and notify sensors
-        await self._stats_store.async_save(
-            self._user_stats, self._guest_last, self._unknown_session_times
-        )
+        await self._async_save()
         self._dispatch_update()
 
         _LOGGER.debug(
@@ -394,12 +400,52 @@ class StatsEngine:
 
         if rolled:
             _LOGGER.info("Month rollover to %s completed for %d user(s)", new_month, rolled)
-            # PR-26 Fix 2 (FR-005): pass unknown_session_times so the rollover
-            # save does not wipe the rolling 7-day warning window to [].
-            await self._stats_store.async_save(
-                self._user_stats, self._guest_last, self._unknown_session_times
-            )
+            # PR-26 Fix 2 (FR-005): the save carries unknown_session_times so the
+            # rollover does not wipe the rolling 7-day warning window to [].
+            await self._async_save()
             self._dispatch_update()
+
+    async def async_remove_user(self, user_name: str) -> None:
+        """Remove a user's bucket; a guest's totals move into the carry (spec 026 D-5, D-6)."""
+        stats = self._user_stats.pop(user_name, None)
+        if stats is None:
+            return
+        if stats.user_type == "guest":
+            # D-29: in whole Wh and hundredths, the units the guest totals sum in.
+            retired = self._guest_retired
+            self._guest_retired = {
+                "energy_kwh": (
+                    round(retired["energy_kwh"] * 1000) + round(stats.total_energy_kwh * 1000)
+                )
+                / 1000,
+                "cost_kr": (round(retired["cost_kr"] * 100) + round(stats.total_cost_kr * 100))
+                / 100,
+            }
+        await self._async_save()
+        self._dispatch_update()
+
+    async def async_rename_user(self, old_name: str, new_name: str) -> None:
+        """Move a user's bucket to a new name, totals and months unchanged (spec 026 D-7)."""
+        if new_name in self._user_stats:
+            # D-26: never overwrite another bucket.
+            _LOGGER.warning(
+                "Not moving statistics of %s to %s: a bucket with that name exists",
+                old_name,
+                new_name,
+            )
+            return
+        stats = self._user_stats.pop(old_name, None)
+        if stats is None:
+            return
+        stats.user_name = new_name
+        self._user_stats[new_name] = stats
+        await self._async_save()
+        self._dispatch_update()
+
+    async def _async_save(self) -> None:
+        await self._stats_store.async_save(
+            self._user_stats, self._guest_last, self._unknown_session_times, self._guest_retired
+        )
 
     @callback
     def _dispatch_update(self) -> None:

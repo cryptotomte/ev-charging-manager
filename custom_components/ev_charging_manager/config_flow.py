@@ -11,12 +11,14 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
+    ConfigSubentry,
     ConfigSubentryFlow,
     OptionsFlow,
     SubentryFlowResult,
 )
 from homeassistant.core import callback
 from homeassistant.helpers import selector
+from homeassistant.util import slugify
 
 from .charger_profiles import CHARGER_PROFILES
 from .const import (
@@ -505,12 +507,16 @@ class OptionsFlowHandler(OptionsFlow):
             if 0 < user_input[CONF_UI_DISPATCH_INTERVAL_S] < UI_DISPATCH_INTERVAL_S_ACTIVE_MIN:
                 errors[CONF_UI_DISPATCH_INTERVAL_S] = "ui_dispatch_interval_invalid"
             else:
-                # Store thresholds and proceed to pricing step.
-                # Explicitly write None for absent observation-slot keys so that
+                # Store thresholds and proceed to pricing step. Keys the form
+                # does not show (promote_*, read by the legacy engine) survive
+                # the save (D-19); every form key is overwritten, because the
+                # optional fields without a default are written below.
+                self._new_options = {**self.config_entry.options, **user_input}
+                # Explicitly write None for absent entity keys so that the setup
                 # migration sees conf_key in entry.options and skips re-filling a
-                # slot the user deliberately cleared.
-                self._new_options = dict(user_input)
+                # field the user deliberately cleared (D-18 for eto_entity).
                 for conf_key in (
+                    CONF_ETO_ENTITY,
                     CONF_PLUG_ENTITY,
                     CONF_CABLE_LOCK_ENTITY,
                     CONF_MODEL_STATUS_ENTITY,
@@ -889,6 +895,27 @@ class VehicleSubentryFlowHandler(ConfigSubentryFlow):
         )
 
 
+def _user_name_error(entry: ConfigEntry, name: str, own_subentry_id: str | None) -> str | None:
+    """Return the error key for a stripped candidate user name, or None (spec 026 D-10).
+
+    The slug is what the per-user sensors' unique_ids are built from; `unknown`
+    and `guest` collide with the Unknown bucket's and the guest aggregates' ids.
+    """
+    if not name:
+        return "name_empty"
+    slug = slugify(name)
+    if slug in ("unknown", "guest"):
+        return "name_reserved"
+    for sub in entry.subentries.values():
+        if (
+            sub.subentry_type == "user"
+            and sub.subentry_id != own_subentry_id
+            and slugify(sub.data["name"]) == slug
+        ):
+            return "name_not_unique"
+    return None
+
+
 class UserSubentryFlowHandler(ConfigSubentryFlow):
     """Handle user subentry add/edit flows."""
 
@@ -896,40 +923,86 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         """Initialize the user subentry flow."""
         super().__init__()
         self._user_data: dict[str, Any] = {}
+        # The first step's input, re-shown when the name fails at the commit point (D-23).
+        self._first_input: dict[str, Any] = {}
+        # The pricing input; the first step resets _user_data when it is re-shown (D-23, V-2).
+        self._pricing_input: dict[str, Any] | None = None
+
+    def _check_name(
+        self, submitted: str, subentry: ConfigSubentry | None
+    ) -> tuple[str, str | None]:
+        """Return the name to store and its error key, or None (spec 026 D-8, D-10, D-24, D-30).
+
+        Runs on the first step and again right before the subentry is written
+        (D-23): a session can start while the guest pricing step is open.
+        """
+        entry = self._get_entry()
+        if subentry is not None and subentry.data["name"] in (submitted, submitted.strip()):
+            # Unchanged names skip the checks so users whose names already
+            # collide can still be deactivated or edited (D-10, D-30).
+            return subentry.data["name"], None
+        name = submitted.strip()
+        error = _user_name_error(entry, name, subentry.subentry_id if subentry else None)
+        if error is None:
+            engine = self.hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("session_engine")
+            session_user = (
+                engine.active_session.user_name
+                if engine is not None and engine.active_session
+                else None
+            )
+            if subentry is not None and session_user == subentry.data["name"]:
+                # D-8: the running session keeps the name it started with
+                # (Snapshot principle), so a rename would land its energy
+                # and cost in a bucket no sensor shows.
+                error = "user_in_session"
+            elif session_user == name:
+                # D-24: the session's energy and cost would land in this user's bucket.
+                error = "name_in_session"
+        return name, error
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
         """Handle adding a new user — step 1: name + type."""
+        errors: dict[str, str] = {}
         if user_input is not None:
-            self._user_data = {
-                "name": user_input["name"],
-                "type": user_input["type"],
-                "active": True,
-                "created_at": datetime.now(UTC).isoformat(),
-            }
-            if user_input["type"] == "guest":
-                return await self.async_step_guest_pricing()
-            return self.async_create_entry(
-                title=self._user_data["name"],
-                data=self._user_data,
-            )
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("name"): selector.TextSelector(),
-                    vol.Required("type"): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=[
-                                {"value": "regular", "label": "Regular"},
-                                {"value": "guest", "label": "Guest"},
-                            ],
-                            mode=selector.SelectSelectorMode.LIST,
-                        )
-                    ),
+            name, error = self._check_name(user_input["name"], None)
+            if error:
+                errors["name"] = error
+            else:
+                self._user_data = {
+                    "name": name,
+                    "type": user_input["type"],
+                    "active": True,
+                    "created_at": datetime.now(UTC).isoformat(),
                 }
-            ),
+                if user_input["type"] == "guest":
+                    self._first_input = dict(user_input)
+                    return await self.async_step_guest_pricing()
+                return self.async_create_entry(
+                    title=self._user_data["name"],
+                    data=self._user_data,
+                )
+        return self._user_form(user_input, errors)
+
+    def _user_form(
+        self, user_input: dict[str, Any] | None, errors: dict[str, str]
+    ) -> SubentryFlowResult:
+        schema = vol.Schema(
+            {
+                vol.Required("name"): selector.TextSelector(),
+                vol.Required("type"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": "regular", "label": "Regular"},
+                            {"value": "guest", "label": "Guest"},
+                        ],
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }
         )
+        if user_input is not None:
+            schema = self.add_suggested_values_to_schema(schema, user_input)
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
     async def async_step_guest_pricing(
         self, user_input: dict[str, Any] | None = None
@@ -938,6 +1011,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            self._pricing_input = dict(user_input)
             method = user_input.get("guest_pricing_method", "fixed")
             price = user_input.get("price_per_kwh")
             markup = user_input.get("markup_factor")
@@ -955,40 +1029,43 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                 elif method == "markup":
                     pricing["markup_factor"] = markup
                 self._user_data["guest_pricing"] = pricing
+                _name, error = self._check_name(self._first_input["name"], None)
+                if error:
+                    return self._user_form(self._first_input, {"name": error})
                 return self.async_create_entry(
                     title=self._user_data["name"],
                     data=self._user_data,
                 )
 
-        return self.async_show_form(
-            step_id="guest_pricing",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("guest_pricing_method"): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=[
-                                {"value": "fixed", "label": "Fixed price"},
-                                {"value": "markup", "label": "Markup"},
-                            ],
-                            mode=selector.SelectSelectorMode.LIST,
-                        )
+        schema = vol.Schema(
+            {
+                vol.Required("guest_pricing_method"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": "fixed", "label": "Fixed price"},
+                            {"value": "markup", "label": "Markup"},
+                        ],
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+                vol.Optional("price_per_kwh"): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(min=0.01, max=100.0, step=0.01)
                     ),
-                    vol.Optional("price_per_kwh"): vol.All(
-                        selector.NumberSelector(
-                            selector.NumberSelectorConfig(min=0.01, max=100.0, step=0.01)
-                        ),
-                        vol.Coerce(float),
+                    vol.Coerce(float),
+                ),
+                vol.Optional("markup_factor"): vol.All(
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(min=1.01, max=10.0, step=0.01)
                     ),
-                    vol.Optional("markup_factor"): vol.All(
-                        selector.NumberSelector(
-                            selector.NumberSelectorConfig(min=1.01, max=10.0, step=0.01)
-                        ),
-                        vol.Coerce(float),
-                    ),
-                }
-            ),
-            errors=errors,
+                    vol.Coerce(float),
+                ),
+            }
         )
+        if self._pricing_input is not None:
+            schema = self.add_suggested_values_to_schema(schema, self._pricing_input)
+
+        return self.async_show_form(step_id="guest_pricing", data_schema=schema, errors=errors)
 
     async def _apply_active_change(
         self, entry: ConfigEntry, subentry_id: str, new_active: bool, was_active: bool
@@ -1007,11 +1084,17 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         """Handle editing an existing user — type is immutable (FR-004)."""
         subentry = self._get_reconfigure_subentry()
         entry = self._get_entry()
+        errors: dict[str, str] = {}
 
         if user_input is not None:
+            name, error = self._check_name(user_input["name"], subentry)
+            if error:
+                errors["name"] = error
+
+        if user_input is not None and not errors:
             # Build updated data preserving immutable fields
             new_data = dict(subentry.data)
-            new_data["name"] = user_input["name"]
+            new_data["name"] = name
             new_data["active"] = user_input.get("active", True)
 
             was_active = subentry.data.get("active", True)
@@ -1019,6 +1102,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
             # If guest, route to pricing edit
             if new_data["type"] == "guest":
                 self._user_data = new_data
+                self._first_input = dict(user_input)
                 return await self.async_step_reconfigure_guest_pricing()
 
             # Run cascade before updating the subentry
@@ -1037,7 +1121,15 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                 title=title,
             )
 
-        # Pre-fill form with current values
+        return self._reconfigure_form(subentry, user_input, errors)
+
+    def _reconfigure_form(
+        self,
+        subentry: ConfigSubentry,
+        user_input: dict[str, Any] | None,
+        errors: dict[str, str],
+    ) -> SubentryFlowResult:
+        # Pre-fill form with current values, or the submitted ones on error
         schema = self.add_suggested_values_to_schema(
             vol.Schema(
                 {
@@ -1045,12 +1137,14 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                     vol.Required("active"): selector.BooleanSelector(),
                 }
             ),
-            {"name": subentry.data["name"], "active": subentry.data.get("active", True)},
+            user_input
+            or {"name": subentry.data["name"], "active": subentry.data.get("active", True)},
         )
 
         return self.async_show_form(
             step_id="reconfigure",
             data_schema=schema,
+            errors=errors,
             description_placeholders={"type": subentry.data["type"]},
         )
 
@@ -1063,6 +1157,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            self._pricing_input = dict(user_input)
             method = user_input.get("guest_pricing_method", "fixed")
             price = user_input.get("price_per_kwh")
             markup = user_input.get("markup_factor")
@@ -1079,6 +1174,17 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                 elif method == "markup":
                     pricing["markup_factor"] = markup
                 self._user_data["guest_pricing"] = pricing
+                name, error = self._check_name(self._first_input["name"], subentry)
+                if error:
+                    return self._reconfigure_form(subentry, self._first_input, {"name": error})
+                self._user_data["name"] = name
+
+                await self._apply_active_change(
+                    entry,
+                    subentry.subentry_id,
+                    self._user_data["active"],
+                    subentry.data.get("active", True),
+                )
 
                 title = self._user_data["name"]
                 if not self._user_data.get("active", True):
@@ -1093,7 +1199,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
 
         # Pre-fill with existing pricing
         existing_pricing = dict(subentry.data.get("guest_pricing", {}))
-        suggested = {
+        suggested = self._pricing_input or {
             "guest_pricing_method": existing_pricing.get("method", "fixed"),
             "price_per_kwh": existing_pricing.get("price_per_kwh"),
             "markup_factor": existing_pricing.get("markup_factor"),
@@ -1190,7 +1296,8 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
             # Fall back to charger_host from entry data (direct config)
             host = entry.data.get("charger_host")
         if host is None:
-            self._discovery_error = "Cannot determine charger address."
+            _LOGGER.warning("RFID discovery skipped: cannot determine the charger address")
+            self._discovery_error = "discovery_failed"
             return await self.async_step_manual()
 
         provider = get_discovery_provider(profile, host)
@@ -1199,12 +1306,17 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
 
         self._provider = provider
 
-        # Run discovery
+        # Run discovery. Any failure falls back to the manual form (D-16).
         try:
             cards = await provider.get_programmed_cards(self.hass)
             self._discovered_cards = cards
         except DiscoveryError as exc:
-            self._discovery_error = exc.message
+            _LOGGER.warning("RFID discovery failed: %s", exc.message)
+            self._discovery_error = "discovery_failed"
+            return await self.async_step_manual()
+        except Exception:
+            _LOGGER.exception("RFID discovery failed unexpectedly")
+            self._discovery_error = "discovery_failed"
             return await self.async_step_manual()
 
         # Also fetch lri UID (best-effort)
@@ -1255,10 +1367,9 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
             label = f"#{card.index}: {label_name} ({energy_str})"
             options.append({"value": str(card.index), "label": label})
 
-        # Build description placeholders for UID info
-        uid_text = f"Last scanned UID: {self._last_rfid_uid}" if self._last_rfid_uid else ""
+        # The sentence around the UID lives in the translations (D-15).
         description_placeholders: dict[str, str] = {
-            "last_uid": uid_text,
+            "last_uid": self._last_rfid_uid or "–",
         }
 
         schema = vol.Schema(
@@ -1290,7 +1401,8 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
         if user_input is not None:
             data: dict[str, Any] = {
                 "card_index": card.index,
-                CONF_CARD_UID: self._last_rfid_uid,
+                # lri is the charger's last scanned UID, not this slot's (D-17).
+                CONF_CARD_UID: None,
                 "user_id": user_input["user_id"],
                 "vehicle_id": user_input.get("vehicle_id"),
                 "active": True,
@@ -1409,16 +1521,14 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
                 )
             )
 
-        error_text = f"Discovery failed: {self._discovery_error}" if self._discovery_error else ""
-        description_placeholders: dict[str, str] = {
-            "discovery_error": error_text,
-        }
+        # Why discovery was not used, shown only on the first display (D-15).
+        if user_input is None and self._discovery_error:
+            errors["base"] = self._discovery_error
 
         return self.async_show_form(
             step_id="manual",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
-            description_placeholders=description_placeholders,
         )
 
     async def async_step_reconfigure(
@@ -1447,6 +1557,8 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
             )
 
         active_users = self._get_active_users(entry)
+        if not active_users:
+            return self.async_abort(reason="no_users")
         vehicles = self._get_vehicles(entry)
 
         schema_dict: dict[Any, Any] = {

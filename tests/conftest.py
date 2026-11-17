@@ -131,6 +131,13 @@ MOCK_CAR_STATUS_ENTITY = "sensor.goe_abc123_car_value"
 MOCK_TRX_ENTITY = "select.goe_abc123_trx"
 MOCK_ENERGY_ENTITY = "sensor.goe_abc123_wh"
 MOCK_POWER_ENTITY = "sensor.goe_abc123_nrg_11"
+# Observation entities the goe_gemini profile resolves for serial "abc123"
+MOCK_PLUG_ENTITY = "binary_sensor.goe_abc123_car_0"
+MOCK_CABLE_LOCK_ENTITY = "sensor.goe_abc123_cus_value"
+
+# One profile per session engine: generic -> SessionEngine, goe_gemini ->
+# PlugAnchoredSessionEngine (selected in __init__.py).
+ENGINE_PROFILES = ("generic", "goe_gemini")
 
 # Vehicle subentry data for session tests (Peugeot 3008 PHEV)
 MOCK_VEHICLE_SUBENTRY = {
@@ -189,6 +196,9 @@ async def setup_session_engine(
     hass.states.async_set(MOCK_TRX_ENTITY, "null")
     hass.states.async_set(MOCK_ENERGY_ENTITY, "0.0")
     hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+    if entry.data.get("charger_profile") == "goe_gemini":
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
 
     entry.add_to_hass(hass)
     await hass.config_entries.async_setup(entry.entry_id)
@@ -210,3 +220,26 @@ async def stop_charging_session(hass: HomeAssistant) -> None:
     """Simulate a charger ending a session."""
     hass.states.async_set(MOCK_CAR_STATUS_ENTITY, "Complete")
     await hass.async_block_till_done()
+
+
+async def start_profile_session(hass: HomeAssistant, profile: str, trx_value: str = "2") -> None:
+    """Start a session on the engine of ``profile``; goe_gemini needs the cable in first."""
+    if profile == "goe_gemini":
+        hass.states.async_set(MOCK_PLUG_ENTITY, "on")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Locked")
+        await hass.async_block_till_done()
+    await start_charging_session(hass, trx_value)
+    if profile == "goe_gemini":
+        hass.states.async_set(MOCK_POWER_ENTITY, "7200.0")
+        await hass.async_block_till_done()
+
+
+async def stop_profile_session(hass: HomeAssistant, profile: str) -> None:
+    """End the session on the engine of ``profile``; goe_gemini ends it at unplug."""
+    await stop_charging_session(hass)
+    if profile == "goe_gemini":
+        hass.states.async_set(MOCK_POWER_ENTITY, "0.0")
+        hass.states.async_set(MOCK_CABLE_LOCK_ENTITY, "Unlocked")
+        await hass.async_block_till_done()
+        hass.states.async_set(MOCK_PLUG_ENTITY, "off")
+        await hass.async_block_till_done()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from unittest.mock import patch
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -12,12 +13,22 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.ev_charging_manager.const import (
     CONF_CABLE_LOCK_ENTITY,
     CONF_ERROR_ENTITY,
+    CONF_ETO_ENTITY,
     CONF_MODEL_STATUS_ENTITY,
     CONF_PLUG_ENTITY,
+    CONF_TOTAL_ENERGY_ENTITY,
     DOMAIN,
 )
 
-from .conftest import MOCK_CHARGER_DATA, setup_entry_with_subentries
+from .conftest import (
+    MOCK_CHARGER_DATA,
+    MOCK_ENERGY_ENTITY,
+    MOCK_PLUG_ENTITY,
+    setup_entry_with_subentries,
+    setup_session_engine,
+    start_profile_session,
+    stop_profile_session,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -235,6 +246,99 @@ async def test_selective_reactivation_fr009(hass: HomeAssistant) -> None:
     # mapping_1: was individually deactivated BEFORE cascade → stays inactive
     assert m1.data["active"] is False
     assert m1.data["deactivated_by"] == "individual"
+
+
+# ---------------------------------------------------------------------------
+# Spec 026 D-11: guest deactivation cascades like a regular user's
+# ---------------------------------------------------------------------------
+
+_GUEST_PRICING = {"guest_pricing_method": "fixed", "price_per_kwh": 4.5}
+
+
+async def _add_guest(hass, entry_id, name="Visitor"):
+    result = await hass.config_entries.subentries.async_init(
+        (entry_id, "user"),
+        context={"source": "user"},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": name, "type": "guest"}
+    )
+    return await hass.config_entries.subentries.async_configure(result["flow_id"], _GUEST_PRICING)
+
+
+async def _reconfigure_guest(hass, entry_id, subentry_id, active, pricing=_GUEST_PRICING):
+    result = await _reconfigure_user(hass, entry_id, subentry_id, "Visitor", active)
+    assert result["step_id"] == "reconfigure_guest_pricing"
+    return await hass.config_entries.subentries.async_configure(result["flow_id"], pricing)
+
+
+async def _guest_with_two_mappings(hass):
+    entry = _make_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_guest(hass, entry.entry_id)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    guest = _get_subentries_by_type(loaded, "user")[0]
+    await _add_rfid(hass, entry.entry_id, 0, guest.subentry_id)
+    await _add_rfid(hass, entry.entry_id, 1, guest.subentry_id)
+    await hass.async_block_till_done()
+    return entry, guest
+
+
+async def test_guest_deactivation_cascade(hass: HomeAssistant) -> None:
+    """T-09: deactivating a guest deactivates its mappings with user_cascade."""
+    entry, guest = await _guest_with_two_mappings(hass)
+
+    result = await _reconfigure_guest(hass, entry.entry_id, guest.subentry_id, False)
+    await hass.async_block_till_done()
+
+    assert result["type"] == FlowResultType.ABORT
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert loaded.subentries[guest.subentry_id].data["active"] is False
+    mappings = _get_subentries_by_type(loaded, "rfid_mapping")
+    assert len(mappings) == 2
+    for m in mappings:
+        assert m.data["active"] is False
+        assert m.data["deactivated_by"] == "user_cascade"
+
+
+async def test_guest_reactivation_restores_only_cascaded_mappings(hass: HomeAssistant) -> None:
+    """T-10: reactivating a guest restores user_cascade mappings, not individual ones."""
+    entry, guest = await _guest_with_two_mappings(hass)
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    mappings = _get_subentries_by_type(loaded, "rfid_mapping")
+    mapping_0 = next(m for m in mappings if m.data["card_index"] == 0)
+    mapping_1 = next(m for m in mappings if m.data["card_index"] == 1)
+    await _reconfigure_rfid(
+        hass, entry.entry_id, mapping_1.subentry_id, guest.subentry_id, active=False
+    )
+
+    await _reconfigure_guest(hass, entry.entry_id, guest.subentry_id, False)
+    await _reconfigure_guest(hass, entry.entry_id, guest.subentry_id, True)
+    await hass.async_block_till_done()
+
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert loaded.subentries[mapping_0.subentry_id].data["active"] is True
+    assert loaded.subentries[mapping_0.subentry_id].data["deactivated_by"] is None
+    assert loaded.subentries[mapping_1.subentry_id].data["active"] is False
+    assert loaded.subentries[mapping_1.subentry_id].data["deactivated_by"] == "individual"
+
+
+async def test_guest_pricing_error_changes_no_mapping(hass: HomeAssistant) -> None:
+    """T-11: a pricing validation error leaves every mapping as it was."""
+    entry, guest = await _guest_with_two_mappings(hass)
+
+    result = await _reconfigure_guest(
+        hass, entry.entry_id, guest.subentry_id, False, {"guest_pricing_method": "fixed"}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "price_required"}
+    loaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert loaded.subentries[guest.subentry_id].data["active"] is True
+    for m in _get_subentries_by_type(loaded, "rfid_mapping"):
+        assert m.data["active"] is True
+        assert m.data["deactivated_by"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -727,3 +831,96 @@ async def test_mig_06_missing_serial_slots_unset(
     assert any(
         "charger serial missing" in r.message or "skipped" in r.message for r in caplog.records
     ), "Expected warning about missing charger serial"
+
+
+# ---------------------------------------------------------------------------
+# Spec 026 D-18: eto_entity seeded from the total-energy entity of first setup
+# ---------------------------------------------------------------------------
+
+_ETO = "sensor.charger_total_energy"
+
+
+def _eto_entry(profile: str, total_energy_entity: str | None, options: dict) -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            **MOCK_CHARGER_DATA,
+            "charger_profile": profile,
+            CONF_TOTAL_ENERGY_ENTITY: total_energy_entity,
+        },
+        options=options,
+        title="Test Charger",
+    )
+
+
+async def test_eto_seeded_from_total_energy_entity(hass: HomeAssistant) -> None:
+    """T-43: on goe_gemini the option is written with the slot migration; a session uses it."""
+    entry = _eto_entry(
+        "goe_gemini", _ETO, {"min_session_duration_s": 0, "min_session_energy_wh": 0}
+    )
+    hass.states.async_set(_ETO, "100.0")
+    with patch.object(
+        hass.config_entries, "async_update_entry", wraps=hass.config_entries.async_update_entry
+    ) as update:
+        await setup_session_engine(hass, entry)
+
+    update.assert_called_once()
+    written = update.call_args.kwargs["options"]
+    assert (written[CONF_ETO_ENTITY], written[CONF_PLUG_ENTITY]) == (_ETO, MOCK_PLUG_ENTITY)
+
+    await _add_user(hass, entry.entry_id, "Petra")
+    petra = _get_subentries_by_type(hass.config_entries.async_get_entry(entry.entry_id), "user")[0]
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=None,
+    ):
+        await _add_rfid(hass, entry.entry_id, 1, petra.subentry_id)
+    await hass.async_block_till_done()
+    await start_profile_session(hass, "goe_gemini")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "2.0")
+    hass.states.async_set(_ETO, "102.0")
+    await hass.async_block_till_done()
+    await stop_profile_session(hass, "goe_gemini")
+
+    session = hass.data[DOMAIN][entry.entry_id]["session_store"].sessions[-1]
+    assert session["user_name"] == "Petra"
+    assert (session["charger_total_before_kwh"], session["charger_total_after_kwh"]) == (
+        100.0,
+        102.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile", "total_energy_entity", "options"),
+    [
+        ("goe_gemini", _ETO, {CONF_ETO_ENTITY: None}),
+        ("goe_gemini", None, {}),
+        ("generic", _ETO, {}),
+    ],
+)
+async def test_eto_not_seeded(
+    hass: HomeAssistant, profile: str, total_energy_entity, options: dict
+) -> None:
+    """T-44: a present option (even None) is kept; no total-energy entity adds no key;
+    a profile without a total-energy sensor (generic) is never seeded (D-31)."""
+    entry = _eto_entry(profile, total_energy_entity, options)
+    await setup_entry_with_subentries(hass, entry)
+
+    assert entry.options.get(CONF_ETO_ENTITY, "absent") == options.get(CONF_ETO_ENTITY, "absent")
+
+
+async def test_eto_seed_runs_once(hass: HomeAssistant) -> None:
+    """T-45: the second setup writes nothing."""
+    entry = _eto_entry("goe_gemini", _ETO, {})
+    await setup_entry_with_subentries(hass, entry)
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch.object(
+        hass.config_entries, "async_update_entry", wraps=hass.config_entries.async_update_entry
+    ) as update:
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    update.assert_not_called()
+    assert entry.options[CONF_ETO_ENTITY] == _ETO

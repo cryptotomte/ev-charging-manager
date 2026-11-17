@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from homeassistant.core import HomeAssistant
 
 from custom_components.ev_charging_manager.stats_engine import (
@@ -11,7 +12,7 @@ from custom_components.ev_charging_manager.stats_engine import (
     MonthStats,
     UserStats,
 )
-from custom_components.ev_charging_manager.stats_store import StatsStore
+from custom_components.ev_charging_manager.stats_store import EMPTY_GUEST_RETIRED, StatsStore
 
 
 def _make_user_stats(
@@ -38,7 +39,7 @@ async def test_load_empty_store_returns_defaults(hass: HomeAssistant) -> None:
     """Loading a missing store returns empty dict and None guest_last."""
     store = StatsStore(hass)
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=None):
-        user_stats, guest_last, _ = await store.async_load()
+        user_stats, guest_last, _, _ = await store.async_load()
 
     assert user_stats == {}
     assert guest_last is None
@@ -59,10 +60,10 @@ async def test_save_and_load_roundtrip_preserves_userstats(hass: HomeAssistant) 
         return saved_data if saved_data else None  # type: ignore[return-value]
 
     with patch.object(store._store, "async_save", side_effect=fake_save):
-        await store.async_save(user_stats_in, None)
+        await store.async_save(user_stats_in, None, [], EMPTY_GUEST_RETIRED)
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
-        user_stats_out, guest_last_out, _ = await store.async_load()
+        user_stats_out, guest_last_out, _, _ = await store.async_load()
 
     assert "Petra" in user_stats_out
     out = user_stats_out["Petra"]
@@ -94,10 +95,10 @@ async def test_save_and_load_roundtrip_preserves_guest_last(hass: HomeAssistant)
         return saved_data if saved_data else None  # type: ignore[return-value]
 
     with patch.object(store._store, "async_save", side_effect=fake_save):
-        await store.async_save({}, guest)
+        await store.async_save({}, guest, [], EMPTY_GUEST_RETIRED)
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
-        _, guest_out, _ = await store.async_load()
+        _, guest_out, _, _ = await store.async_load()
 
     assert guest_out is not None
     assert guest_out.energy_kwh == 32.1
@@ -117,7 +118,7 @@ async def test_load_skips_malformed_user_entry(hass: HomeAssistant) -> None:
     }
 
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=bad_data):
-        user_stats, _, _ = await store.async_load()
+        user_stats, _, _, _ = await store.async_load()
 
     # Only the valid entry survives
     assert "Petra" in user_stats
@@ -130,7 +131,7 @@ async def test_load_handles_missing_guest_last(hass: HomeAssistant) -> None:
     data = {"user_stats": {}, "guest_last": None}
 
     with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=data):
-        _, guest_last, _ = await store.async_load()
+        _, guest_last, _, _ = await store.async_load()
 
     assert guest_last is None
 
@@ -151,11 +152,85 @@ async def test_save_multiple_users(hass: HomeAssistant) -> None:
         return saved_data if saved_data else None  # type: ignore[return-value]
 
     with patch.object(store._store, "async_save", side_effect=fake_save):
-        await store.async_save({"Petra": petra, "Paul": paul, "Unknown": unknown}, None)
+        await store.async_save(
+            {"Petra": petra, "Paul": paul, "Unknown": unknown}, None, [], EMPTY_GUEST_RETIRED
+        )
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
-        user_stats, _, _ = await store.async_load()
+        user_stats, _, _, _ = await store.async_load()
 
     assert set(user_stats.keys()) == {"Petra", "Paul", "Unknown"}
     assert user_stats["Paul"].session_count == 2
     assert user_stats["Unknown"].total_energy_kwh == 0.0
+
+
+async def test_load_without_guest_retired_reads_zeros(hass: HomeAssistant, caplog) -> None:
+    """T-42: a store written before spec 026 has no guest_retired; it reads as zeros."""
+    store = StatsStore(hass)
+    stored = {"user_stats": {}, "guest_last": None, "unknown_session_times": []}
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored):
+        *_, guest_retired = await store.async_load()
+
+    assert guest_retired == {"energy_kwh": 0.0, "cost_kr": 0.0}
+    assert "guest_retired" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("oops", (0.0, 0.0)),
+        ([1, 2], (0.0, 0.0)),
+        ({"energy_kwh": 1.0}, (1.0, 0.0)),
+        ({"energy_kwh": "x", "cost_kr": 1.0}, (0.0, 1.0)),
+        # D-29: booleans, non-finite and negative energy are malformed too.
+        ({"energy_kwh": True, "cost_kr": 1.0}, (0.0, 1.0)),
+        ({"energy_kwh": 1.0, "cost_kr": False}, (1.0, 0.0)),
+        ({"energy_kwh": float("nan"), "cost_kr": 1.0}, (0.0, 1.0)),
+        ({"energy_kwh": float("inf"), "cost_kr": -1.0}, (0.0, -1.0)),
+        ({"energy_kwh": 1.0, "cost_kr": float("-inf")}, (1.0, 0.0)),
+        ({"energy_kwh": -0.5, "cost_kr": 1.0}, (0.0, 1.0)),
+        ({"energy_kwh": "x", "cost_kr": None}, (0.0, 0.0)),
+    ],
+)
+async def test_load_malformed_guest_retired_reads_zero_per_field_with_warning(
+    hass: HomeAssistant, caplog, raw, expected
+) -> None:
+    """T-42, V-1: a malformed field reads as zero, the other is kept; one warning per load."""
+    store = StatsStore(hass)
+    stored = {"user_stats": {}, "guest_retired": raw}
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored):
+        *_, guest_retired = await store.async_load()
+
+    assert guest_retired == {"energy_kwh": expected[0], "cost_kr": expected[1]}
+    assert [r.levelname for r in caplog.records if "guest_retired" in r.message] == ["WARNING"]
+
+
+async def test_load_negative_guest_retired_cost_is_kept(hass: HomeAssistant, caplog) -> None:
+    """V-1: spot cost can be negative, so a negative carried cost is valid."""
+    store = StatsStore(hass)
+    stored = {"user_stats": {}, "guest_retired": {"energy_kwh": 10.0, "cost_kr": -3.0}}
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored):
+        *_, guest_retired = await store.async_load()
+
+    assert guest_retired == {"energy_kwh": 10.0, "cost_kr": -3.0}
+    assert "guest_retired" not in caplog.text
+
+
+async def test_guest_retired_roundtrip(hass: HomeAssistant) -> None:
+    """T-42: a saved carry loads back unchanged."""
+    store = StatsStore(hass)
+    with patch.object(store._store, "async_save", new_callable=AsyncMock) as save:
+        await store.async_save({}, None, [], {"energy_kwh": 10.0, "cost_kr": 45.0})
+    with patch.object(
+        store._store, "async_load", new_callable=AsyncMock, return_value=save.call_args.args[0]
+    ):
+        *_, guest_retired = await store.async_load()
+
+    assert guest_retired == {"energy_kwh": 10.0, "cost_kr": 45.0}
+
+
+async def test_save_requires_guest_retired(hass: HomeAssistant) -> None:
+    """D-29: no caller can save without the carry and so drop it from the store."""
+    store = StatsStore(hass)
+    with patch.object(store._store, "async_save", new_callable=AsyncMock), pytest.raises(TypeError):
+        await store.async_save({}, None, [])

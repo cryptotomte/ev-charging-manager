@@ -628,3 +628,154 @@ async def test_fw59_short_cards_array_padded_to_10(hass: HomeAssistant) -> None:
     for i in range(3, 10):
         assert cards[i].is_programmed is False
         assert cards[i].name is None
+
+
+# ---------------------------------------------------------------------------
+# Spec 026 D-16: malformed charger answers never raise anything but DiscoveryError
+# ---------------------------------------------------------------------------
+
+
+def _patch_session(session: MagicMock):
+    return patch(
+        "custom_components.ev_charging_manager.rfid_discovery_goe.async_get_clientsession",
+        return_value=session,
+    )
+
+
+async def test_odd_slot_types_degrade_without_exception(hass: HomeAssistant) -> None:
+    """T-21: non-string names and non-numeric energies are parsed, never raised on."""
+    slots = [
+        {"name": 42, "energy": 0},
+        {"name": ["a"], "energy": 0},
+        {"name": {"x": 1}, "energy": 0},
+        {"name": True, "energy": 0},
+        {"name": "", "energy": "56223"},
+        {"name": "", "energy": [1]},
+        {"name": "", "energy": {"wh": 1}},
+        {"name": "Paul", "energy": "abc"},
+    ]
+    session = _mock_session([(200, {"fwv": "59.4"}), (200, {"cards": slots})])
+
+    with _patch_session(session):
+        cards = await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+    for card in cards[:4]:
+        assert card.name is None
+        assert card.is_programmed is False
+    assert cards[4].energy_kwh == pytest.approx(56.223)
+    assert cards[4].is_programmed is True
+    for card in cards[5:7]:
+        assert card.energy_kwh is None
+        assert card.is_programmed is False
+    assert cards[7].name == "Paul"
+    assert cards[7].energy_kwh is None
+    assert cards[7].is_programmed is True
+
+
+@pytest.mark.parametrize("body", [[{"fwv": "59.4"}], None, 42])
+async def test_non_object_body_raises_discovery_error(hass: HomeAssistant, body) -> None:
+    """T-22: a JSON body that is not an object -> DiscoveryError."""
+    session = _mock_session([(200, body)])
+
+    with _patch_session(session), pytest.raises(DiscoveryError):
+        await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+
+@pytest.mark.parametrize(
+    ("fwv", "second_response", "expected_name"),
+    [
+        (60, _make_flat_keys_response([("Paul", 0, True)]), "Paul"),
+        (59.4, _make_cards_array_response(), "Paul"),
+    ],
+)
+async def test_numeric_fwv_parsed(
+    hass: HomeAssistant, fwv, second_response: dict, expected_name: str
+) -> None:
+    """T-23: integer and float fwv select the right card format by major version."""
+    session = _mock_session([(200, {"fwv": fwv}), (200, second_response)])
+
+    with _patch_session(session):
+        cards = await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+    assert cards[0].name == expected_name
+
+
+@pytest.mark.parametrize("fwv", [None, True, False])
+async def test_null_or_bool_fwv_raises_discovery_error(hass: HomeAssistant, fwv) -> None:
+    """T-23: fwv null or boolean -> DiscoveryError."""
+    session = _mock_session([(200, {"fwv": fwv})])
+
+    with _patch_session(session), pytest.raises(DiscoveryError):
+        await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+
+# ---------------------------------------------------------------------------
+# Spec 026 D-32: overflow, booleans, non-object bodies, and the is_programmed rule
+# ---------------------------------------------------------------------------
+
+
+async def test_huge_or_boolean_energy_is_not_a_number(hass: HomeAssistant) -> None:
+    """D-32: an energy too large for a float, or a boolean, parses as no energy."""
+    slots = [{"name": "", "energy": 10**400}, {"name": "", "energy": True}]
+    session = _mock_session([(200, {"fwv": "59.4"}), (200, {"cards": slots})])
+
+    with _patch_session(session):
+        cards = await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+    for card in cards[:2]:
+        assert card.energy_kwh is None
+        assert card.is_programmed is False
+
+
+@pytest.mark.parametrize("body", [["04b7d7b2c01690"], None, 42, "04b7d7b2c01690"])
+async def test_last_uid_non_object_body_returns_none(hass: HomeAssistant, body) -> None:
+    """D-32: a last-UID answer that is not a JSON object reads as no UID."""
+    session = _mock_session([(200, body)])
+
+    with _patch_session(session):
+        assert await GoeRfidDiscovery("192.168.1.100").get_last_rfid_uid(hass) is None
+
+
+async def test_is_programmed_uses_cleaned_name_and_parsed_energy(hass: HomeAssistant) -> None:
+    """D-32 (spec § 12 X-5): blank or placeholder names and out-of-range energy do not count."""
+    slots = [
+        {"name": "   ", "energy": 0},
+        {"name": " N/A ", "energy": 0},
+        {"name": "", "energy": 10**12},
+        {"name": "Paul", "energy": 0},
+    ]
+    session = _mock_session([(200, {"fwv": "59.4"}), (200, {"cards": slots})])
+
+    with _patch_session(session):
+        cards = await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+    assert [c.is_programmed for c in cards[:4]] == [False, False, False, True]
+
+
+async def test_flat_keys_odd_types_degrade_without_exception(hass: HomeAssistant) -> None:
+    """D-16, D-32: the firmware >= 60 parser survives odd JSON types in every key."""
+    data = {
+        "c0n": 42,
+        "c0e": "abc",
+        "c0i": True,
+        "c1n": ["x"],
+        "c1e": 10**400,
+        "c1i": False,
+        "c2n": " Paul ",
+        "c2e": True,
+        "c2i": True,
+        "c3n": {"x": 1},
+        "c3e": [1],
+        "c3i": None,
+        "c4n": None,
+        "c4e": "56223",
+        "c4i": True,
+    }
+    session = _mock_session([(200, {"fwv": "60.1"}), (200, data)])
+
+    with _patch_session(session):
+        cards = await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+    assert [c.name for c in cards[:5]] == [None, None, "Paul", None, None]
+    assert [c.energy_kwh for c in cards[:4]] == [None, None, None, None]
+    assert cards[4].energy_kwh == pytest.approx(56.223)

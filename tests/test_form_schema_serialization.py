@@ -43,9 +43,14 @@ from custom_components.ev_charging_manager.const import (
     DEFAULT_SPOT_VAT_MULTIPLIER,
     DOMAIN,
 )
-from custom_components.ev_charging_manager.rfid_discovery import DiscoveredCard
+from custom_components.ev_charging_manager.rfid_discovery import DiscoveredCard, DiscoveryError
 
-from .conftest import MOCK_CHARGER_DATA, setup_entry_with_subentries, setup_session_engine
+from .conftest import (
+    MOCK_CHARGER_DATA,
+    setup_entry_with_subentries,
+    setup_session_engine,
+    start_charging_session,
+)
 
 _FLOW = "/api/config/config_entries/flow"
 _OPTIONS_FLOW = "/api/config/config_entries/options/flow"
@@ -196,9 +201,9 @@ async def test_user_subentry_forms_serializable(hass: HomeAssistant, client) -> 
 
     result = await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "user"]}, "user")
     step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
-    await _post(client, step, {"name": "Guest", "type": "guest"}, "guest_pricing")
+    await _post(client, step, {"name": "Visitor", "type": "guest"}, "guest_pricing")
     await _post(client, step, {"guest_pricing_method": "fixed", "price_per_kwh": 4.5})
-    guest_id = _subentry_id(hass, entry.entry_id, "user", "Guest")
+    guest_id = _subentry_id(hass, entry.entry_id, "user", "Visitor")
 
     result = await _post(
         client,
@@ -209,7 +214,7 @@ async def test_user_subentry_forms_serializable(hass: HomeAssistant, client) -> 
     await _post(
         client,
         f"{_SUBENTRY_FLOW}/{result['flow_id']}",
-        {"name": "Guest", "active": True},
+        {"name": "Visitor", "active": True},
         "reconfigure_guest_pricing",
     )
 
@@ -270,3 +275,170 @@ async def test_rfid_mapping_subentry_forms_serializable(hass: HomeAssistant, cli
         return_value=None,
     ):
         await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "rfid_mapping"]}, "manual")
+
+
+async def test_user_subentry_error_forms_serializable(hass: HomeAssistant, client) -> None:
+    """T-50: user forms re-shown with the D-10 and D-8 errors."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    result = await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "user"]}, "user")
+    step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
+    for name, error in (("  ", "name_empty"), ("Guest", "name_reserved")):
+        result = await _post(client, step, {"name": name, "type": "regular"}, "user")
+        assert result["errors"] == {"name": error}
+    await _post(client, step, {"name": "Petra", "type": "regular"})
+    petra_id = _subentry_id(hass, entry.entry_id, "user", "Petra")
+
+    result = await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "user"]}, "user")
+    result = await _post(
+        client,
+        f"{_SUBENTRY_FLOW}/{result['flow_id']}",
+        {"name": "petra", "type": "guest"},
+        "user",
+    )
+    assert result["errors"] == {"name": "name_not_unique"}
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+    )
+    await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"card_index": "1", "user_id": petra_id}
+    )
+    await start_charging_session(hass, trx_value="2")
+
+    result = await _post(
+        client,
+        _SUBENTRY_FLOW,
+        {"handler": [entry.entry_id, "user"], "subentry_id": petra_id},
+        "reconfigure",
+    )
+    step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
+    for name, error in (("Unknown", "name_reserved"), ("Petra B", "user_in_session")):
+        result = await _post(client, step, {"name": name, "active": True}, "reconfigure")
+        assert result["errors"] == {"name": error}
+
+    # D-24: Petra is deleted; her session runs on under her name.
+    hass.config_entries.async_remove_subentry(entry, petra_id)
+    await hass.async_block_till_done()
+    result = await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "user"]}, "user")
+    result = await _post(
+        client,
+        f"{_SUBENTRY_FLOW}/{result['flow_id']}",
+        {"name": "Petra", "type": "regular"},
+        "user",
+    )
+    assert result["errors"] == {"name": "name_in_session"}
+
+
+async def test_user_subentry_commit_point_forms_serializable(hass: HomeAssistant, client) -> None:
+    """T-50: the first step re-shown from the pricing step when the name fails there (D-23)."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    # Add: another user takes the name while the pricing step is open.
+    result = await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "user"]}, "user")
+    step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
+    await _post(client, step, {"name": "Visitor", "type": "guest"}, "guest_pricing")
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "user"), context={"source": "user"}
+    )
+    await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Visitor", "type": "regular"}
+    )
+    result = await _post(
+        client, step, {"guest_pricing_method": "fixed", "price_per_kwh": 4.0}, "user"
+    )
+    assert result["errors"] == {"name": "name_not_unique"}
+    await _post(client, step, {"name": "Gina", "type": "guest"}, "guest_pricing")
+    await _post(client, step, {"guest_pricing_method": "fixed", "price_per_kwh": 4.0})
+    gina_id = _subentry_id(hass, entry.entry_id, "user", "Gina")
+
+    # Reconfigure: the guest's session starts while the pricing step is open.
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+    )
+    await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"card_index": "1", "user_id": gina_id}
+    )
+    result = await _post(
+        client,
+        _SUBENTRY_FLOW,
+        {"handler": [entry.entry_id, "user"], "subentry_id": gina_id},
+        "reconfigure",
+    )
+    step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
+    await _post(client, step, {"name": "Gina B", "active": True}, "reconfigure_guest_pricing")
+    await start_charging_session(hass, trx_value="2")
+    result = await _post(
+        client, step, {"guest_pricing_method": "fixed", "price_per_kwh": 4.0}, "reconfigure"
+    )
+    assert result["errors"] == {"name": "user_in_session"}
+
+
+async def test_rfid_mapping_forms_without_vehicle_serializable(hass: HomeAssistant, client) -> None:
+    """T-50: map_card without vehicle and suggested user, manual and reconfigure without
+    vehicle, and the manual form with each D-15 error and with already_mapped."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, CONF_CHARGER_PROFILE: "goe_gemini"},
+        title="Test Charger",
+    )
+    await setup_entry_with_subentries(hass, entry)
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "user"), context={"source": "user"}
+    )
+    await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Paul", "type": "regular"}
+    )
+    user_id = _subentry_id(hass, entry.entry_id, "user", "Paul")
+
+    zed = DiscoveredCard(index=0, name="Zed", energy_kwh=None, is_programmed=True)
+    provider = MagicMock()
+    provider.get_programmed_cards = AsyncMock(return_value=[zed])
+    provider.get_last_rfid_uid = AsyncMock(return_value=None)
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=provider,
+    ):
+        result = await _post(
+            client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "rfid_mapping"]}, "select_card"
+        )
+        step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
+        await _post(client, step, {"card_index": "0"}, "map_card")
+        await _post(client, step, {"user_id": user_id})
+    mapping_id = next(
+        s.subentry_id
+        for s in hass.config_entries.async_get_entry(entry.entry_id).subentries.values()
+        if s.subentry_type == "rfid_mapping"
+    )
+    await _post(
+        client,
+        _SUBENTRY_FLOW,
+        {"handler": [entry.entry_id, "rfid_mapping"], "subentry_id": mapping_id},
+        "reconfigure",
+    )
+
+    unprogrammed = DiscoveredCard(index=1, name=None, energy_kwh=None, is_programmed=False)
+    for side_effect, cards, error in (
+        (DiscoveryError("Cannot reach charger."), None, "discovery_failed"),
+        (None, [zed], "all_slots_mapped"),
+        (None, [unprogrammed], "no_programmed_cards"),
+    ):
+        provider.get_programmed_cards = AsyncMock(side_effect=side_effect, return_value=cards)
+        with patch(
+            "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+            return_value=provider,
+        ):
+            result = await _post(
+                client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "rfid_mapping"]}, "manual"
+            )
+        assert result["errors"] == {"base": error}
+
+    result = await _post(
+        client,
+        f"{_SUBENTRY_FLOW}/{result['flow_id']}",
+        {"card_index": "0", "user_id": user_id},
+        "manual",
+    )
+    assert result["errors"] == {"card_index": "already_mapped"}

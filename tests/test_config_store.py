@@ -5,9 +5,15 @@ from __future__ import annotations
 from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ev_charging_manager.config_store import ConfigStore
+from custom_components.ev_charging_manager.const import DOMAIN, STORE_KEY, STORE_VERSION
+
+from .conftest import MOCK_CHARGER_DATA, setup_entry_with_subentries
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -174,30 +180,65 @@ async def test_sync_from_empty_subentries(hass: HomeAssistant) -> None:
 
 
 # ---------------------------------------------------------------------------
-# T058: Edge case — corrupted/invalid stored data
+# T058 / spec 026 D-20: stored data of the wrong shape
 # ---------------------------------------------------------------------------
 
 
-async def test_async_load_corrupted_returns_stored_data(hass: HomeAssistant) -> None:
-    """Loading corrupted (partial) data returns whatever was stored (no crash)."""
-    # Simulate stored data that's missing expected keys
-    corrupted = {"vehicles": [{"id": "v1"}]}
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {"vehicles": [{"id": "v1"}]},
+        {},
+        {"vehicles": [], "users": [{"id": "u1", "name": "Paul"}], "rfid_mappings": []},
+    ],
+)
+async def test_async_load_valid_data_passes_through(hass: HomeAssistant, stored, caplog) -> None:
+    """T-49: dicts whose present keys hold lists of dicts load unchanged, without a warning."""
     store = ConfigStore(hass)
-    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=corrupted):
+    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value=stored):
         result = await store.async_load()
 
-    # ConfigStore should load the data as-is (not crash)
-    assert result == corrupted
-    assert store.data == corrupted
+    assert result == stored
+    assert store.data == stored
+    assert "unexpected format" not in caplog.text
 
 
-async def test_async_load_empty_dict_returns_empty_dict(hass: HomeAssistant) -> None:
-    """Loading an empty dict (not None) returns that empty dict."""
-    store = ConfigStore(hass)
-    with patch.object(store._store, "async_load", new_callable=AsyncMock, return_value={}):
-        result = await store.async_load()
+@pytest.mark.parametrize(
+    "stored",
+    [
+        [{"id": "v1"}],
+        "corrupt",
+        42,
+        {"vehicles": [], "users": [], "rfid_mappings": None},
+        {"vehicles": [], "users": [], "rfid_mappings": {"card_index": 0}},
+        {"vehicles": [], "users": [], "rfid_mappings": ["card0"]},
+    ],
+)
+async def test_corrupt_config_store_rebuilt_at_setup(
+    hass: HomeAssistant, hass_storage, caplog, stored
+) -> None:
+    """T-48: setup succeeds, one warning, config rebuilt from the subentries."""
+    hass_storage[STORE_KEY] = {"version": STORE_VERSION, "key": STORE_KEY, "data": stored}
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CHARGER_DATA,
+        title="Test Charger",
+        subentries_data=[
+            {
+                "data": {"name": "Paul", "type": "regular", "active": True},
+                "subentry_type": "user",
+                "title": "Paul",
+                "unique_id": None,
+            }
+        ],
+    )
+    await setup_entry_with_subentries(hass, entry)
 
-    assert result == {}
+    assert entry.state is ConfigEntryState.LOADED
+    warnings = [r for r in caplog.records if "unexpected format" in r.message]
+    assert [r.levelname for r in warnings] == ["WARNING"]
+    store = hass.data[DOMAIN][entry.entry_id]["config_store"]
+    assert [u["name"] for u in store.data["users"]] == ["Paul"]
 
 
 # ---------------------------------------------------------------------------

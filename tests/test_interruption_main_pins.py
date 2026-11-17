@@ -7,7 +7,9 @@ runs unchanged against a checkout of main.
 
 from __future__ import annotations
 
-from tests.session_rig import TRX_PAUL, Rig, reload, restart
+import pytest
+
+from tests.session_rig import TRX_GFIX, TRX_PAUL, Rig, reload, restart
 
 
 def _summary(rig: Rig) -> list[tuple]:
@@ -108,3 +110,67 @@ async def test_pin_main_reload_after_the_rfid_entity_was_missing(
 
     assert _summary(rig) == [("Paul", 4.0, 10.0, None, 4.0)]
     assert len(rig.started) == 1
+
+
+async def _paul_leaves_with_the_counter_at_10(rig: Rig) -> None:
+    """Paul charges 10.0 kWh and unplugs; the counter keeps 10.0 until the next plug-in."""
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:20:00")
+    await rig.set(energy=10.0, eto=1010.0)
+    await rig.goto("10:30:00")
+    await rig.set(power=0)
+    await rig.goto("10:40:00")
+    await rig.unplug()
+    await rig.set(trx="null")
+    await rig.goto("10:45:00")
+
+
+async def _guest_charges_3_from_a_stale_counter(rig: Rig) -> None:
+    """The guest's plug-on arrives while the counter still shows Paul's 10.0; it
+    restarts at zero a moment later and the guest charges 3.0 kWh."""
+    await rig.set(trx=TRX_GFIX)
+    await rig.set(plug="on", lock="Locked")
+    await rig.set(energy=0.0)
+    await rig.set(power=7000)
+    await rig.goto("11:00:00")
+    await rig.set(energy=3.0)
+    await rig.set(power=0)
+    await rig.goto("11:10:00")
+    await rig.unplug()
+    await rig.goto("11:11:00")
+
+
+@pytest.mark.parametrize("before", ["unavailable", "unknown", "off"])
+async def test_pin_main_plug_on_from_no_valid_state_with_a_stale_counter(
+    hass, hass_storage, freezer, before
+) -> None:
+    """Verification V-1: the plug entity has no valid state (or, as control, reads off)
+    when the guest plugs in, and the counter still shows the previous connection. The
+    zero baseline of the fix round billed the guest 13.0 kWh; main records 3.0."""
+    rig = Rig(hass, freezer, hass_storage)
+    await _paul_leaves_with_the_counter_at_10(rig)
+    if before != "off":
+        await rig.set(plug=before)
+    await _guest_charges_3_from_a_stale_counter(rig)
+
+    assert _summary(rig) == [("Paul", 10.0, 25.0, None, 10.0), ("Gaest", 3.0, 7.5, 15.0, 3.0)]
+
+
+async def test_pin_main_charger_offline_then_back_plug_first(hass, hass_storage, freezer) -> None:
+    """Verification V-1: every charger entity goes unavailable, the guest plugs in
+    meanwhile, and on return the plug reads on together with the new counter."""
+    rig = Rig(hass, freezer, hass_storage)
+    await _paul_leaves_with_the_counter_at_10(rig)
+    for name in ("plug", "lock", "trx", "energy", "power", "car", "eto"):
+        await rig.set(**{name: "unavailable"})
+    await rig.goto("10:50:00")
+    await rig.set(plug="on", lock="Locked", trx=TRX_GFIX, power=7000, energy=0.5)
+    await rig.goto("11:00:00")
+    await rig.set(energy=3.0, power=0)
+    await rig.goto("11:10:00")
+    await rig.unplug()
+    await rig.goto("11:11:00")
+
+    assert _summary(rig) == [("Paul", 10.0, 25.0, None, 10.0), ("Gaest", 3.0, 7.5, 15.0, 3.0)]

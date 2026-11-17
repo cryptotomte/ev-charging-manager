@@ -164,9 +164,7 @@ class _RfidWaitState:
     """
 
     plug_on_at: datetime
-    # Spec 027 D-51: a wait entered for a cable already in carries the counter baseline
-    # (None = live reading) and the reconstructed flag to the session it starts.
-    energy_start_kwh: float | None = None
+    # Spec 027 D-51: a wait entered for a cable already in flags the session it starts.
     reconstructed: bool = False
 
 
@@ -346,9 +344,6 @@ class PlugAnchoredSessionEngine:
         self._recovery_wait_unsub: _Unsub = None
         self._recovery_wait_timeout_unsub: _Unsub = None
         self._recovery_busy: bool = False
-        # Spec 027 D-51: this engine force-completed a snapshot at the 60-minute
-        # timeout, so a cable already in may still carry that snapshot's energy.
-        self._force_completed_at_timeout: bool = False
         # Spec 027 D-56: snapshot writes requested after unload do nothing.
         self._unloaded: bool = False
 
@@ -961,7 +956,6 @@ class PlugAnchoredSessionEngine:
                 # PR-27 FR-001: an unavailable counter is no evidence; a genuine 0.0
                 # reading is.
                 energy = self._snapshot_completion_energy(snapshot, self._get_energy())
-                self._force_completed_at_timeout = True
                 await self._complete_snapshot_as_session(snapshot, energy, now)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error(
@@ -1795,10 +1789,9 @@ class PlugAnchoredSessionEngine:
 
         self._state = SessionEngineState.TRACKING
 
-        # Spec 027 D-51, PRELIMINARY P-1 (§ 10): with the cable in, the counter is this
-        # connection's energy, so the session takes all of it, unless this engine
-        # force-completed a snapshot at the timeout that may hold part of it.
-        energy_start_kwh = 0.0 if cable_in and not self._force_completed_at_timeout else None
+        # Spec 027 D-58: a cable already in takes the baseline of main (the reading now).
+        # At a real plug-in the counter can still show the previous connection for a
+        # moment, and a zero baseline would bill it to this one (§ 13.5 V-1).
         current_trx = self._get_trx()
 
         if current_trx in _INVALID_STATES and cable_in and (self._get_power() or 0.0) > 0:
@@ -1806,21 +1799,17 @@ class PlugAnchoredSessionEngine:
             # an RFID wait — the open-access inference of FR-003 runs now.
             self._hass.async_create_task(
                 self._async_start_session(
-                    reason=UnknownReason.OPEN_ACCESS_INFERRED,
-                    energy_start_kwh=energy_start_kwh,
-                    reconstructed=True,
+                    reason=UnknownReason.OPEN_ACCESS_INFERRED, reconstructed=True
                 )
             )
         elif current_trx in _INVALID_STATES:
             # trx is null/unavailable at plug-on → enter event-driven RFID wait (FR-001)
             now = dt_util.utcnow()
-            self._start_rfid_wait(now, energy_start_kwh, reconstructed=cable_in)
+            self._start_rfid_wait(now, reconstructed=cable_in)
         else:
             # trx is already non-null (fast path: blip-before-plug, or open-access)
             # → immediate session start (FR-006)
-            self._hass.async_create_task(
-                self._async_start_session(energy_start_kwh=energy_start_kwh, reconstructed=cable_in)
-            )
+            self._hass.async_create_task(self._async_start_session(reconstructed=cable_in))
 
     def _handle_plug_off(self) -> None:
         """Plug transitioned on → off: validate with cable_lock before ending (PR-22 FR-002/FR-003).
@@ -2130,7 +2119,6 @@ class PlugAnchoredSessionEngine:
     def _start_rfid_wait(
         self,
         plug_on_at: datetime,
-        energy_start_kwh: float | None = None,
         *,
         reconstructed: bool = False,
     ) -> None:
@@ -2146,15 +2134,12 @@ class PlugAnchoredSessionEngine:
 
         Args:
             plug_on_at: UTC timestamp of the plug-on event (becomes session.connected_at, FR-007).
-            energy_start_kwh: counter baseline for the session the wait starts (D-51).
             reconstructed: the session the wait starts is flagged (D-51).
         """
         # Cancel any stale wait state (defensive)
         self._cancel_rfid_wait()
 
-        self._rfid_wait = _RfidWaitState(
-            plug_on_at=plug_on_at, energy_start_kwh=energy_start_kwh, reconstructed=reconstructed
-        )
+        self._rfid_wait = _RfidWaitState(plug_on_at=plug_on_at, reconstructed=reconstructed)
 
         if self._debug_logger:
             self._debug_logger.log(
@@ -2186,7 +2171,6 @@ class PlugAnchoredSessionEngine:
 
         # Save plug_on_at BEFORE cancelling (cancel clears the state)
         saved_plug_on_at = self._rfid_wait.plug_on_at
-        energy_start_kwh = self._rfid_wait.energy_start_kwh
         reconstructed = self._rfid_wait.reconstructed
 
         # Clear the wait state
@@ -2198,11 +2182,7 @@ class PlugAnchoredSessionEngine:
         # (which it is — this callback fires after the state change), it will
         # be resolved by RfidLookup.
         self._hass.async_create_task(
-            self._async_start_session(
-                connected_at=saved_plug_on_at,
-                energy_start_kwh=energy_start_kwh,
-                reconstructed=reconstructed,
-            )
+            self._async_start_session(connected_at=saved_plug_on_at, reconstructed=reconstructed)
         )
 
     # -----------------------------------------------------------------------
@@ -2236,7 +2216,6 @@ class PlugAnchoredSessionEngine:
                 # Power began flowing while waiting for RFID — open-access charger.
                 # Save plug_on_at and clear wait before starting session (FR-007).
                 plug_on_at = self._rfid_wait.plug_on_at
-                energy_start_kwh = self._rfid_wait.energy_start_kwh
                 reconstructed = self._rfid_wait.reconstructed
                 self._cancel_rfid_wait()
                 if self._debug_logger:
@@ -2249,7 +2228,6 @@ class PlugAnchoredSessionEngine:
                     self._async_start_session(
                         connected_at=plug_on_at,
                         reason=UnknownReason.OPEN_ACCESS_INFERRED,
-                        energy_start_kwh=energy_start_kwh,
                         reconstructed=reconstructed,
                     )
                 )
@@ -2529,8 +2507,8 @@ class PlugAnchoredSessionEngine:
                 UnknownReason.OPEN_ACCESS_INFERRED instead of the default
                 UnknownReason.TRX_NULL when trx is null but power flow started.
             energy_start_kwh: Counter baseline; None takes the reading now. Spec 027
-                D-50/D-51 pass 0.0 for a connection that began before start-up, and
-                the session then holds the whole counter at once.
+                D-50 passes 0.0 for the new connection of a card split, and the
+                session then holds the whole counter at once.
             reconstructed: the plug-in was not observed (spec 027 D-50/D-51); the
                 session is flagged ``reconstructed`` and ``data_gap``.
         """

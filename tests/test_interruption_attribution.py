@@ -42,10 +42,12 @@ def test_p1_guard_counter_belongs_to_the_connection() -> None:
 
     Assumption: with the cable in, the charger's energy counter (go-e ``wh``) is the
     energy of the current connection — it keeps its value after the unplug and restarts
-    at zero at the next plug-in. D-50 and D-51 therefore start a session with
-    energy_start_kwh = 0.0 when the connection began before start-up (exercised by
-    RT-17 and RT-23). Evidence: three plug-ins in the owner's debug log (2026-11-08,
-    -10, -13). A profile that reuses the plug-anchored engine must restate it here.
+    at zero at the next plug-in. D-50 therefore starts the new session of a card split
+    with energy_start_kwh = 0.0 (exercised by RT-17). A cable already in at start-up
+    does not rely on it: D-58 takes the reading at the start, because the counter can
+    still show the previous connection for a moment after a plug-in. Evidence: three
+    plug-ins in the owner's debug log (2026-11-08, -10, -13). A profile that reuses the
+    plug-anchored engine must restate it here.
     """
     assert PLUG_ANCHORED_PROFILES == {"goe_gemini"}
 
@@ -538,13 +540,27 @@ async def _card_and_cable_while_down(rig: Rig) -> None:
     await rig.set(energy=2.0)
 
 
+# RT-23 under D-58: the baseline is the energy reading when the session starts.
+RT23_ENERGY = {
+    "none": 4.0,
+    # The counter reads 2.0 at setup: only the 2.0 kWh after start-up are counted.
+    "restart-present": 2.0,
+    # The card appears before the energy entity, so there is no reading at the start
+    # and the baseline is 0.0 (main's rule for a missing reading): the whole 4.0 kWh.
+    "restart-late-field": 4.0,
+    # The plug appears last, after the counter's 2.0: as restart-present.
+    "restart-late-pluglast": 2.0,
+}
+
+
 @pytest.mark.parametrize("intr", list(LATE_ORDERS))
 async def test_rt23_cable_and_card_in_at_setup_without_snapshot(
     hass, hass_storage, freezer, intr
 ) -> None:
-    """RT-23 (and P-1): the session starts at setup with energy_start_kwh 0.0 and takes
-    the whole counter of the connection (4.0 kWh), not only what follows start-up, in
-    every start order (D-51: a plug that appears after setup is a cable already in)."""
+    """RT-23 (D-51, D-58): the session starts at setup (or when the plug appears) with
+    the baseline of main, the reading at that moment. Allowed difference (D-57): energy
+    delivered while Home Assistant was down, before the session existed, is not counted
+    when the counter already shows it at the start."""
     rig = Rig(hass, freezer, hass_storage)
     await rig.setup()
     if intr == "none":
@@ -555,17 +571,19 @@ async def test_rt23_cable_and_card_in_at_setup_without_snapshot(
     else:
         await _restart_in(intr, _card_and_cable_while_down)(rig)
         session = rig.engine.active_session
-        assert session.energy_start_kwh == 0.0
-        assert (session.energy_kwh, session.cost_total_kr) == (2.0, 5.0)
+        assert session.energy_start_kwh == 4.0 - RT23_ENERGY[intr]
+        assert session.energy_kwh == RT23_ENERGY[intr] - 2.0
     await rig.goto("10:30:00")
     await rig.set(energy=4.0)
     await rig.set(power=0)
     await rig.goto("10:40:00")
     await rig.unplug()
 
-    assert _summary(rig) == [("Paul", 4.0, 10.0, None, 4.0)]
+    energy = RT23_ENERGY[intr]
+    assert _summary(rig) == [("Paul", energy, energy * 2.5, None, energy)]
     assert len(rig.started) == 1
     assert rig.completed[0].data["reconstructed"] is (intr != "none")
+    assert rig.completed[0].data["data_gap"] is (intr != "none")
 
 
 CARD_FIRST = ["trx", "plug", "lock", "power", "energy", "car", "eto"]
@@ -575,14 +593,17 @@ CARD_FIRST = ["trx", "plug", "lock", "power", "energy", "car", "eto"]
 async def test_d51_plug_from_unavailable_to_on_is_a_cable_already_in(
     hass, hass_storage, freezer, order
 ) -> None:
-    """D-51: the charger's entities read "unavailable" at setup and then become valid,
-    the plug before or after the card. The plug-on follows no valid off, so the session
-    takes the whole counter of the connection, as with the plug present at setup."""
+    """D-51, D-58: the charger's entities read "unavailable" at setup and then become
+    valid, the plug before or after the card. The plug-on follows no valid off, so it is
+    handled as a cable already in (flagged), with the baseline of main: in both orders the
+    energy entity is still unavailable when the session starts, so the baseline is 0.0
+    and the session holds the whole counter (2.0 kWh) once the reading arrives."""
     rig = Rig(hass, freezer, hass_storage)
     await rig.setup()
     await restart("late", during=_card_and_cable_while_down, order=order, unavailable=True)(rig)
     session = rig.engine.active_session
     assert (session.energy_start_kwh, session.energy_kwh) == (0.0, 2.0)
+    assert (session.reconstructed, session.data_gap) == (True, True)
     await rig.goto("10:30:00")
     await rig.set(energy=4.0)
     await rig.set(power=0)
@@ -609,31 +630,64 @@ async def _open_access_car_while_down(rig: Rig) -> None:
 async def test_d51_open_access_with_power_already_flowing_starts_at_once(
     hass, hass_storage, freezer, intr
 ) -> None:
-    """D-51: cable in, no card and power already above zero: no power event will ever
-    resolve an RFID wait, so the open-access session starts at once with the whole
-    counter."""
+    """D-51: cable in, the RFID entity loaded and showing no card, and power already
+    above zero: no power event will ever resolve an RFID wait, so the open-access
+    session starts at once. D-58: from the reading at that moment (2.0 kWh), so the
+    2.0 kWh delivered before start-up are not counted."""
     rig = Rig(hass, freezer, hass_storage)
     await rig.setup()
     await _restart_in(intr, _open_access_car_while_down)(rig)
     session = rig.engine.active_session
     assert session is not None and session.user_name == "Unknown"
-    assert (session.energy_start_kwh, session.energy_kwh) == (0.0, 2.0)
+    assert (session.energy_start_kwh, session.energy_kwh) == (2.0, 0.0)
+    assert (session.reconstructed, session.data_gap) == (True, True)
     await rig.goto("10:30:00")
     await rig.set(energy=4.0)
     await rig.set(power=0)
     await rig.goto("10:40:00")
     await rig.unplug()
 
-    assert _summary(rig) == [("Unknown", 4.0, 10.0, None, 4.0)]
+    assert _summary(rig) == [("Unknown", 2.0, 5.0, None, 2.0)]
 
 
-async def test_d51_after_a_timeout_completion_the_baseline_of_main_applies(
+async def test_d58_open_access_start_from_a_stale_counter(hass, hass_storage, freezer) -> None:
+    """D-58 (verification V-1): the plug goes from unavailable to on with power flowing
+    and no card, while the counter still shows the previous connection's 10.0 kWh; it
+    restarts at zero a moment later. The open-access session gets its own 3.0 kWh, not
+    13.0. (Main starts no session here: its RFID wait never sees a power change.)"""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:20:00")
+    await rig.set(energy=10.0)
+    await rig.set(power=0)
+    await rig.goto("10:40:00")
+    await rig.unplug()
+    await rig.set(trx="null")
+    await rig.set(plug="unavailable")
+    await rig.set(power=7000)
+    await rig.set(plug="on", lock="Locked")
+    session = rig.engine.active_session
+    assert (session.user_name, session.energy_start_kwh) == ("Unknown", 10.0)
+    await rig.set(energy=0.0)
+    await rig.goto("11:00:00")
+    await rig.set(energy=3.0)
+    await rig.set(power=0)
+    await rig.goto("11:10:00")
+    await rig.unplug()
+
+    assert _summary(rig) == [("Paul", 10.0, 25.0, None, 10.0), ("Unknown", 3.0, 7.5, None, 3.0)]
+    assert rig.completed[1].data["reconstructed"] is True
+
+
+async def test_d58_cable_in_start_after_a_timeout_completion_counts_no_energy_twice(
     hass, hass_storage, freezer
 ) -> None:
-    """D-51 exception: this engine force-completed Paul's snapshot at the 60-minute
-    timeout with the counter (2.5 kWh). When the plug then returns with the same car,
-    the new session starts at the counter's reading, not at zero, so the 2.5 kWh are
-    not counted again."""
+    """D-58: this engine force-completed Paul's snapshot at the 60-minute timeout with
+    the counter (2.5 kWh). When the plug then returns with the same car, the cable-in
+    session starts at the counter's reading, so the snapshot's 2.5 kWh are not counted
+    again."""
     rig = Rig(hass, freezer, hass_storage)
     await rig.setup()
     await rig.goto("10:06:00")

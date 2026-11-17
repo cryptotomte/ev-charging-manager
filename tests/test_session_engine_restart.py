@@ -918,7 +918,7 @@ async def test_ha_restart_during_rfid_wait_re_enters_wait_state(
         plug_state="on",
         cable_lock_state="Locked",
         power_state="0.0",
-        energy_state="0.4",  # this connection's counter (spec 027 P-1)
+        energy_state="0.4",
     )
     # Complete setup (no snapshot → active_snapshot is None → no async_recover).
     with patch("homeassistant.helpers.storage.Store.async_save", new_callable=AsyncMock):
@@ -960,8 +960,8 @@ async def test_ha_restart_during_rfid_wait_re_enters_wait_state(
     assert engine._rfid_wait is None, (  # noqa: SLF001
         "SF7: _rfid_wait must be cleared after session starts"
     )
-    assert engine.active_session.energy_start_kwh == 0.0, (
-        "spec 027 D-51: the session of a cable already in at setup takes the whole counter"
+    assert engine.active_session.energy_start_kwh == 0.4, (
+        "spec 027 D-58: the session of a cable already in at setup starts at the reading"
     )
 
 

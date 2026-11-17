@@ -12,7 +12,7 @@ from custom_components.ev_charging_manager.stats_engine import (
     MonthStats,
     UserStats,
 )
-from custom_components.ev_charging_manager.stats_store import StatsStore
+from custom_components.ev_charging_manager.stats_store import EMPTY_GUEST_RETIRED, StatsStore
 
 
 def _make_user_stats(
@@ -60,7 +60,7 @@ async def test_save_and_load_roundtrip_preserves_userstats(hass: HomeAssistant) 
         return saved_data if saved_data else None  # type: ignore[return-value]
 
     with patch.object(store._store, "async_save", side_effect=fake_save):
-        await store.async_save(user_stats_in, None)
+        await store.async_save(user_stats_in, None, [], EMPTY_GUEST_RETIRED)
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
         user_stats_out, guest_last_out, _, _ = await store.async_load()
@@ -95,7 +95,7 @@ async def test_save_and_load_roundtrip_preserves_guest_last(hass: HomeAssistant)
         return saved_data if saved_data else None  # type: ignore[return-value]
 
     with patch.object(store._store, "async_save", side_effect=fake_save):
-        await store.async_save({}, guest)
+        await store.async_save({}, guest, [], EMPTY_GUEST_RETIRED)
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
         _, guest_out, _, _ = await store.async_load()
@@ -152,7 +152,9 @@ async def test_save_multiple_users(hass: HomeAssistant) -> None:
         return saved_data if saved_data else None  # type: ignore[return-value]
 
     with patch.object(store._store, "async_save", side_effect=fake_save):
-        await store.async_save({"Petra": petra, "Paul": paul, "Unknown": unknown}, None)
+        await store.async_save(
+            {"Petra": petra, "Paul": paul, "Unknown": unknown}, None, [], EMPTY_GUEST_RETIRED
+        )
 
     with patch.object(store._store, "async_load", side_effect=fake_load):
         user_stats, _, _, _ = await store.async_load()
@@ -174,7 +176,20 @@ async def test_load_without_guest_retired_reads_zeros(hass: HomeAssistant, caplo
 
 
 @pytest.mark.parametrize(
-    "raw", ["oops", [1, 2], {"energy_kwh": 1.0}, {"energy_kwh": "x", "cost_kr": 1.0}]
+    "raw",
+    [
+        "oops",
+        [1, 2],
+        {"energy_kwh": 1.0},
+        {"energy_kwh": "x", "cost_kr": 1.0},
+        # D-29: booleans, non-finite and negative totals are malformed too.
+        {"energy_kwh": True, "cost_kr": 1.0},
+        {"energy_kwh": 1.0, "cost_kr": False},
+        {"energy_kwh": float("nan"), "cost_kr": 1.0},
+        {"energy_kwh": float("inf"), "cost_kr": 1.0},
+        {"energy_kwh": 1.0, "cost_kr": float("-inf")},
+        {"energy_kwh": -0.5, "cost_kr": 1.0},
+    ],
 )
 async def test_load_malformed_guest_retired_reads_zeros_with_warning(
     hass: HomeAssistant, caplog, raw
@@ -200,3 +215,10 @@ async def test_guest_retired_roundtrip(hass: HomeAssistant) -> None:
         *_, guest_retired = await store.async_load()
 
     assert guest_retired == {"energy_kwh": 10.0, "cost_kr": 45.0}
+
+
+async def test_save_requires_guest_retired(hass: HomeAssistant) -> None:
+    """D-29: no caller can save without the carry and so drop it from the store."""
+    store = StatsStore(hass)
+    with patch.object(store._store, "async_save", new_callable=AsyncMock), pytest.raises(TypeError):
+        await store.async_save({}, None, [])

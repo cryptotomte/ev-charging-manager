@@ -9,6 +9,7 @@ Format:        {"user_stats": {...}, "guest_last": {...} | null, "unknown_sessio
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -73,8 +74,8 @@ class StatsStore:
         if raw_retired is not None:
             try:
                 guest_retired = {
-                    "energy_kwh": float(raw_retired["energy_kwh"]),
-                    "cost_kr": float(raw_retired["cost_kr"]),
+                    "energy_kwh": _carry_value(raw_retired["energy_kwh"]),
+                    "cost_kr": _carry_value(raw_retired["cost_kr"]),
                 }
             except (KeyError, TypeError, ValueError):
                 _LOGGER.warning("Ignoring malformed guest_retired in stats store: %r", raw_retired)
@@ -86,8 +87,8 @@ class StatsStore:
         self,
         user_stats: dict[str, UserStats],
         guest_last: GuestLastSession | None,
-        unknown_session_times: list[str] | None = None,
-        guest_retired: dict[str, float] | None = None,
+        unknown_session_times: list[str] | None,
+        guest_retired: dict[str, float],
     ) -> None:
         """Persist current statistics to disk."""
         data: dict[str, Any] = {
@@ -96,6 +97,16 @@ class StatsStore:
             "unknown_session_times": unknown_session_times
             if unknown_session_times is not None
             else [],
-            "guest_retired": guest_retired if guest_retired is not None else EMPTY_GUEST_RETIRED,
+            "guest_retired": guest_retired,
         }
         await self._store.async_save(data)
+
+
+def _carry_value(raw: Any) -> float:
+    """Return one guest_retired total; raise ValueError or TypeError if it is not one (D-29)."""
+    if isinstance(raw, bool):
+        raise TypeError("boolean")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(value)
+    return value

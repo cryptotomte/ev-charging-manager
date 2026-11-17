@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from types import MappingProxyType
 from unittest.mock import AsyncMock, patch
 
@@ -267,6 +268,49 @@ async def test_delete_guest_keeps_guest_totals(hass: HomeAssistant, hass_storage
     assert await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done()
     assert (_state(hass, energy_id), _state(hass, cost_id)) == ("15.0", "65.0")
+
+
+async def test_guest_carry_survives_a_later_save(hass: HomeAssistant, hass_storage) -> None:
+    """D-6, D-29: a session completed after a guest was deleted keeps the carry in the store."""
+    entry = await _setup(hass, _user("Visitor", "guest"), _user("Paul"))
+    await _completed(hass, "Visitor", 10.0, 45.0, "guest")
+    await _delete_user(hass, entry, "Visitor")
+
+    await _completed(hass, "Paul", 2.0, 5.0)
+
+    assert _stored(hass_storage)["user_stats"]["Paul"]["total_energy_kwh"] == 2.0
+    assert _stored(hass_storage)["guest_retired"] == {"energy_kwh": 10.0, "cost_kr": 45.0}
+
+
+async def test_guest_totals_never_drop_when_guests_are_removed(hass: HomeAssistant) -> None:
+    """D-29: over many random removals neither guest total decreases (fixed seed)."""
+    entry = await _setup(hass)
+    engine = _engine(hass, entry)
+    registry = er.async_get(hass)
+    ids = [
+        registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_guest_total_{m}")
+        for m in ("energy", "cost")
+    ]
+    rng = random.Random(2026)
+
+    def totals() -> tuple[float, float]:
+        return tuple(float(_state(hass, entity_id)) for entity_id in ids)
+
+    with patch.object(engine._stats_store, "async_save", AsyncMock()):
+        for batch in range(100):
+            names = [f"g{batch}-{i}" for i in range(4)]
+            for name in names:
+                energy = round(rng.uniform(0, 50), 3)
+                await _completed(hass, name, energy, round(energy * rng.uniform(1, 5), 2), "guest")
+            before = totals()
+            rng.shuffle(names)
+            for name in names:
+                await engine.async_remove_user(name)
+                await hass.async_block_till_done()
+                after = totals()
+                assert after[0] >= before[0]
+                assert after[1] >= before[1]
+                before = after
 
 
 async def test_delete_user_sharing_exact_name_keeps_bucket(hass: HomeAssistant) -> None:

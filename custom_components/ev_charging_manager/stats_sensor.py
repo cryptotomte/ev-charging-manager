@@ -416,10 +416,14 @@ class GuestTotalEnergySensor(StatsBaseSensor):
         engine = self._stats_engine()
         if engine is None:
             return 0.0
-        total = sum(
-            s.total_energy_kwh for s in engine.user_stats.values() if s.user_type == "guest"
+        # D-29: summed in whole Wh, so removing a guest bucket into the carry
+        # cannot lower the shown value through float rounding.
+        wh = sum(
+            round(s.total_energy_kwh * 1000)
+            for s in engine.user_stats.values()
+            if s.user_type == "guest"
         )
-        return round(total + engine.guest_retired["energy_kwh"], 2)
+        return round((wh + round(engine.guest_retired["energy_kwh"] * 1000)) / 1000, 2)
 
 
 class GuestTotalCostSensor(StatsBaseSensor):
@@ -446,8 +450,13 @@ class GuestTotalCostSensor(StatsBaseSensor):
         engine = self._stats_engine()
         if engine is None:
             return 0.0
-        total = sum(s.total_cost_kr for s in engine.user_stats.values() if s.user_type == "guest")
-        return round(total + engine.guest_retired["cost_kr"], 2)
+        # D-29: summed in whole hundredths, like the guest energy total.
+        cents = sum(
+            round(s.total_cost_kr * 100)
+            for s in engine.user_stats.values()
+            if s.user_type == "guest"
+        )
+        return (cents + round(engine.guest_retired["cost_kr"] * 100)) / 100
 
 
 # ---------------------------------------------------------------------------

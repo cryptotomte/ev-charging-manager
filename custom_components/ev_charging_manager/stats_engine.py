@@ -411,9 +411,15 @@ class StatsEngine:
         if stats is None:
             return
         if stats.user_type == "guest":
+            # D-29: in whole Wh and hundredths, the units the guest totals sum in.
+            retired = self._guest_retired
             self._guest_retired = {
-                "energy_kwh": round(self._guest_retired["energy_kwh"] + stats.total_energy_kwh, 3),
-                "cost_kr": round(self._guest_retired["cost_kr"] + stats.total_cost_kr, 2),
+                "energy_kwh": (
+                    round(retired["energy_kwh"] * 1000) + round(stats.total_energy_kwh * 1000)
+                )
+                / 1000,
+                "cost_kr": (round(retired["cost_kr"] * 100) + round(stats.total_cost_kr * 100))
+                / 100,
             }
         await self._async_save()
         self._dispatch_update()

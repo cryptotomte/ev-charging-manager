@@ -459,3 +459,17 @@ async def test_rt26_car_left_counter_below_the_snapshot(hass, hass_storage, free
     energy = 3.8 if intr == "none" else 3.0
     assert _summary(rig) == [("Gaest", energy, energy * 2.5, energy * 5.0, energy)]
     assert rig.snapshot() is None
+
+
+async def test_rt17_new_user_charged_more_than_the_snapshot(hass, hass_storage, freezer) -> None:
+    """RT-17: the new connection's counter (4.5 kWh) exceeds Paul's snapshot (3.0 kWh);
+    Paul still gets only his snapshot's energy and the guest the whole counter."""
+
+    async def guest_charges_more(rig: Rig) -> None:
+        await _swap_users(rig, fire=False)
+        await rig.set(energy=4.5)
+
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_h(rig, restart(during=guest_charges_more))
+    # The scenario's later 2.0 kWh reading is a live counter reset for the guest.
+    assert _summary(rig) == [("Paul", 3.0, 7.5, None, 3.0), ("Gaest", 4.5, 11.25, 22.5, 4.5)]

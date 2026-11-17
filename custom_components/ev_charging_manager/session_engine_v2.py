@@ -1158,12 +1158,7 @@ class PlugAnchoredSessionEngine:
         *,
         charger_total_after_kwh: float | None = None,
     ) -> None:
-        """Complete a snapshot as a reconstructed session with the energy the caller chose.
-
-        The engine is COMPLETING until it returns, so a plug event arriving during the
-        store write cannot start a session that the final IDLE would strand.
-        """
-        self._state = SessionEngineState.COMPLETING
+        """Complete a snapshot as a reconstructed session with the energy the caller chose."""
         energy_start = float(snapshot.get("energy_start_kwh", 0.0))
 
         connected_at_str = snapshot.get("connected_at") or snapshot.get(

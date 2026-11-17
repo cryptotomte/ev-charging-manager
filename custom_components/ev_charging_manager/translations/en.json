@@ -339,7 +339,11 @@
             "error": {
                 "pricing_required": "Guest users require pricing configuration.",
                 "price_required": "Price per kWh is required when using fixed pricing method.",
-                "markup_required": "Markup factor is required when using markup pricing method."
+                "markup_required": "Markup factor is required when using markup pricing method.",
+                "name_empty": "Enter a name.",
+                "name_reserved": "This name is reserved. A name needs at least one letter or digit and cannot be Guest or Unknown.",
+                "name_not_unique": "Another user already has this name, or one that differs only in case, spacing or accents.",
+                "user_in_session": "This user has a charging session in progress. Change the name after the session has ended."
             }
         },
         "rfid_mapping": {

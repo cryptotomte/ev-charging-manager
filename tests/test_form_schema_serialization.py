@@ -196,9 +196,9 @@ async def test_user_subentry_forms_serializable(hass: HomeAssistant, client) -> 
 
     result = await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "user"]}, "user")
     step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
-    await _post(client, step, {"name": "Guest", "type": "guest"}, "guest_pricing")
+    await _post(client, step, {"name": "Visitor", "type": "guest"}, "guest_pricing")
     await _post(client, step, {"guest_pricing_method": "fixed", "price_per_kwh": 4.5})
-    guest_id = _subentry_id(hass, entry.entry_id, "user", "Guest")
+    guest_id = _subentry_id(hass, entry.entry_id, "user", "Visitor")
 
     result = await _post(
         client,
@@ -209,7 +209,7 @@ async def test_user_subentry_forms_serializable(hass: HomeAssistant, client) -> 
     await _post(
         client,
         f"{_SUBENTRY_FLOW}/{result['flow_id']}",
-        {"name": "Guest", "active": True},
+        {"name": "Visitor", "active": True},
         "reconfigure_guest_pricing",
     )
 

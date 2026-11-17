@@ -17,6 +17,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers import selector
+from homeassistant.util import slugify
 
 from .charger_profiles import CHARGER_PROFILES
 from .const import (
@@ -889,6 +890,27 @@ class VehicleSubentryFlowHandler(ConfigSubentryFlow):
         )
 
 
+def _user_name_error(entry: ConfigEntry, name: str, own_subentry_id: str | None) -> str | None:
+    """Return the error key for a stripped candidate user name, or None (spec 026 D-10).
+
+    The slug is what the per-user sensors' unique_ids are built from; `unknown`
+    and `guest` collide with the Unknown bucket's and the guest aggregates' ids.
+    """
+    if not name:
+        return "name_empty"
+    slug = slugify(name)
+    if slug in ("unknown", "guest"):
+        return "name_reserved"
+    for sub in entry.subentries.values():
+        if (
+            sub.subentry_type == "user"
+            and sub.subentry_id != own_subentry_id
+            and slugify(sub.data["name"]) == slug
+        ):
+            return "name_not_unique"
+    return None
+
+
 class UserSubentryFlowHandler(ConfigSubentryFlow):
     """Handle user subentry add/edit flows."""
 
@@ -899,37 +921,43 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
         """Handle adding a new user — step 1: name + type."""
+        errors: dict[str, str] = {}
         if user_input is not None:
-            self._user_data = {
-                "name": user_input["name"],
-                "type": user_input["type"],
-                "active": True,
-                "created_at": datetime.now(UTC).isoformat(),
-            }
-            if user_input["type"] == "guest":
-                return await self.async_step_guest_pricing()
-            return self.async_create_entry(
-                title=self._user_data["name"],
-                data=self._user_data,
-            )
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("name"): selector.TextSelector(),
-                    vol.Required("type"): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=[
-                                {"value": "regular", "label": "Regular"},
-                                {"value": "guest", "label": "Guest"},
-                            ],
-                            mode=selector.SelectSelectorMode.LIST,
-                        )
-                    ),
+            name = user_input["name"].strip()
+            error = _user_name_error(self._get_entry(), name, None)
+            if error:
+                errors["name"] = error
+            else:
+                self._user_data = {
+                    "name": name,
+                    "type": user_input["type"],
+                    "active": True,
+                    "created_at": datetime.now(UTC).isoformat(),
                 }
-            ),
+                if user_input["type"] == "guest":
+                    return await self.async_step_guest_pricing()
+                return self.async_create_entry(
+                    title=self._user_data["name"],
+                    data=self._user_data,
+                )
+
+        schema = vol.Schema(
+            {
+                vol.Required("name"): selector.TextSelector(),
+                vol.Required("type"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": "regular", "label": "Regular"},
+                            {"value": "guest", "label": "Guest"},
+                        ],
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }
         )
+        if user_input is not None:
+            schema = self.add_suggested_values_to_schema(schema, user_input)
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
     async def async_step_guest_pricing(
         self, user_input: dict[str, Any] | None = None
@@ -1007,11 +1035,33 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         """Handle editing an existing user — type is immutable (FR-004)."""
         subentry = self._get_reconfigure_subentry()
         entry = self._get_entry()
+        errors: dict[str, str] = {}
 
         if user_input is not None:
+            stored_name = subentry.data["name"]
+            # Unchanged names skip the checks so users whose names already
+            # collide can still be deactivated or edited (D-10).
+            name = user_input["name"]
+            if name != stored_name:
+                name = name.strip()
+                error = _user_name_error(entry, name, subentry.subentry_id)
+                if error is None and name != stored_name:
+                    # D-8: the running session keeps the name it started with
+                    # (Snapshot principle), so a rename would land its energy
+                    # and cost in a bucket no sensor shows.
+                    engine = (
+                        self.hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("session_engine")
+                    )
+                    session = engine.active_session if engine is not None else None
+                    if session is not None and session.user_name == stored_name:
+                        error = "user_in_session"
+                if error:
+                    errors["name"] = error
+
+        if user_input is not None and not errors:
             # Build updated data preserving immutable fields
             new_data = dict(subentry.data)
-            new_data["name"] = user_input["name"]
+            new_data["name"] = name
             new_data["active"] = user_input.get("active", True)
 
             was_active = subentry.data.get("active", True)
@@ -1037,7 +1087,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                 title=title,
             )
 
-        # Pre-fill form with current values
+        # Pre-fill form with current values, or the submitted ones on error
         schema = self.add_suggested_values_to_schema(
             vol.Schema(
                 {
@@ -1045,12 +1095,14 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                     vol.Required("active"): selector.BooleanSelector(),
                 }
             ),
-            {"name": subentry.data["name"], "active": subentry.data.get("active", True)},
+            user_input
+            or {"name": subentry.data["name"], "active": subentry.data.get("active", True)},
         )
 
         return self.async_show_form(
             step_id="reconfigure",
             data_schema=schema,
+            errors=errors,
             description_placeholders={"type": subentry.data["type"]},
         )
 

@@ -222,8 +222,12 @@ async def test_rt16_guest_markup_on_spot(hass, hass_storage, freezer, intr) -> N
     ]
 
 
-def _save_spot_options(additional_cost: float) -> Interruption:
+OTHER_SPOT = "sensor.other_spot_price"
+
+
+def _save_spot_options(additional_cost: float, price_entity: str) -> Interruption:
     async def _save(rig: Rig) -> None:
+        rig.hass.states.async_set(OTHER_SPOT, "7.0")
         flow = rig.hass.config_entries.options
         result = await flow.async_init(rig.entry.entry_id)
         result = await flow.async_configure(
@@ -235,7 +239,7 @@ def _save_spot_options(additional_cost: float) -> Interruption:
             {
                 "pricing_mode": "spot",
                 "static_price_kwh": 2.5,
-                "spot_price_entity": SPOT,
+                "spot_price_entity": price_entity,
                 "spot_additional_cost_kwh": additional_cost,
                 "spot_vat_multiplier": 1.0,
                 "spot_fallback_price_kwh": 9.0,
@@ -247,14 +251,23 @@ def _save_spot_options(additional_cost: float) -> Interruption:
     return _save
 
 
-@pytest.mark.parametrize("change", ["none", "additional-cost"])
+CHANGES = {
+    # options saved in hour 10, price of the next session's hour 12
+    "none": (None, 3.0),
+    "additional-cost": (_save_spot_options(1.0, SPOT), 4.0),
+    "price-entity": (_save_spot_options(0.0, OTHER_SPOT), 7.0),
+}
+
+
+@pytest.mark.parametrize("change", list(CHANGES))
 async def test_rt08_spot_parameters_changed_during_a_spot_session(
     hass, hass_storage, freezer, change
 ) -> None:
-    """RT-08: the running session keeps its own spot parameters; the next uses the new."""
-    at = {} if change == "none" else {"h1": _save_spot_options(1.0)}
+    """RT-08: the running session keeps its own spot parameters, its price entity
+    included; the next session uses the new ones."""
+    save, next_price = CHANGES[change]
     rig = Rig(hass, freezer, hass_storage, pricing="spot")
-    await scenario_b(rig, TRX_PAUL, at)
+    await scenario_b(rig, TRX_PAUL, {"h1": save} if save else {})
     await rig.goto("12:40:00")
     await rig.plug_in(TRX_PAUL)
     await rig.goto("12:50:00")
@@ -265,5 +278,4 @@ async def test_rt08_spot_parameters_changed_during_a_spot_session(
 
     first, second = rig.money()
     assert first == B_TRUTH
-    expected_price = 3.0 + (1.0 if change == "additional-cost" else 0.0)
-    assert second["details"] == [("12:00", 1.0, expected_price, False)]
+    assert second["details"] == [("12:00", 1.0, next_price, False)]

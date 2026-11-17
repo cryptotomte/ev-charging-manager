@@ -715,6 +715,8 @@ class PlugAnchoredSessionEngine:
                     "session ended at restart — reason=another card on the charger at "
                     f"restart id={snapshot.get('id', '?')}",
                 )
+            if self._unloaded:
+                return
             self._state = SessionEngineState.TRACKING
             # PRELIMINARY P-1 (spec 027 § 10): with the cable in, the counter is the
             # energy of the current connection.
@@ -831,7 +833,8 @@ class PlugAnchoredSessionEngine:
     def _hand_plug_back_after_recovery(self, *, cable_in: bool = False) -> None:
         """Give a cable held back while the recovery decided its normal plug-on handling."""
         if (
-            not self._recovery_pending
+            not self._unloaded
+            and not self._recovery_pending
             and self._state == SessionEngineState.IDLE
             and self._get_plug() == "on"
         ):

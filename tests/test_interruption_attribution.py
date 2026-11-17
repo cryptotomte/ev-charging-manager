@@ -735,6 +735,53 @@ async def test_d58_cable_in_start_after_a_timeout_completion_counts_no_energy_tw
     assert _summary(rig) == [("Paul", 2.5, 6.25, None, 2.5), ("Paul", 0.5, 1.25, None, 0.5)]
 
 
+async def test_v5_no_plug_hand_back_after_unload(hass, hass_storage, freezer) -> None:
+    """§ 13.5 V-5: a hand-back that runs after the engine was unloaded starts nothing."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    engine = rig.engine
+    assert await hass.config_entries.async_unload(rig.entry.entry_id)
+    await hass.async_block_till_done()
+    await rig.set(trx=TRX_PAUL)
+    await rig.set(plug="on", lock="Locked")
+
+    engine._hand_plug_back_after_recovery(cable_in=True)  # noqa: SLF001
+    await hass.async_block_till_done()
+
+    assert engine.state == SessionEngineState.IDLE
+    assert engine.active_session is None and rig.started == []
+
+
+async def test_v5_unload_during_a_split_starts_no_session(hass, hass_storage, freezer) -> None:
+    """§ 13.5 V-5: the entry is unloaded while a split decided after the RFID wait is
+    writing the completed record. Neither the split's new session nor the plug hand-back
+    starts a session on the unloaded engine."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:22:00")
+    await restart("late", during=_swap_users_while_down, absent=["trx"], order=[])(rig)
+    engine = rig.engine
+    store = engine._session_store  # noqa: SLF001
+    add_session = store.add_session
+
+    async def add_session_then_unload(record: dict) -> None:
+        await add_session(record)
+        await engine.async_unload()
+
+    store.add_session = add_session_then_unload
+    await rig.set(trx=TRX_GFIX)
+
+    assert [ev.data["user_name"] for ev in rig.completed] == ["Paul"]
+    assert engine.active_session is None and engine.state == SessionEngineState.IDLE
+    assert len(rig.started) == 1
+
+
 async def test_rt24_cable_in_while_recovery_is_deferred(hass, hass_storage, freezer) -> None:
     """RT-24: with the RFID entity missing at setup the recovery waits (D-49) and the
     cable-in handling does not run: no RFID wait, and power flowing meanwhile starts no

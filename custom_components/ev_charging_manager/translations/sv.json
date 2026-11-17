@@ -343,7 +343,8 @@
                 "name_empty": "Ange ett namn.",
                 "name_reserved": "Namnet är reserverat. Ett namn måste innehålla minst en bokstav eller siffra och får inte vara Guest eller Unknown.",
                 "name_not_unique": "En annan användare har redan det här namnet, eller ett som bara skiljer sig i versaler, mellanslag eller accenter.",
-                "user_in_session": "Användaren har en pågående laddsession. Byt namn när sessionen är avslutad."
+                "user_in_session": "Användaren har en pågående laddsession. Byt namn när sessionen är avslutad.",
+                "name_in_session": "En pågående laddsession är bokförd under det här namnet. Försök igen när den är avslutad."
             }
         },
         "rfid_mapping": {

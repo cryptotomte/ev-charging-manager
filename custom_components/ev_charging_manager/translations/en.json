@@ -343,7 +343,8 @@
                 "name_empty": "Enter a name.",
                 "name_reserved": "This name is reserved. A name needs at least one letter or digit and cannot be Guest or Unknown.",
                 "name_not_unique": "Another user already has this name, or one that differs only in case, spacing or accents.",
-                "user_in_session": "This user has a charging session in progress. Change the name after the session has ended."
+                "user_in_session": "This user has a charging session in progress. Change the name after the session has ended.",
+                "name_in_session": "A charging session in progress is recorded under this name. Try again when it has ended."
             }
         },
         "rfid_mapping": {

@@ -318,6 +318,63 @@ async def test_user_subentry_error_forms_serializable(hass: HomeAssistant, clien
         result = await _post(client, step, {"name": name, "active": True}, "reconfigure")
         assert result["errors"] == {"name": error}
 
+    # D-24: Petra is deleted; her session runs on under her name.
+    hass.config_entries.async_remove_subentry(entry, petra_id)
+    await hass.async_block_till_done()
+    result = await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "user"]}, "user")
+    result = await _post(
+        client,
+        f"{_SUBENTRY_FLOW}/{result['flow_id']}",
+        {"name": "Petra", "type": "regular"},
+        "user",
+    )
+    assert result["errors"] == {"name": "name_in_session"}
+
+
+async def test_user_subentry_commit_point_forms_serializable(hass: HomeAssistant, client) -> None:
+    """T-50: the first step re-shown from the pricing step when the name fails there (D-23)."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA, title="Test Charger")
+    await setup_session_engine(hass, entry)
+
+    # Add: another user takes the name while the pricing step is open.
+    result = await _post(client, _SUBENTRY_FLOW, {"handler": [entry.entry_id, "user"]}, "user")
+    step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
+    await _post(client, step, {"name": "Visitor", "type": "guest"}, "guest_pricing")
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "user"), context={"source": "user"}
+    )
+    await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Visitor", "type": "regular"}
+    )
+    result = await _post(
+        client, step, {"guest_pricing_method": "fixed", "price_per_kwh": 4.0}, "user"
+    )
+    assert result["errors"] == {"name": "name_not_unique"}
+    await _post(client, step, {"name": "Gina", "type": "guest"}, "guest_pricing")
+    await _post(client, step, {"guest_pricing_method": "fixed", "price_per_kwh": 4.0})
+    gina_id = _subentry_id(hass, entry.entry_id, "user", "Gina")
+
+    # Reconfigure: the guest's session starts while the pricing step is open.
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+    )
+    await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"card_index": "1", "user_id": gina_id}
+    )
+    result = await _post(
+        client,
+        _SUBENTRY_FLOW,
+        {"handler": [entry.entry_id, "user"], "subentry_id": gina_id},
+        "reconfigure",
+    )
+    step = f"{_SUBENTRY_FLOW}/{result['flow_id']}"
+    await _post(client, step, {"name": "Gina B", "active": True}, "reconfigure_guest_pricing")
+    await start_charging_session(hass, trx_value="2")
+    result = await _post(
+        client, step, {"guest_pricing_method": "fixed", "price_per_kwh": 4.0}, "reconfigure"
+    )
+    assert result["errors"] == {"name": "user_in_session"}
+
 
 async def test_rfid_mapping_forms_without_vehicle_serializable(hass: HomeAssistant, client) -> None:
     """T-50: map_card without vehicle and suggested user, manual and reconfigure without

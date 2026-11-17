@@ -11,6 +11,7 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
+    ConfigSubentry,
     ConfigSubentryFlow,
     OptionsFlow,
     SubentryFlowResult,
@@ -922,13 +923,46 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         """Initialize the user subentry flow."""
         super().__init__()
         self._user_data: dict[str, Any] = {}
+        # The first step's input, re-shown when the name fails at the commit point (D-23).
+        self._first_input: dict[str, Any] = {}
+
+    def _check_name(
+        self, submitted: str, subentry: ConfigSubentry | None
+    ) -> tuple[str, str | None]:
+        """Return the name to store and its error key, or None (spec 026 D-8, D-10, D-24, D-30).
+
+        Runs on the first step and again right before the subentry is written
+        (D-23): a session can start while the guest pricing step is open.
+        """
+        entry = self._get_entry()
+        if subentry is not None and subentry.data["name"] in (submitted, submitted.strip()):
+            # Unchanged names skip the checks so users whose names already
+            # collide can still be deactivated or edited (D-10, D-30).
+            return subentry.data["name"], None
+        name = submitted.strip()
+        error = _user_name_error(entry, name, subentry.subentry_id if subentry else None)
+        if error is None:
+            engine = self.hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("session_engine")
+            session_user = (
+                engine.active_session.user_name
+                if engine is not None and engine.active_session
+                else None
+            )
+            if subentry is not None and session_user == subentry.data["name"]:
+                # D-8: the running session keeps the name it started with
+                # (Snapshot principle), so a rename would land its energy
+                # and cost in a bucket no sensor shows.
+                error = "user_in_session"
+            elif session_user == name:
+                # D-24: the session's energy and cost would land in this user's bucket.
+                error = "name_in_session"
+        return name, error
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
         """Handle adding a new user — step 1: name + type."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            name = user_input["name"].strip()
-            error = _user_name_error(self._get_entry(), name, None)
+            name, error = self._check_name(user_input["name"], None)
             if error:
                 errors["name"] = error
             else:
@@ -939,12 +973,17 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                     "created_at": datetime.now(UTC).isoformat(),
                 }
                 if user_input["type"] == "guest":
+                    self._first_input = dict(user_input)
                     return await self.async_step_guest_pricing()
                 return self.async_create_entry(
                     title=self._user_data["name"],
                     data=self._user_data,
                 )
+        return self._user_form(user_input, errors)
 
+    def _user_form(
+        self, user_input: dict[str, Any] | None, errors: dict[str, str]
+    ) -> SubentryFlowResult:
         schema = vol.Schema(
             {
                 vol.Required("name"): selector.TextSelector(),
@@ -987,6 +1026,9 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                 elif method == "markup":
                     pricing["markup_factor"] = markup
                 self._user_data["guest_pricing"] = pricing
+                _name, error = self._check_name(self._first_input["name"], None)
+                if error:
+                    return self._user_form(self._first_input, {"name": error})
                 return self.async_create_entry(
                     title=self._user_data["name"],
                     data=self._user_data,
@@ -1042,25 +1084,9 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            stored_name = subentry.data["name"]
-            # Unchanged names skip the checks so users whose names already
-            # collide can still be deactivated or edited (D-10).
-            name = user_input["name"]
-            if name != stored_name:
-                name = name.strip()
-                error = _user_name_error(entry, name, subentry.subentry_id)
-                if error is None and name != stored_name:
-                    # D-8: the running session keeps the name it started with
-                    # (Snapshot principle), so a rename would land its energy
-                    # and cost in a bucket no sensor shows.
-                    engine = (
-                        self.hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("session_engine")
-                    )
-                    session = engine.active_session if engine is not None else None
-                    if session is not None and session.user_name == stored_name:
-                        error = "user_in_session"
-                if error:
-                    errors["name"] = error
+            name, error = self._check_name(user_input["name"], subentry)
+            if error:
+                errors["name"] = error
 
         if user_input is not None and not errors:
             # Build updated data preserving immutable fields
@@ -1073,6 +1099,7 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
             # If guest, route to pricing edit
             if new_data["type"] == "guest":
                 self._user_data = new_data
+                self._first_input = dict(user_input)
                 return await self.async_step_reconfigure_guest_pricing()
 
             # Run cascade before updating the subentry
@@ -1091,6 +1118,14 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                 title=title,
             )
 
+        return self._reconfigure_form(subentry, user_input, errors)
+
+    def _reconfigure_form(
+        self,
+        subentry: ConfigSubentry,
+        user_input: dict[str, Any] | None,
+        errors: dict[str, str],
+    ) -> SubentryFlowResult:
         # Pre-fill form with current values, or the submitted ones on error
         schema = self.add_suggested_values_to_schema(
             vol.Schema(
@@ -1135,6 +1170,10 @@ class UserSubentryFlowHandler(ConfigSubentryFlow):
                 elif method == "markup":
                     pricing["markup_factor"] = markup
                 self._user_data["guest_pricing"] = pricing
+                name, error = self._check_name(self._first_input["name"], subentry)
+                if error:
+                    return self._reconfigure_form(subentry, self._first_input, {"name": error})
+                self._user_data["name"] = name
 
                 await self._apply_active_change(
                     entry,

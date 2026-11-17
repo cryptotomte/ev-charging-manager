@@ -590,11 +590,12 @@ async def test_v2_resume_re_persists_snapshot_immediately(hass: HomeAssistant) -
     )
 
 
-async def test_v2_recovery_genuine_counter_reset_still_completes(
+async def test_v2_recovery_genuine_counter_reset_resumes_with_energy_kept(
     hass: HomeAssistant,
 ) -> None:
-    """FR-002 control: a genuine reset (energy available, measurably lower)
-    preserves the existing counter-reset completion behavior."""
+    """Spec 027 D-38 (replaces the FR-027 completion on a reset): a genuine reset
+    (energy available, measurably lower) with no other card on the charger resumes
+    the session through the live reset rule, keeping the accumulated energy."""
     snapshot = make_active_snapshot(
         session_id="v2-reset-001",
         energy_start_kwh=100.0,
@@ -611,12 +612,13 @@ async def test_v2_recovery_genuine_counter_reset_still_completes(
     )
 
     engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
-    assert engine.state == SessionEngineState.IDLE, (
-        "a genuine counter reset must complete the old session (FR-027 preserved)"
+    assert engine.state == SessionEngineState.TRACKING, (
+        "a counter reset with the same connection resumes the session (spec 027 D-38)"
     )
-    assert len(events) == 1, "exactly one completion event for the reset session"
-    assert events[0].data["session_id"] == "v2-reset-001"
-    assert events[0].data["reconstructed"] is True
+    assert engine.active_session.id == "v2-reset-001"
+    assert engine.active_session.energy_kwh == pytest.approx(5.0, abs=0.001)
+    assert engine.active_session.energy_start_kwh == pytest.approx(0.3 - 5.0, abs=0.001)
+    assert len(events) == 0
 
 
 async def test_v2_recovery_energy_jitter_below_start_is_not_a_reset(

@@ -12,7 +12,13 @@ from __future__ import annotations
 import pytest
 
 from tests.session_rig import (
+    ETO,
     INTERRUPTIONS,
+    LOCK,
+    PLUG,
+    SPOT_DATA,
+    TRX_GFIX,
+    TRX_GMARK,
     TRX_PAUL,
     Interruption,
     Rig,
@@ -177,3 +183,166 @@ async def test_rt03_charge_finishes_during_the_outage(hass, hass_storage, freeze
     rig = Rig(hass, freezer, hass_storage)
     await scenario_f(rig, TRX_PAUL, interruption)
     _assert_one_paul_session(rig)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("reload", "reload"),
+        ("restart-present", "restart-present"),
+        ("reload", "restart-late"),
+    ],
+)
+async def test_rt04_two_interruptions_in_one_session(
+    hass, hass_storage, freezer, first, second
+) -> None:
+    """RT-04: two interruptions in one session end as uninterrupted (RT-01's reference)."""
+    rig = Rig(hass, freezer, hass_storage)
+    at = {"mid": INTERRUPTIONS[first], "mid2": INTERRUPTIONS[second]}
+    await scenario_a(rig, TRX_PAUL, at)
+    _assert_one_paul_session(rig)
+
+
+def save_options(pricing: dict) -> Interruption:
+    """Save the options form (observation step, then pricing step); it reloads the entry."""
+
+    async def _save(rig: Rig) -> None:
+        flow = rig.hass.config_entries.options
+        result = await flow.async_init(rig.entry.entry_id)
+        result = await flow.async_configure(
+            result["flow_id"],
+            {"plug_entity": PLUG, "cable_lock_entity": LOCK, "eto_entity": ETO},
+        )
+        result = await flow.async_configure(result["flow_id"], pricing)
+        await rig.hass.async_block_till_done()
+        assert result["type"] == "create_entry"
+
+    return _save
+
+
+async def _second_session(rig: Rig) -> None:
+    """A second session after scenario A: 1.0 kWh, 10:45–10:58."""
+    await rig.goto("10:45:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:55:00")
+    await rig.set(energy=5.0)
+    await rig.set(power=0)
+    await rig.goto("10:58:00")
+    await rig.unplug()
+
+
+@pytest.mark.parametrize("change", ["none", "same", "price"])
+async def test_rt06_fixed_price_changed_during_a_session(
+    hass, hass_storage, freezer, change
+) -> None:
+    """RT-06: the running session keeps 2.50 kr/kWh; the next one is priced at 4.00."""
+    new_price = {"none": 2.5, "same": 2.5, "price": 4.0}[change]
+    at = (
+        {}
+        if change == "none"
+        else {"mid": save_options({"pricing_mode": "static", "static_price_kwh": new_price})}
+    )
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_a(rig, TRX_PAUL, at)
+    await _second_session(rig)
+
+    first, second = rig.money()
+    assert first == PAUL_4KWH
+    assert second["energy"] == 1.0
+    assert second["cost"] == 1.0 * new_price
+
+
+async def test_rt07_fixed_to_spot_during_a_session(hass, hass_storage, freezer) -> None:
+    """RT-07: the running session completes at its fixed price; the next one is spot."""
+    rig = Rig(hass, freezer, hass_storage)
+    spot = {"pricing_mode": "spot", "static_price_kwh": 2.5, **SPOT_DATA}
+    await scenario_a(rig, TRX_PAUL, {"mid": save_options(spot)})
+    await _second_session(rig)
+
+    first, second = rig.money()
+    assert first == PAUL_4KWH
+    assert rig.completed[0].data["cost_method"] == "static"
+    assert rig.completed[1].data["cost_method"] == "spot"
+    # Spot 1.0 kr/kWh, no additional cost, VAT multiplier 1.0.
+    assert second["cost"] == 1.0
+    assert second["details"] == [("10:00", 1.0, 1.0, False)]
+
+
+GUESTS = {
+    # trx, charge price for 4.0 kWh at 2.50 kr/kWh, method
+    "fixed": (TRX_GFIX, "Gaest", 20.0),
+    "markup": (TRX_GMARK, "Markup", 15.0),
+}
+
+
+@pytest.mark.parametrize("intr", list(INTERRUPTIONS))
+@pytest.mark.parametrize("method", list(GUESTS))
+async def test_rt09_guest_charge_price_survives(hass, hass_storage, freezer, method, intr) -> None:
+    """RT-09: charge price and method as uninterrupted in event, record and guest_last."""
+    trx, name, charge = GUESTS[method]
+    fn = INTERRUPTIONS[intr]
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_a(rig, trx, {"mid": fn} if fn else {})
+
+    assert rig.money() == [
+        PAUL_4KWH
+        | {
+            "user": name,
+            "charge_price": charge,
+            "charge_method": method,
+            "record_charge_price": charge,
+        }
+    ]
+    assert rig.stats.guest_last.charge_price_kr == charge
+
+
+async def _unplug_guest(rig: Rig, *, fire: bool = True) -> None:
+    """The guest's car charges to 3.8 kWh and leaves at 10:30; with fire=False while down."""
+    await rig.goto("10:30:00", fire=fire)
+    await rig.set(energy=3.8)
+    await rig.set(power=0)
+    await rig.unplug()
+    await rig.set(trx="null")
+    await rig.goto("10:45:00", fire=fire)
+
+
+async def _unplug_guest_while_down(rig: Rig) -> None:
+    await _unplug_guest(rig, fire=False)
+
+
+@pytest.mark.parametrize("intr", ["none", "restart-present", "restart-late-energy-first"])
+async def test_rt10_guest_unplugged_during_the_outage(hass, hass_storage, freezer, intr) -> None:
+    """RT-10: energy, cost and charge price from the final counter (3.8 kWh).
+
+    Allowed difference: the end time is the start-up time, the unplug was not observed.
+    """
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_GFIX)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:22:00")
+    if intr == "none":
+        await _unplug_guest(rig)
+    else:
+        order = ["energy", "plug", "lock", "trx", "power", "car", "eto"]
+        await {
+            "restart-present": restart(during=_unplug_guest_while_down),
+            "restart-late-energy-first": restart(
+                "late", during=_unplug_guest_while_down, order=order
+            ),
+        }[intr](rig)
+    await rig.goto("10:46:00")
+
+    (money,) = rig.money()
+    assert (money["energy"], money["cost"], money["charge_price"]) == (3.8, 9.5, 19.0)
+    assert (money["record_energy"], money["record_cost"], money["record_charge_price"]) == (
+        3.8,
+        9.5,
+        19.0,
+    )
+    assert money["charge_method"] == "fixed"
+    assert rig.stats.guest_last.charge_price_kr == 19.0

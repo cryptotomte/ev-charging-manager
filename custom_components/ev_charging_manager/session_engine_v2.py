@@ -124,6 +124,10 @@ _RFID_REASON_MAP: dict[str, UnknownReason] = {
 }
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 @dataclass(frozen=True, slots=True)
 class _RfidWaitState:
     """In-memory state for an active RFID wait (event-driven; no timer).
@@ -604,15 +608,9 @@ class PlugAnchoredSessionEngine:
             )
 
         energy_start = float(snapshot.get("energy_start_kwh", 0.0))
-        # PR-27 FR-002: only an available reading measurably below the session's
-        # start value is a reset; the epsilon kills float jitter false positives.
-        energy_counter_reset = (
-            current_energy is not None and current_energy < energy_start - ENERGY_RESET_EPSILON_KWH
-        )
-
         # Effective energy for downstream use: when the live reading is missing,
         # reconstruct it from the snapshot (start + accumulated) so the session
-        # resumes/completes with its last known values (PR-27 FR-001).
+        # completes with its last known values (PR-27 FR-001).
         effective_energy = (
             current_energy
             if current_energy is not None
@@ -623,12 +621,13 @@ class PlugAnchoredSessionEngine:
         # None was handled by the early return above).
         plug_on = current_plug == "on"
 
-        if plug_on and not energy_counter_reset:
-            # Cable still in — resume the session (FR-026)
-            await self._resume_session_from_snapshot(snapshot, effective_energy, current_power, now)
+        if plug_on:
+            # Cable still in — resume the session (FR-026). A counter below the
+            # snapshot's is handled inside the resume (spec 027 D-38).
+            await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
         else:
-            # Cable removed or energy counter reset — complete the old session (FR-027)
-            reason = "energy counter reset" if energy_counter_reset else "plug was off at restart"
+            # Cable removed — complete the old session (FR-027)
+            reason = "plug was off at restart"
             _LOGGER.info(
                 "PlugAnchoredSessionEngine recovery: completing old session (%s) id=%s",
                 reason,
@@ -786,7 +785,7 @@ class PlugAnchoredSessionEngine:
     async def _resume_session_from_snapshot(
         self,
         snapshot: dict,
-        current_energy: float,
+        current_energy: float | None,
         current_power: float,
         now: datetime,
     ) -> None:
@@ -798,6 +797,10 @@ class PlugAnchoredSessionEngine:
         synthetic closed window — never both (seed-split below); in spot mode
         the hourly snapshot callback is re-armed; and the resumed session is
         immediately re-persisted as the active snapshot (review F2).
+
+        ``current_energy`` is the live counter reading, None while the energy entity
+        is unavailable. Spec 027 § 6.2 step 5 sets the order: restore what the session
+        started with, replay the present reading (D-38), recompute (D-37).
         """
         # PR-27 FR-003: clear any armed RFID wait BEFORE installing the session.
         # The deferred-resume path can race the engine's own plug-on handling,
@@ -822,7 +825,7 @@ class PlugAnchoredSessionEngine:
                 snapshot.get("connected_at") or snapshot.get("started_at", now.isoformat())
             ),
             energy_start_kwh=float(snapshot.get("energy_start_kwh", 0.0)),
-            energy_kwh=max(0.0, current_energy - float(snapshot.get("energy_start_kwh", 0.0))),
+            energy_kwh=float(snapshot.get("energy_kwh", 0.0)),
             cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
             cost_method=snapshot.get("cost_method", "static"),
             price_details=snapshot.get("price_details"),
@@ -837,15 +840,19 @@ class PlugAnchoredSessionEngine:
         )
 
         self._active_session = session
-        self._last_energy_kwh = current_energy
+        # Spec 027 D-38: the last known counter reading is the snapshot's, so the
+        # replay below compares the present reading with it.
+        self._last_energy_kwh = session.energy_start_kwh + session.energy_kwh
+        current_energy_or_last = (
+            current_energy if current_energy is not None else self._last_energy_kwh
+        )
         self._last_power_w = current_power
         self._state = SessionEngineState.TRACKING
         # PR-27: mirror the session-level flag (FR-026 sets data_gap=True on every
         # restart resume) on the engine flag, so completion's
         # `session.data_gap = self._data_gap` transfer cannot wipe it later.
         self._data_gap = True
-        # Spec 027 D-41.
-        self._eto_start = session.charger_total_before_kwh
+        self._restore_session_context(snapshot, session)
 
         # BUG-2 fix: re-arm the spot-pricing hourly snapshot callback after restart.
         # Without this, _hourly_unsub stays None, the hourly callback never fires,
@@ -854,7 +861,7 @@ class PlugAnchoredSessionEngine:
         # next hourly boundary correctly accounts for energy delivered since restart.
         if self._pricing.mode == "spot" and self._hourly_unsub is None:
             self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-            self._hour_energy_snapshot = max(0.0, current_energy - session.energy_start_kwh)
+            self._hour_energy_snapshot = max(0.0, current_energy_or_last - session.energy_start_kwh)
             # PR-29 (FR-008): the pre-restart captured price is gone (in-memory)
             # — recapture at resume for the in-progress hour.
             self._capture_hour_price()
@@ -918,7 +925,7 @@ class PlugAnchoredSessionEngine:
                     start_at=pre_restart_start,
                     end_at=pre_restart_end,
                     energy_start_kwh=session.energy_start_kwh,
-                    energy_end_kwh=current_energy,
+                    energy_end_kwh=current_energy_or_last,
                     last_power_change_at=pre_restart_end,
                 )
                 self._window_tracker.inject_closed_window(synthetic_window)
@@ -959,7 +966,7 @@ class PlugAnchoredSessionEngine:
         # Reconcile window state: if power > 0, continue/open a window; else keep closed
         if current_power > 0:
             # Open a window (or continue one — we can't distinguish without full history)
-            self._window_tracker.open_window(now, current_energy)
+            self._window_tracker.open_window(now, current_energy_or_last)
             session.charging_window_count += 1
             if session.charging_started_at is None:
                 session.charging_started_at = now.isoformat()
@@ -968,9 +975,15 @@ class PlugAnchoredSessionEngine:
                 self._debug_logger.log(
                     DEBUG_CAT_CHARGING_WINDOW_OPEN,
                     f"window={session.charging_window_count} opened at restart "
-                    f"(power={current_power:.0f}W energy_start={current_energy:.3f}kWh)",
+                    f"(power={current_power:.0f}W energy_start={current_energy_or_last:.3f}kWh)",
                 )
         # If power=0, leave window tracker empty — window will open when power returns
+
+        # Spec 027 D-38: replay the present through the live handler, so a counter that
+        # went backwards during the outage meets the live reset rule.
+        if current_energy is not None:
+            self._handle_energy_update(str(current_energy))
+        self._recompute_derived(session)
 
         if self._debug_logger:
             self._debug_logger.log(
@@ -998,6 +1011,67 @@ class PlugAnchoredSessionEngine:
                 "failed: %s — the pre-restart snapshot remains on disk",
                 err,
             )
+
+    def _restore_session_context(self, snapshot: dict, session: Session) -> None:
+        """Restore what the session started with from the snapshot's ``resume_state``.
+
+        Spec 027 D-36 (pricing), D-40 (guest rate), D-41 (charger total). An absent
+        ``resume_state`` or part falls back per D-45; a malformed part also logs a warning.
+        """
+        state = snapshot.get("resume_state")
+        if state is not None and not isinstance(state, dict):
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: resume_state of snapshot id=%s is malformed "
+                "(%r) — using the fallbacks of spec 027 D-45",
+                session.id,
+                state,
+            )
+            state = None
+        state = state or {}
+
+        def malformed(part: str) -> None:
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: resume_state.%s of snapshot id=%s is malformed "
+                "(%r) — using the fallback of spec 027 D-45",
+                part,
+                session.id,
+                state[part],
+            )
+
+        pricing = state.get("pricing")
+        if pricing is not None:
+            mode = pricing.get("mode") if isinstance(pricing, dict) else None
+            spot_keys = (
+                CONF_SPOT_ADDITIONAL_COST_KWH,
+                CONF_SPOT_VAT_MULTIPLIER,
+                CONF_SPOT_FALLBACK_PRICE_KWH,
+            )
+            if not (
+                (mode == "static" and _is_number(pricing.get(CONF_STATIC_PRICE_KWH)))
+                or (
+                    mode == "spot"
+                    and isinstance(pricing.get(CONF_SPOT_PRICE_ENTITY), str)
+                    and all(_is_number(pricing.get(key)) for key in spot_keys)
+                )
+            ):
+                malformed("pricing")
+                pricing = None
+        self._apply_pricing(dict(pricing) if pricing else self._entry_pricing_params())
+
+        guest: GuestPricing | None = None
+        raw_guest = state.get("guest_pricing")
+        if raw_guest is not None:
+            method = raw_guest.get("method") if isinstance(raw_guest, dict) else None
+            if (method == "fixed" and _is_number(raw_guest.get("price_per_kwh"))) or (
+                method == "markup" and _is_number(raw_guest.get("markup_factor"))
+            ):
+                guest = GuestPricing.from_dict(raw_guest)
+            else:
+                malformed("guest_pricing")
+        self._guest_pricing = guest
+        session.charge_price_method = guest.method if guest is not None else None
+
+        self._eto_start = session.charger_total_before_kwh
 
     async def _complete_snapshot_as_session(
         self, snapshot: dict, current_energy: float, now: datetime
@@ -1062,6 +1136,8 @@ class PlugAnchoredSessionEngine:
             reconstructed=True,
             data_gap=True,
         )
+        self._restore_session_context(snapshot, session)
+        self._recompute_derived(session)
 
         if charging_duration_s > 0 and session.energy_kwh > 0:
             session.avg_power_w = round((session.energy_kwh * 3_600_000) / charging_duration_s, 1)
@@ -2044,7 +2120,14 @@ class PlugAnchoredSessionEngine:
 
         # Energy delta from session start
         session.energy_kwh = max(0.0, energy_kwh - session.energy_start_kwh)
+        self._recompute_derived(session)
 
+    def _recompute_derived(self, session: Session) -> None:
+        """Recompute cost, guest charge price and SoC from the session's energy.
+
+        Spec 027 D-37: runs on every energy update, at the end of a resume and before
+        every completion, so no stored value is older than the energy it belongs to.
+        """
         # Mode-aware cost update
         if self._pricing.mode == "static":
             session.cost_total_kr = self._pricing.calculate(session.energy_kwh)
@@ -2104,6 +2187,8 @@ class PlugAnchoredSessionEngine:
             return
 
         try:
+            # Spec 027 D-36: a price changed in the options applies from the next session.
+            self._apply_pricing(self._entry_pricing_params())
             now = dt_util.utcnow()
             now_iso = now.isoformat()
             # Use the caller-provided plug-on time if available (FR-007), else current time.
@@ -2513,6 +2598,7 @@ class PlugAnchoredSessionEngine:
             # the claim above already detached it from self._active_session).
             if self._window_tracker.is_open():
                 self._close_window(now, session)
+            self._recompute_derived(session)
 
             # Compute final durations
             connected_at_str = session.connected_at or session.started_at

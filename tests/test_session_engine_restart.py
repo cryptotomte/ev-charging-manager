@@ -908,7 +908,7 @@ async def test_ha_restart_during_rfid_wait_re_enters_wait_state(
     entity values and correctly enters waiting_for_rfid — exactly as it would in a
     live session.  No active session snapshot exists (the wait was pre-session).
 
-    Spec 020 (line 103) and spec 027 D-46: the plug already reads on when the
+    Spec 020 (line 103) and spec 027 D-51: the plug already reads on when the
     integration is set up, and no state-change event follows; setup itself must
     run the plug-on handling. (This test used to set up with the plug off and
     then fire a plug event, which is a live plug-in, not a restart.)
@@ -961,7 +961,7 @@ async def test_ha_restart_during_rfid_wait_re_enters_wait_state(
         "SF7: _rfid_wait must be cleared after session starts"
     )
     assert engine.active_session.energy_start_kwh == 0.0, (
-        "spec 027 D-46: the session of a cable already in at setup takes the whole counter"
+        "spec 027 D-51: the session of a cable already in at setup takes the whole counter"
     )
 
 
@@ -1113,7 +1113,7 @@ async def test_deferred_resume_clears_rfid_wait_and_session_survives(
     session, and a subsequent plug-in starts a new session.
 
     Adversarial residue: an RFID wait is armed when the deferred-recovery resume
-    installs the recovered session. Spec 027 D-43 keeps the engine's own plug
+    installs the recovered session. Spec 027 D-49 (§ 12 X-3) keeps the engine's own plug
     handler from arming one while a recovery is deferred, so the residue is
     injected directly; the resume must still clear it (per plan.md the fix must
     not RELY on eager semantics or on that guard).

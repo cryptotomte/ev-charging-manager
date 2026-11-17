@@ -183,8 +183,10 @@ async def test_rt18_same_card_counter_restarted_during_the_outage(
     D-38 replays the present reading through the live reset rule, which takes the first
     reading after a reset as the new baseline. Live, that reading is 0.0 and nothing is
     lost (5.0 kWh). Across the outage it is 1.0, so the session keeps the snapshot's
-    3.0 kWh plus the 1.0 kWh counted after start-up: 4.0 kWh. That 1.0 kWh difference is
-    the D-38 rule as decided (§ 3 wins over RT-18's prose; spec 027 § 12, X-1).
+    3.0 kWh plus the 1.0 kWh counted after start-up: 4.0 kWh. The same in every start
+    order. That 1.0 kWh difference is the live reset rule, decided at GATE B: kept
+    (spec 027 D-53, § 12 X-1); the alternative would bill a counter that only stepped
+    back about twice.
     """
     rig = Rig(hass, freezer, hass_storage, energy0=str(base))
     await rig.setup()

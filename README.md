@@ -101,7 +101,7 @@ Users represent the people who charge at your location. Each user can have RFID 
 
 Guest users have additional billing options (custom price per kWh or markup factor).
 
-Names must be unique, ignoring case, accents, spaces and punctuation ("Anna", "anna" and "Änna" count as the same name). "Guest" and "Unknown" are reserved. A user cannot be renamed while that user's charging session is in progress.
+Names must be unique. Two names count as the same when they differ only in case, accents or punctuation ("Anna", "anna" and "Änna", or "Eva-Lena" and "Eva Lena"). "Guest" and "Unknown" are reserved. A user cannot be renamed while that user's charging session is in progress. A name cannot be taken while a charging session in progress is recorded under it.
 
 Deleting a user deletes that user's statistics and statistics sensors. The guest totals keep a deleted guest's energy and cost. Stored sessions are not affected.
 

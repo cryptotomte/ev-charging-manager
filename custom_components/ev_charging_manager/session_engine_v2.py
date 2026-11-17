@@ -89,6 +89,7 @@ from .const import (
     EVENT_SESSION_STARTED,
     EVENT_UNKNOWN_RFID_DETECTED,
     NOTIFICATION_ID_UNKNOWN_RFID,
+    RECOVERY_INPUT_WAIT_S,
     SIGNAL_RFID_MAPPING_ADDED,
     SIGNAL_SESSION_UPDATE,
     SessionEngineState,
@@ -311,6 +312,11 @@ class PlugAnchoredSessionEngine:
         # other's handle is not sufficient when both were dispatched in the
         # same loop iteration.
         self._recovery_resolved: bool = False
+        # Spec 027 D-49: the short wait for the energy or RFID entity once the plug is
+        # valid (state listener + timer), and a decision that is running.
+        self._recovery_wait_unsub: _Unsub = None
+        self._recovery_wait_timeout_unsub: _Unsub = None
+        self._recovery_busy: bool = False
 
         # The price parameters of the session in progress (spec 027 D-35/D-36), stored
         # with its snapshot; the entry's between sessions.
@@ -527,6 +533,8 @@ class PlugAnchoredSessionEngine:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("deferred-recovery-timeout unsub failed: %s", err)
             self._deferred_recovery_timeout_unsub = None
+        self._safe_cancel("_recovery_wait_unsub")
+        self._safe_cancel("_recovery_wait_timeout_unsub")
 
         # Cancel and clear all engine-managed unsubs.
         for unsub in list(self._engine_unsubs):
@@ -566,22 +574,24 @@ class PlugAnchoredSessionEngine:
             self._state = SessionEngineState.IDLE
             self._active_session = None
 
-    def _recovery_inputs_ready(self) -> bool:
-        """Whether the plug and the RFID entity both have a valid state (spec 027 D-43).
+    def _rfid_entity_unready(self) -> bool:
+        """Whether the RFID entity has no state or is unavailable (spec 027 D-49).
 
-        The plug must read a usable value (BUG-3). For the RFID entity "null" is a valid
-        state (no card on the charger); only an absent, unavailable or unknown entity
-        is not.
+        ``unknown`` and ``null`` are states of a loaded entity and mean "no card".
         """
-        if self._entry.options.get(CONF_PLUG_ENTITY) and self._get_plug() is None:
-            return False
         rfid_entity_id = self._entry.data.get(CONF_RFID_ENTITY)
         if not rfid_entity_id:
-            return True
+            return False
         rfid_state = self._hass.states.get(rfid_entity_id)
-        return rfid_state is not None and rfid_state.state not in (
-            STATE_UNAVAILABLE,
-            STATE_UNKNOWN,
+        return rfid_state is None or rfid_state.state == STATE_UNAVAILABLE
+
+    @property
+    def _recovery_pending(self) -> bool:
+        """Whether a recovery decision is still open (deferred, waiting or running)."""
+        return (
+            self._deferred_recovery_unsub is not None
+            or self._recovery_wait_unsub is not None
+            or self._recovery_busy
         )
 
     def _present_card_index(self) -> int | None:
@@ -592,38 +602,39 @@ class PlugAnchoredSessionEngine:
             return None
         return index if index >= 0 else None
 
-    async def _async_do_recover(self, snapshot: dict) -> None:
-        """Execute the plug-anchored restart recovery logic (spec 027 § 6.2).
+    async def _async_do_recover(self, snapshot: dict, *, waited: bool = False) -> None:
+        """Execute the plug-anchored restart recovery logic (spec 027 § 6.2, D-49).
 
         BUG-3 fix: when the plug entity is not yet available (None — unavailable /
         unknown / entity not loaded at boot), DO NOT silently treat the plug as
         off. That would prematurely complete the session with the wrong disconnect
-        time. Instead, defer recovery until a valid plug state arrives; spec 027
-        D-43 waits for the RFID entity as well.
+        time. Instead, defer recovery until a valid plug state arrives. With a valid
+        plug, a missing energy reading (plug off) or RFID entity (plug on) gets a
+        short wait; ``waited`` means that wait is over and what is known decides.
         """
         now = dt_util.utcnow()
-        plug_entity_id = self._entry.options.get(CONF_PLUG_ENTITY)
-        rfid_entity_id = self._entry.data.get(CONF_RFID_ENTITY)
 
-        if not self._recovery_inputs_ready():
+        # Read current charger state — plug may be None if entity not yet loaded.
+        current_plug = self._get_plug()
+        plug_entity_id = self._entry.options.get(CONF_PLUG_ENTITY)
+
+        if current_plug is None and plug_entity_id:
+            # Plug entity not yet reporting a usable value — defer recovery (BUG-3).
             if self._debug_logger:
                 snap_id = snapshot.get("id", "?")
                 self._debug_logger.log(
                     DEBUG_CAT_HA_RESTART_DETECTED,
-                    "RECOVERY_DEFERRED_WAITING_FOR_PLUG — plug or RFID entity unavailable "
-                    f"at recovery time (plug={plug_entity_id} rfid={rfid_entity_id} "
-                    f"snapshot_id={snap_id})",
+                    "RECOVERY_DEFERRED_WAITING_FOR_PLUG — plug entity unavailable at "
+                    f"recovery time (entity_id={plug_entity_id} snapshot_id={snap_id})",
                 )
             _LOGGER.info(
-                "PlugAnchoredSessionEngine recovery: deferring — plug entity %s or RFID "
-                "entity %s not yet available; will retry on first valid state",
+                "PlugAnchoredSessionEngine recovery: deferring — plug entity %s "
+                "not yet available; will retry on first valid state",
                 plug_entity_id,
-                rfid_entity_id,
             )
-            await self._defer_recovery_until_ready(snapshot)
+            await self._defer_recovery_until_plug_ready(snapshot, plug_entity_id)
             return
 
-        current_plug = self._get_plug()
         current_cable_lock = self._get_cable_lock()
         # PR-27 FR-001: keep None when the energy entity is unavailable — an
         # absent reading is "no evidence", never a counter reset.
@@ -639,79 +650,178 @@ class PlugAnchoredSessionEngine:
                 f"power={current_power:.0f}W energy={energy_str}",
             )
 
+        if current_plug != "on":
+            energy_entity_id = self._entry.data.get(CONF_ENERGY_ENTITY)
+            if not waited and energy_entity_id and current_energy is None:
+                self._wait_for_recovery_input(snapshot, energy_entity_id, kind="energy")
+                return
+            await self._complete_snapshot_car_left(snapshot)
+            return
+
+        if not waited and self._rfid_entity_unready():
+            self._wait_for_recovery_input(snapshot, self._entry.data[CONF_RFID_ENTITY], kind="rfid")
+            return
+
         saved_energy = float(snapshot.get("energy_kwh", 0.0))
         card = self._present_card_index()
-
-        if current_plug != "on":
-            # Cable removed — complete the old session (FR-027). Spec 027 D-47: the
-            # counter keeps the session's final value until the next plug-in, but is
-            # never trusted below the snapshot.
-            reason = "plug was off at restart"
-            energy = saved_energy
-            if current_energy is not None:
-                energy = max(
-                    saved_energy, current_energy - float(snapshot.get("energy_start_kwh", 0.0))
-                )
-            _LOGGER.info(
-                "PlugAnchoredSessionEngine recovery: completing old session (%s) id=%s",
-                reason,
-                snapshot.get("id", "?"),
-            )
-            await self._complete_snapshot_as_session(
-                snapshot, energy, now, charger_total_after_kwh=self._get_eto()
-            )
         # PRELIMINARY P-2 (spec 027 § 10): the card value does not change within one
         # connection, so a different card means a new connection. No card is no
         # evidence (spec 027 § 4.6).
-        elif card is not None and card != snapshot.get("rfid_index"):
+        if card is not None and card != snapshot.get("rfid_index"):
             # Spec 027 D-44: the counter belongs to the new connection, so the old
             # session keeps its snapshot energy and the new one takes the whole counter.
-            reason = "another card on the charger at restart"
             await self._complete_snapshot_as_session(snapshot, saved_energy, now)
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
+                    "session ended at restart — reason=another card on the charger at "
+                    f"restart id={snapshot.get('id', '?')}",
+                )
             self._state = SessionEngineState.TRACKING
             # PRELIMINARY P-1 (spec 027 § 10): with the cable in, the counter is the
             # energy of the current connection.
             await self._async_start_session(energy_start_kwh=0.0)
-        else:
-            # Cable still in — resume the session (FR-026). A counter below the
-            # snapshot's is handled inside the resume (spec 027 D-38).
-            await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
             return
 
+        # Cable still in — resume the session (FR-026). A counter below the
+        # snapshot's is handled inside the resume (spec 027 D-38).
+        await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
+
+    async def _complete_snapshot_car_left(self, snapshot: dict) -> None:
+        """Complete a snapshot whose car left during the outage (FR-027, spec 027 D-47).
+
+        The counter keeps the session's final value until the next plug-in, but is
+        never trusted below the snapshot.
+        """
+        saved_energy = float(snapshot.get("energy_kwh", 0.0))
+        current_energy = self._get_energy()
+        energy = saved_energy
+        if current_energy is not None:
+            energy = max(
+                saved_energy, current_energy - float(snapshot.get("energy_start_kwh", 0.0))
+            )
+        _LOGGER.info(
+            "PlugAnchoredSessionEngine recovery: completing old session "
+            "(plug was off at restart) id=%s",
+            snapshot.get("id", "?"),
+        )
+        await self._complete_snapshot_as_session(
+            snapshot, energy, dt_util.utcnow(), charger_total_after_kwh=self._get_eto()
+        )
         if self._debug_logger:
             self._debug_logger.log(
                 DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
-                f"session ended at restart — reason={reason} id={snapshot.get('id', '?')}",
+                "session ended at restart — reason=plug was off at restart "
+                f"id={snapshot.get('id', '?')}",
             )
 
-    async def _defer_recovery_until_ready(self, snapshot: dict) -> None:
-        """Register a listener that re-runs recovery when plug and RFID entity are valid.
+    def _wait_for_recovery_input(self, snapshot: dict, entity_id: str, *, kind: str) -> None:
+        """Hold the recovery decision until ``entity_id`` is usable (spec 027 D-49).
+
+        At most RECOVERY_INPUT_WAIT_S. ``kind`` "energy" (plug off): ends at the first
+        valid energy reading or at any plug change, then completes the snapshot with
+        what is known. ``kind`` "rfid" (plug on): ends when the RFID entity has a state
+        other than unavailable, or at a plug change, then decides again without waiting.
+        While the wait runs a plug-on starts nothing (§ 12, X-3).
+        """
+        plug_entity_id = self._entry.options.get(CONF_PLUG_ENTITY)
+        plug_at_start = self._get_plug()
+        if self._debug_logger:
+            self._debug_logger.log(
+                DEBUG_CAT_HA_RESTART_DETECTED,
+                f"recovery waits up to {RECOVERY_INPUT_WAIT_S}s for {entity_id} "
+                f"(plug={plug_at_start} snapshot_id={snapshot.get('id', '?')})",
+            )
+
+        def _ready() -> bool:
+            if self._get_plug() != plug_at_start:
+                return True
+            if kind == "energy":
+                return self._get_energy() is not None
+            return not self._rfid_entity_unready()
+
+        async def _finish(reason: str) -> None:
+            # Check-and-set before any await: the listener and the timer race.
+            if self._recovery_wait_unsub is None:
+                return
+            self._safe_cancel("_recovery_wait_unsub")
+            self._safe_cancel("_recovery_wait_timeout_unsub")
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_HA_RESTART_DETECTED,
+                    f"recovery wait for {entity_id} ended ({reason}) — deciding",
+                )
+            self._recovery_busy = True
+            try:
+                if kind == "energy":
+                    await self._complete_snapshot_car_left(snapshot)
+                else:
+                    await self._async_do_recover(snapshot, waited=True)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error(
+                    "PlugAnchoredSessionEngine: recovery after waiting for %s failed: %s id=%s",
+                    entity_id,
+                    err,
+                    snapshot.get("id", "?"),
+                )
+                self._state = SessionEngineState.IDLE
+                self._active_session = None
+            finally:
+                self._recovery_busy = False
+            self._hand_plug_back_after_recovery()
+
+        async def _on_state(_event: Event) -> None:
+            if _ready():
+                await _finish("input valid or plug changed")
+
+        async def _on_timeout(_now: datetime) -> None:
+            self._recovery_wait_timeout_unsub = None
+            await _finish(f"no valid state within {RECOVERY_INPUT_WAIT_S}s")
+
+        self._recovery_wait_unsub = async_track_state_change_event(
+            self._hass, [e for e in (entity_id, plug_entity_id) if e], _on_state
+        )
+        self._recovery_wait_timeout_unsub = async_call_later(
+            self._hass, RECOVERY_INPUT_WAIT_S, _on_timeout
+        )
+
+    def _hand_plug_back_after_recovery(self) -> None:
+        """Give a cable held back while the recovery decided its normal plug-on handling."""
+        if (
+            not self._recovery_pending
+            and self._state == SessionEngineState.IDLE
+            and self._get_plug() == "on"
+        ):
+            self._handle_plug_on()
+
+    async def _defer_recovery_until_plug_ready(self, snapshot: dict, plug_entity_id: str) -> None:
+        """Register a one-shot listener that re-runs recovery when plug entity is valid.
 
         BUG-3 fix: avoids the silent-corruption path where current_plug == None at
         boot causes the engine to assume plug is off and prematurely complete the
-        session with the restart timestamp as disconnected_at. Spec 027 D-43 waits
-        for the RFID entity too, because the card decides between resume and split.
+        session with the restart timestamp as disconnected_at.
 
         HIGH-1 fix: also registers a timeout (DEFERRED_RECOVERY_TIMEOUT_MIN). If
-        the entities never report a valid state within the window (e.g. user
+        the plug entity never reports a valid state within the window (e.g. user
         has a typo in their plug entity ID, charger is permanently offline), the
         engine fires a persistent notification and force-completes the snapshot
         rather than staying deferred forever.
         """
-        plug_entity_id = self._entry.options.get(CONF_PLUG_ENTITY)
-        watched = [e for e in (plug_entity_id, self._entry.data.get(CONF_RFID_ENTITY)) if e]
         # PR-27 FR-005: fresh mutual-exclusion flag for this deferral round.
         self._recovery_resolved = False
 
-        async def _on_entity_ready(_event: Event) -> None:
-            if not self._recovery_inputs_ready():
+        async def _on_plug_ready(event: Event) -> None:
+            new_state = event.data.get("new_state")
+            if new_state is None:
+                return
+            if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                 return
             # PR-27 FR-005: check-and-set before any await — if the timeout
             # already resolved the recovery, this callback is a no-op.
             if self._recovery_resolved:
                 return
             self._recovery_resolved = True
-            # Both entities are valid now — cancel listener + timeout and resume recovery.
+            # Plug entity now has a valid state — cancel listener + timeout and resume recovery.
             if self._deferred_recovery_unsub is not None:
                 self._deferred_recovery_unsub()
                 self._deferred_recovery_unsub = None
@@ -721,9 +831,9 @@ class PlugAnchoredSessionEngine:
             if self._debug_logger:
                 self._debug_logger.log(
                     DEBUG_CAT_HA_RESTART_DETECTED,
-                    f"plug entity now valid ({self._get_plug()!r}) and RFID entity valid "
-                    "— running deferred recovery",
+                    f"plug entity now valid ({new_state.state!r}) — running deferred recovery",
                 )
+            self._recovery_busy = True
             try:
                 await self._async_do_recover(snapshot)
             except Exception as err:  # noqa: BLE001
@@ -734,6 +844,9 @@ class PlugAnchoredSessionEngine:
                 )
                 self._state = SessionEngineState.IDLE
                 self._active_session = None
+            finally:
+                self._recovery_busy = False
+            self._hand_plug_back_after_recovery()
 
         async def _on_recovery_timeout(_now: datetime) -> None:
             # PR-27 FR-005: check-and-set before any await — if the plug-ready
@@ -741,7 +854,7 @@ class PlugAnchoredSessionEngine:
             if self._recovery_resolved:
                 return
             self._recovery_resolved = True
-            # Cancel the state listener (it will no longer be needed).
+            # Cancel the plug-state listener (it will no longer be needed).
             if self._deferred_recovery_unsub is not None:
                 try:
                     self._deferred_recovery_unsub()
@@ -751,12 +864,12 @@ class PlugAnchoredSessionEngine:
             self._deferred_recovery_timeout_unsub = None
 
             snap_id = snapshot.get("id", "?")
-            entities = " / ".join(watched)
             _LOGGER.error(
                 "PlugAnchoredSessionEngine: deferred recovery timed out after %d min "
-                "— %s never reported a valid state; force-completing snapshot id=%s",
+                "— plug entity %s never reported a valid state; force-completing "
+                "snapshot id=%s",
                 DEFERRED_RECOVERY_TIMEOUT_MIN,
-                entities,
+                plug_entity_id,
                 snap_id,
             )
 
@@ -764,7 +877,7 @@ class PlugAnchoredSessionEngine:
                 self._debug_logger.log(
                     DEBUG_CAT_RECOVERY_TIMEOUT,
                     f"deferred recovery timed out after {DEFERRED_RECOVERY_TIMEOUT_MIN} min "
-                    f"— {entities} never valid; "
+                    f"— plug entity {plug_entity_id} never valid; "
                     f"force-completing snapshot id={snap_id}",
                 )
 
@@ -773,7 +886,7 @@ class PlugAnchoredSessionEngine:
                 persistent_notification.async_create(
                     self._hass,
                     message=(
-                        f"The plug or RFID entity (**{entities}**) did not report a valid "
+                        f"The plug entity **{plug_entity_id}** did not report a valid "
                         f"state within {DEFERRED_RECOVERY_TIMEOUT_MIN} minutes after Home "
                         "Assistant restart. The previously active session has been "
                         "force-completed with a data gap.\n\n"
@@ -794,6 +907,7 @@ class PlugAnchoredSessionEngine:
 
             # Force-complete the snapshot as a reconstructed session (mirrors BUG-3
             # path but with restart-time as disconnected_at).
+            self._recovery_busy = True
             try:
                 now = dt_util.utcnow()
                 saved_energy = float(snapshot.get("energy_kwh", 0.0))
@@ -816,13 +930,12 @@ class PlugAnchoredSessionEngine:
                 )
                 self._state = SessionEngineState.IDLE
                 self._active_session = None
-            # A plug that turned valid during the deferral was held back (see
-            # _handle_plug_on); give it its normal handling now.
-            if self._state == SessionEngineState.IDLE and self._get_plug() == "on":
-                self._handle_plug_on()
+            finally:
+                self._recovery_busy = False
+            self._hand_plug_back_after_recovery()
 
         self._deferred_recovery_unsub = async_track_state_change_event(
-            self._hass, watched, _on_entity_ready
+            self._hass, [plug_entity_id], _on_plug_ready
         )
         self._engine_unsubs.append(self._deferred_recovery_unsub)
 
@@ -1575,10 +1688,10 @@ class PlugAnchoredSessionEngine:
             # Already completing — ignore
             return
 
-        # Spec 027 D-43: while a recovery is deferred, the recovery decides what this
-        # cable is; a session started here (e.g. by power during an RFID wait) would be
-        # overwritten by it. The timeout path hands the plug back afterwards (§ 12, X-3).
-        if self._deferred_recovery_unsub is not None:
+        # While a recovery decision is open, the recovery decides what this cable is; a
+        # session started here (e.g. by power during an RFID wait) would be overwritten
+        # by it. The plug is handed back afterwards (spec 027 D-49, § 12 X-3).
+        if self._recovery_pending:
             return
 
         # Cancel any lingering disconnect timer (defensive)

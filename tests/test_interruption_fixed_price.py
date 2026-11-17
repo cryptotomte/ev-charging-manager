@@ -16,6 +16,7 @@ from tests.session_rig import (
     INTERRUPTIONS,
     LOCK,
     PLUG,
+    PLUG_LAST,
     SPOT_DATA,
     TRX_GFIX,
     TRX_GMARK,
@@ -27,8 +28,6 @@ from tests.session_rig import (
     scenario_a,
     scenario_f,
 )
-
-PLUG_LAST = ["energy", "power", "trx", "lock", "car", "eto", "plug"]
 
 # Scenario A, Paul (vehicle 50 kWh, efficiency 0.9) at 2.50 kr/kWh.
 PAUL_4KWH = {
@@ -252,9 +251,19 @@ async def _unplug_guest_while_down(rig: Rig) -> None:
     await _unplug_guest(rig, fire=False)
 
 
-@pytest.mark.parametrize("intr", ["none", "restart-present", "restart-late-energy-first"])
+@pytest.mark.parametrize(
+    "intr",
+    [
+        "none",
+        "restart-present",
+        "restart-late-energy-first",
+        "restart-late-field",
+        "restart-late-pluglast",
+    ],
+)
 async def test_rt10_guest_unplugged_during_the_outage(hass, hass_storage, freezer, intr) -> None:
-    """RT-10: energy, cost and charge price from the final counter (3.8 kWh).
+    """RT-10: energy, cost and charge price from the final counter (3.8 kWh), also when
+    the plug is valid before the energy entity (field order: D-49 waits for it).
 
     Allowed difference: the end time is the start-up time, the unplug was not observed.
     """
@@ -275,6 +284,10 @@ async def test_rt10_guest_unplugged_during_the_outage(hass, hass_storage, freeze
             "restart-present": restart(during=_unplug_guest_while_down),
             "restart-late-energy-first": restart(
                 "late", during=_unplug_guest_while_down, order=order
+            ),
+            "restart-late-field": restart("late", during=_unplug_guest_while_down),
+            "restart-late-pluglast": restart(
+                "late", during=_unplug_guest_while_down, order=PLUG_LAST
             ),
         }[intr](rig)
     await rig.goto("10:46:00")

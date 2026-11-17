@@ -253,6 +253,11 @@ ENERGY_RESET_EPSILON_KWH = 0.01
 # notification and force-completes the snapshot as a reconstructed session.
 DEFERRED_RECOVERY_TIMEOUT_MIN = 60  # minutes
 
+# Spec 027 D-49: once the plug is valid, how long recovery waits for the energy entity
+# (plug off) or the RFID entity (plug on). In the field the charger's entities become
+# valid within 20 ms of each other.
+RECOVERY_INPUT_WAIT_S = 30
+
 # New debug log categories (FR-034) — used as the first argument to DebugLogger.log().
 # The DebugLogger accepts arbitrary category strings; these constants ensure
 # consistent spelling across session_engine_v2.py and tests.

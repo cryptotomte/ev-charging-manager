@@ -54,6 +54,10 @@ NAMES = {
     "spot": SPOT,
 }
 CHARGER = [PLUG, LOCK, TRX, ENERGY, POWER, CAR, ETO]
+# The order in which the charger's entities became valid at three restarts in the
+# owner's log (spec 027 § 2.4, § 13.1): this integration is set up first.
+FIELD_ORDER = ["plug", "lock", "trx", "power", "energy", "car", "eto"]
+PLUG_LAST = ["energy", "power", "trx", "lock", "car", "eto", "plug"]
 DAY = "2026-11-17"
 
 # trx value = card_index + 1
@@ -300,7 +304,13 @@ class Rig:
         return snapshot_on_disk(self.storage)
 
     def money(self) -> list[dict]:
-        """What § 6.3 compares, per completed session: event and record side by side."""
+        """What § 6.3 compares, per completed session: event and record side by side.
+
+        Also holds every comparison to one stored record per completed event and no
+        active snapshot left behind (spec 027 § 13.3).
+        """
+        assert len(self.records()) == len(self.completed), "one record per completed event"
+        assert self.snapshot() is None, "an active snapshot was left behind"
         out = []
         records = {r["id"]: r for r in self.records()}
         for ev in self.completed:
@@ -341,13 +351,16 @@ def restart(
     during: Interruption | None = None,
     order: list[str] | None = None,
     absent: list[str] | None = None,
+    spot_late: bool = False,
 ) -> Interruption:
     """An orderly stop or a crash followed by a new setup (see the module docstring).
 
     entities: "present" = the charger's entities have their values at setup; "late" = they
-        are absent at setup and appear afterwards one by one in ``order`` (short names).
+        are absent at setup and appear afterwards one by one in ``order`` (short names,
+        default ``FIELD_ORDER``).
     during: runs while the integration is down (time passes, the charger changes).
     absent: which entities are absent for "late" (default: all charger entities).
+    spot_late: the spot price entity is absent at setup as well and appears last.
     """
 
     async def _restart(rig: Rig) -> None:
@@ -360,16 +373,18 @@ def restart(
         if during is not None:
             await during(rig)
         saved: dict[str, str] = {}
-        if entities == "late":
-            for eid in [NAMES[n] for n in absent] if absent else CHARGER:
-                state = hass.states.get(eid)
-                if state is not None:
-                    saved[eid] = state.state
-                    hass.states.async_remove(eid)
-            await hass.async_block_till_done()
+        names = (absent or FIELD_ORDER) if entities == "late" else []
+        if spot_late:
+            names = [*names, "spot"]
+        for eid in [NAMES[n] for n in names]:
+            state = hass.states.get(eid)
+            if state is not None:
+                saved[eid] = state.state
+                hass.states.async_remove(eid)
+        await hass.async_block_till_done()
         await hass.config_entries.async_setup(rig.entry.entry_id)
         await hass.async_block_till_done()
-        default = ["plug", "lock", "trx", "power", "energy", "car", "eto", "spot"]
+        default = [*FIELD_ORDER, "spot"]
         for eid in [NAMES[n] for n in (default if order is None else order)]:
             if eid in saved:
                 hass.states.async_set(eid, saved[eid])
@@ -502,5 +517,5 @@ INTERRUPTIONS: dict[str, Interruption | None] = {
     "none": None,
     "reload": reload,
     "restart-present": restart(),
-    "restart-late": restart("late"),
+    "restart-late": restart("late"),  # FIELD_ORDER
 }

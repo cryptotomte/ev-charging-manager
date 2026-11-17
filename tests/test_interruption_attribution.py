@@ -7,16 +7,23 @@ named in each test.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.ev_charging_manager.charger_profiles import CHARGER_PROFILES
 from custom_components.ev_charging_manager.const import (
     DEFERRED_RECOVERY_TIMEOUT_MIN,
+    RECOVERY_INPUT_WAIT_S,
     SessionEngineState,
     SessionSubState,
 )
 from tests.session_rig import (
+    FIELD_ORDER,
     INTERRUPTIONS,
+    PLUG_LAST,
     TRX_GFIX,
     TRX_PAUL,
     Interruption,
@@ -263,13 +270,21 @@ async def test_rt20_snapshot_without_card_and_a_card_now_present(
     ]
 
 
+async def _tick(rig: Rig, seconds: int) -> None:
+    rig.freezer.tick(timedelta(seconds=seconds))
+    async_fire_time_changed(rig.hass, dt_util.utcnow())
+    await rig.hass.async_block_till_done()
+
+
 async def test_rt21_recovery_waits_for_the_rfid_entity(hass, hass_storage, freezer) -> None:
-    """RT-21: plug valid, RFID entity not yet: recovery and the engine wait; when the
-    guest's card appears the snapshot splits as in RT-17."""
+    """RT-21 (D-49): plug valid, RFID entity a few seconds late: the decision waits and
+    nothing starts meanwhile; when the guest's card appears the snapshot splits as in
+    RT-17."""
     late_trx = ["plug", "lock", "power", "energy", "car", "eto"]
 
     async def interruption(rig: Rig) -> None:
         await restart("late", during=_swap_users_while_down, order=late_trx)(rig)
+        await _tick(rig, 5)
         engine = rig.engine
         assert engine.state == SessionEngineState.IDLE
         assert engine.active_session is None
@@ -282,24 +297,106 @@ async def test_rt21_recovery_waits_for_the_rfid_entity(hass, hass_storage, freez
     assert _summary(rig) == [("Paul", 3.0, 7.5, None, 3.0), GUEST_2KWH]
 
 
-async def test_rt21_timeout_still_completes_the_snapshot(hass, hass_storage, freezer) -> None:
-    """RT-21: the RFID entity never becomes valid: after the timeout the snapshot is
-    completed with its own energy, and the cable gets its normal plug-on handling."""
+async def test_rt21_rfid_entity_never_valid_resumes_after_the_wait(
+    hass, hass_storage, freezer
+) -> None:
+    """RT-21 (D-49): the RFID entity never becomes valid: after RECOVERY_INPUT_WAIT_S the
+    snapshot is resumed (no card is no evidence), and the session ends as uninterrupted."""
+
+    async def interruption(rig: Rig) -> None:
+        await restart("late", absent=["trx"], order=[])(rig)
+        await _tick(rig, RECOVERY_INPUT_WAIT_S - 1)
+        assert rig.engine.active_session is None, "the decision is still waiting"
+        await _tick(rig, 2)
+        assert rig.engine.active_session.user_name == "Paul"
+
+    assert RECOVERY_INPUT_WAIT_S == 30
     rig = Rig(hass, freezer, hass_storage)
+    await scenario_a(rig, TRX_PAUL, {"mid": interruption})
+    assert _summary(rig) == [("Paul", 4.0, 10.0, None, 4.0)]
+    assert len(rig.started) == 1
+
+
+async def test_rt21_plug_off_with_the_rfid_entity_invalid_completes_at_once(
+    hass, hass_storage, freezer
+) -> None:
+    """RT-21 (D-49): the car left during the outage and the RFID entity is missing: the
+    plug alone decides, the snapshot is completed at setup without any wait."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:22:00")
+
+    async def leaves(rig: Rig) -> None:
+        await rig.set(energy=3.8, power=0)
+        await rig.unplug()
+
+    await restart("late", during=leaves, absent=["trx"], order=[])(rig)
+    assert _summary(rig) == [("Paul", 3.8, 9.5, None, 3.8)]
+
+
+async def test_d49_plug_off_energy_never_valid_completes_after_the_wait(
+    hass, hass_storage, freezer
+) -> None:
+    """D-49: plug off and the energy entity never valid: after RECOVERY_INPUT_WAIT_S the
+    snapshot is completed with its own energy (3.0 kWh at the 10:20 save)."""
+    rig = Rig(hass, freezer, hass_storage)
+    await rig.setup()
+    await rig.goto("10:06:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:12:00")
+    await rig.set(energy=1.0)
+    await rig.goto("10:18:00")
+    await rig.set(energy=3.0)
+    await rig.goto("10:22:00")
+
+    async def leaves(rig: Rig) -> None:
+        await rig.set(energy=3.8, power=0)
+        await rig.unplug()
+
+    await restart("late", during=leaves, absent=["energy"], order=[])(rig)
+    await _tick(rig, RECOVERY_INPUT_WAIT_S - 1)
+    assert rig.completed == [], "the completion waits for the energy entity"
+    await _tick(rig, 2)
+    assert _summary(rig) == [("Paul", 3.0, 7.5, None, 3.0)]
+
+
+async def _counter_moves_while_down(rig: Rig) -> None:
+    await rig.set(energy=2.5)
+
+
+@pytest.mark.parametrize("pricing", ["static", "spot"])
+async def test_rt21_timeout_still_completes_the_snapshot(
+    hass, hass_storage, freezer, pricing
+) -> None:
+    """RT-21 / D-49: the plug entity never becomes valid: after the 60-minute timeout the
+    snapshot is completed with the counter, which moved on to 2.5 kWh during the outage
+    (D-52), and the spot energy is billed once in the stored hour (D-39)."""
+    rig = Rig(hass, freezer, hass_storage, pricing=pricing)
     await rig.setup()
     await rig.goto("10:06:00")
     await rig.plug_in(TRX_PAUL)
     await rig.goto("10:12:00")
     await rig.set(energy=1.5)
     await rig.goto("10:15:30")  # the periodic save at 10:15 holds 1.5 kWh
-    await restart("late", absent=["trx"], order=[])(rig)
+    await restart("late", during=_counter_moves_while_down, absent=["plug"], order=[])(rig)
     assert rig.engine.active_session is None and rig.completed == []
 
     assert DEFERRED_RECOVERY_TIMEOUT_MIN == 60
     await rig.goto("11:16:30")
 
-    assert _summary(rig) == [("Paul", 1.5, 3.75, None, 1.5)]
-    assert rig.engine.get_status_sub_state() == SessionSubState.WAITING_FOR_RFID
+    cost = 6.25 if pricing == "static" else 2.5
+    assert _summary(rig) == [("Paul", 2.5, cost, None, 2.5)]
+    if pricing == "spot":
+        (money,) = rig.money()
+        assert money["details"] == [("10:00", 2.5, 1.0, False)]
+        assert money["details_kwh"] == 2.5
+    assert rig.engine.state == SessionEngineState.IDLE
 
 
 async def scenario_v(rig: Rig, interruption: Interruption | None) -> None:
@@ -375,8 +472,9 @@ async def test_rt23_cable_and_card_in_at_setup_without_snapshot(
 
 
 async def test_rt24_cable_in_while_recovery_is_deferred(hass, hass_storage, freezer) -> None:
-    """RT-24: with the RFID entity missing at setup the recovery defers and D-46 does not
-    run: no RFID wait, and power flowing meanwhile starts no session."""
+    """RT-24: with the RFID entity missing at setup the recovery waits (D-49) and the
+    cable-in handling does not run: no RFID wait, and power flowing meanwhile starts no
+    session."""
 
     async def interruption(rig: Rig) -> None:
         await restart("late", absent=["trx"], order=[])(rig)
@@ -404,8 +502,18 @@ async def _guest_leaves(rig: Rig, *, after_unplug: str | None, fire: bool = True
     await rig.goto("10:45:00", fire=fire)
 
 
-async def scenario_u(rig: Rig, trx: str, *, after_unplug: str | None, interrupted: bool):
-    """Research 027 scenario U: the car leaves at 10:30 with 3.8 kWh (down 10:22–10:45)."""
+async def scenario_u(
+    rig: Rig,
+    trx: str,
+    *,
+    after_unplug: str | None,
+    interrupted: bool,
+    order: list[str] | None = None,
+):
+    """Research 027 scenario U: the car leaves at 10:30 with 3.8 kWh (down 10:22–10:45).
+
+    ``order``: the charger's entities appear after setup in this order (restart-late).
+    """
     await rig.setup()
     await rig.goto("10:06:00")
     await rig.plug_in(trx)
@@ -421,29 +529,42 @@ async def scenario_u(rig: Rig, trx: str, *, after_unplug: str | None, interrupte
         async def during(rig: Rig) -> None:
             await _guest_leaves(rig, after_unplug=after_unplug, fire=False)
 
-        await restart(during=during)(rig)
+        if order is None:
+            await restart(during=during)(rig)
+        else:
+            await restart("late", during=during, order=order)(rig)
     await rig.goto("10:46:00")
 
 
-@pytest.mark.parametrize("intr", ["none", "restart-present"])
+LATE_ORDERS = {"none": None, "restart-present": None, **{
+    "restart-late-field": FIELD_ORDER, "restart-late-pluglast": PLUG_LAST,
+}}  # fmt: skip
+
+
+@pytest.mark.parametrize("intr", list(LATE_ORDERS))
 async def test_rt25_car_left_counter_kept(hass, hass_storage, freezer, intr) -> None:
     """RT-25: energy from the final counter (D-47), cost recomputed (D-37), charger
-    totals present. Allowed difference: the end time is the start-up time."""
+    totals present, in every start order (D-49 waits for the energy entity when the
+    plug comes first). Allowed differences: the end time is the start-up time; in the
+    field order the lifetime counter is not yet valid when the energy decides, so the
+    record has no charger total after."""
     rig = Rig(hass, freezer, hass_storage)
-    await scenario_u(rig, TRX_PAUL, after_unplug=None, interrupted=intr != "none")
+    await scenario_u(
+        rig, TRX_PAUL, after_unplug=None, interrupted=intr != "none", order=LATE_ORDERS[intr]
+    )
     assert _summary(rig) == [("Paul", 3.8, 9.5, None, 3.8)]
     (record,) = rig.records()
-    assert (record["charger_total_before_kwh"], record["charger_total_after_kwh"]) == (
-        1000.0,
-        1003.8,
-    )
+    totals = (record["charger_total_before_kwh"], record["charger_total_after_kwh"])
+    assert totals == ((1000.0, None) if intr == "restart-late-field" else (1000.0, 1003.8))
 
 
-@pytest.mark.parametrize("intr", ["none", "restart-present"])
+@pytest.mark.parametrize("intr", list(LATE_ORDERS))
 async def test_rt25_spot_car_left_closes_the_stored_hour(hass, hass_storage, freezer, intr):
     """RT-25, spot (D-39): the remaining energy closes into the stored hour at its price."""
     rig = Rig(hass, freezer, hass_storage, pricing="spot")
-    await scenario_u(rig, TRX_PAUL, after_unplug=None, interrupted=intr != "none")
+    await scenario_u(
+        rig, TRX_PAUL, after_unplug=None, interrupted=intr != "none", order=LATE_ORDERS[intr]
+    )
     (money,) = rig.money()
     assert money["details"] == [("10:00", 3.8, 1.0, False)]
     assert (money["energy"], money["cost"], money["details_kwh"]) == (3.8, 3.8, 3.8)

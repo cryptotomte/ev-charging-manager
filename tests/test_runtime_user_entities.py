@@ -7,6 +7,8 @@ registry, the state machine and the stats store.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from types import MappingProxyType
 from unittest.mock import AsyncMock, patch
 
@@ -14,6 +16,7 @@ import pytest
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import slugify
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_capture_events
@@ -22,6 +25,11 @@ from custom_components.ev_charging_manager.const import (
     DOMAIN,
     EVENT_SESSION_COMPLETED,
     STATS_STORE_KEY,
+)
+from custom_components.ev_charging_manager.sensor import (
+    async_add_user_stats_sensors,
+    async_remove_user_stats_sensors,
+    async_rename_user_stats_sensors,
 )
 
 from .conftest import (
@@ -170,12 +178,16 @@ async def test_add_user_during_session_keeps_session(hass: HomeAssistant) -> Non
 
 
 async def _add_rfid(hass: HomeAssistant, entry: MockConfigEntry, index: int, user_id: str) -> None:
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "rfid_mapping"), context={"source": "user"}
-    )
-    await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"card_index": str(index), "user_id": user_id}
-    )
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=None,
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+        )
+        await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"card_index": str(index), "user_id": user_id}
+        )
     await hass.async_block_till_done()
 
 
@@ -457,3 +469,221 @@ async def test_delete_legacy_user_named_unknown_keeps_unknown_bucket(hass: HomeA
 
     assert _engine(hass, entry).user_stats["Unknown"].total_energy_kwh == 3.0
     assert _entity_ids(hass, entry, "Unknown") == entity_ids
+
+
+# ---------------------------------------------------------------------------
+# D-25: overlapping listener runs, failures, unload
+# ---------------------------------------------------------------------------
+
+
+def _slow_saves(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """Make each stats store save yield to the loop, like a real executor write."""
+    store = _engine(hass, entry)._stats_store
+    save = store.async_save
+
+    async def slow(*args, **kwargs):
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await save(*args, **kwargs)
+
+    store.async_save = slow
+
+
+def _sub(entry: MockConfigEntry, name: str) -> ConfigSubentry:
+    return next(
+        s for s in entry.subentries.values() if s.subentry_type == "user" and s.data["name"] == name
+    )
+
+
+def _api_rename(hass: HomeAssistant, entry: MockConfigEntry, old: str, new: str) -> None:
+    sub = _sub(entry, old)
+    hass.config_entries.async_update_subentry(entry, sub, data={**sub.data, "name": new}, title=new)
+
+
+def _assert_consistent(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """Registry entries, live sensors and tracked sensors match the configured users."""
+    names = {
+        s.subentry_id: s.data["name"]
+        for s in entry.subentries.values()
+        if s.subentry_type == "user"
+    }
+    holders = [*names.values(), "Unknown"]
+    registry = er.async_get(hass)
+    guest_totals = {f"{entry.entry_id}_guest_total_energy", f"{entry.entry_id}_guest_total_cost"}
+    assert {
+        e.unique_id
+        for e in er.async_entries_for_config_entry(registry, entry.entry_id)
+        if e.unique_id.endswith(_METRICS) and e.unique_id not in guest_totals
+    } == {f"{entry.entry_id}_{slugify(n)}_{m}" for n in holders for m in _METRICS}
+    live = [
+        e._user_name
+        for platform in entity_platform.async_get_platforms(hass, DOMAIN)
+        for e in platform.entities.values()
+        if hasattr(e, "_user_name")
+    ]
+    assert sorted(live) == sorted(n for n in holders for _ in _METRICS)
+    tracked = hass.data[DOMAIN][entry.entry_id]["stats_platform"]["user_entities"]
+    assert {sid: {s._user_name for s in sensors} for sid, sensors in tracked.items()} == {
+        sid: {n} for sid, n in names.items()
+    }
+    assert all(s.hass is not None for sensors in tracked.values() for s in sensors)
+
+
+async def test_interleaved_double_rename_with_leftover(hass: HomeAssistant) -> None:
+    """D-25: two renames within one store write end under the final name, leftover retired."""
+    entry = await _setup(hass, _user("Anna"))
+    await _completed(hass, "Anna", 4.0, 10.0)
+    await _completed(hass, "Bea", 9.0, 90.0, "guest")
+    _slow_saves(hass, entry)
+
+    _api_rename(hass, entry, "Anna", "Bea")
+    _api_rename(hass, entry, "Bea", "Cia")
+    await hass.async_block_till_done()
+
+    engine = _engine(hass, entry)
+    assert set(engine.user_stats) == {"Cia", "Unknown"}
+    assert engine.user_stats["Cia"].total_energy_kwh == 4.0
+    assert engine.guest_retired == {"energy_kwh": 9.0, "cost_kr": 90.0}
+    _assert_consistent(hass, entry)
+
+
+async def test_interleaved_rename_then_delete(hass: HomeAssistant) -> None:
+    """D-25: a rename and a delete of the same user within one store write leave nothing behind."""
+    entry = await _setup(hass, _user("Anna"), _user("Other"))
+    await _completed(hass, "Anna", 4.0, 10.0)
+    _slow_saves(hass, entry)
+
+    _api_rename(hass, entry, "Anna", "Bea")
+    hass.config_entries.async_remove_subentry(entry, _sub(entry, "Bea").subentry_id)
+    await hass.async_block_till_done()
+
+    assert set(_engine(hass, entry).user_stats) == {"Unknown"}
+    _assert_consistent(hass, entry)
+
+
+async def test_interleaved_add_then_rename(hass: HomeAssistant) -> None:
+    """D-25: an add (removing a leftover) and an immediate rename end under the final name."""
+    entry = await _setup(hass)
+    await _completed(hass, "Dan", 2.0, 5.0)
+    _slow_saves(hass, entry)
+
+    hass.config_entries.async_add_subentry(
+        entry,
+        ConfigSubentry(
+            data=MappingProxyType({"name": "Dan", "type": "regular", "active": True}),
+            subentry_type="user",
+            title="Dan",
+            unique_id=None,
+        ),
+    )
+    _api_rename(hass, entry, "Dan", "Dave")
+    await hass.async_block_till_done()
+
+    assert set(_engine(hass, entry).user_stats) == {"Unknown"}
+    _assert_consistent(hass, entry)
+    await _completed(hass, "Dave", 1.0, 2.0)
+    assert _state(hass, _entity_ids(hass, entry, "Dave")[0]) == "1.0"
+
+
+async def test_failed_user_work_is_logged_and_others_continue(hass: HomeAssistant, caplog) -> None:
+    """D-25: one user's failing work is logged with traceback; the rest and the sync still run."""
+    entry = await _setup(hass, _user("Paul"))
+    await _completed(hass, "Paul", 4.0, 10.0)
+    # A user the snapshot still holds, so this run handles two removed users.
+    domain_data = hass.data[DOMAIN][entry.entry_id]
+    domain_data["prev_subentries"]["ghost"] = {
+        "subentry_type": "user",
+        "data": {"name": "Ghost", "type": "regular", "active": True},
+    }
+    cascade = "custom_components.ev_charging_manager.async_cascade_delete_user"
+
+    async def failing_cascade(hass, entry, sid):
+        if sid == "ghost":
+            raise RuntimeError("boom")
+
+    with patch(cascade, side_effect=failing_cascade):
+        await _delete_user(hass, entry, "Paul")
+
+    assert "Paul" not in _engine(hass, entry).user_stats
+    assert _entity_ids(hass, entry, "Paul") == [None] * 5
+    assert domain_data["config_store"].data["users"] == []
+    failures = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(failures) == 1
+    assert "ghost" in failures[0].getMessage()
+    assert failures[0].exc_info is not None
+
+
+async def test_unload_during_listener_run(hass: HomeAssistant, caplog) -> None:
+    """D-25: unloading while a run is suspended in a save ends the run without errors."""
+    entry = await _setup(hass)
+    await _completed(hass, "Dan", 2.0, 5.0)
+    _slow_saves(hass, entry)
+
+    hass.config_entries.async_add_subentry(
+        entry,
+        ConfigSubentry(
+            data=MappingProxyType({"name": "Dan", "type": "regular", "active": True}),
+            subentry_type="user",
+            title="Dan",
+            unique_id=None,
+        ),
+    )
+    hass.async_create_task(hass.config_entries.async_unload(entry.entry_id))
+    await hass.async_block_till_done()
+
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+async def test_run_waiting_for_the_lock_stops_after_unload(hass: HomeAssistant) -> None:
+    """D-25: a run that gets the lock after the entry was unloaded does no work."""
+    entry = await _setup(hass)
+    await _completed(hass, "Dan", 2.0, 5.0)
+    engine = _engine(hass, entry)
+    lock = hass.data[DOMAIN][entry.entry_id]["listener_lock"]
+
+    with patch.object(engine, "async_remove_user", wraps=engine.async_remove_user) as remove:
+        await lock.acquire()
+        hass.config_entries.async_add_subentry(
+            entry,
+            ConfigSubentry(
+                data=MappingProxyType({"name": "Dan", "type": "regular", "active": True}),
+                subentry_type="user",
+                title="Dan",
+                unique_id=None,
+            ),
+        )
+        for _ in range(10):  # not block_till_done: the run waits for the held lock
+            await asyncio.sleep(0)
+        await hass.config_entries.async_unload(entry.entry_id)
+        lock.release()
+        await hass.async_block_till_done()
+
+    remove.assert_not_called()
+
+
+async def test_config_store_synced_before_statistics_work(hass: HomeAssistant) -> None:
+    """D-25: a session starting while the statistics work waits already sees the new name."""
+    entry = await _setup(hass, _user("Paul"))
+    domain_data = hass.data[DOMAIN][entry.entry_id]
+    lock = domain_data["listener_lock"]
+
+    await lock.acquire()
+    _api_rename(hass, entry, "Paul", "Pelle")
+    for _ in range(10):  # not block_till_done: the run waits for the held lock
+        await asyncio.sleep(0)
+    names = [u["name"] for u in domain_data["config_store"].data["users"]]
+    lock.release()
+    await hass.async_block_till_done()
+
+    assert names == ["Pelle"]
+
+
+async def test_stats_sensor_helpers_without_platform_data(hass: HomeAssistant) -> None:
+    """D-25: the three runtime helpers do nothing when the entry's data is gone."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CHARGER_DATA)
+
+    async_add_user_stats_sensors(hass, entry, "sid", "Paul")
+    async_remove_user_stats_sensors(hass, entry, "sid", "Paul", remove_registry=True)
+    await async_rename_user_stats_sensors(hass, entry, "sid", "Paul", "Pelle", move_registry=True)
+
+    assert DOMAIN not in hass.data

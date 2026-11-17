@@ -91,11 +91,16 @@ async def async_setup_entry(
 # the format stays defined in one place (stats_sensor.py).
 
 
+def _stats_platform(hass: HomeAssistant, entry: ConfigEntry) -> dict | None:
+    # The entry's data is gone once it is unloaded, possibly while the listener waits.
+    return hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("stats_platform")
+
+
 def async_add_user_stats_sensors(
     hass: HomeAssistant, entry: ConfigEntry, subentry_id: str, user_name: str
 ) -> None:
     """Create and add one user's five statistics sensors (D-4)."""
-    platform = hass.data[DOMAIN][entry.entry_id].get("stats_platform")
+    platform = _stats_platform(hass, entry)
     if platform is None:
         return
     sensors = create_user_stats_sensors(hass, entry, user_name)
@@ -114,7 +119,7 @@ def async_remove_user_stats_sensors(
 
     Removing by unique_id also covers entities the user had disabled.
     """
-    platform = hass.data[DOMAIN][entry.entry_id].get("stats_platform")
+    platform = _stats_platform(hass, entry)
     if platform is None:
         return
     platform["user_entities"].pop(subentry_id, None)
@@ -140,7 +145,7 @@ async def async_rename_user_stats_sensors(
     holding a target unique_id is a leftover (D-10 keeps the new slug unique) and
     is removed first.
     """
-    platform = hass.data[DOMAIN][entry.entry_id].get("stats_platform")
+    platform = _stats_platform(hass, entry)
     if platform is None:
         return
     if move_registry:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -55,7 +56,7 @@ def _snapshot_subentries(entry: ConfigEntry) -> dict[str, dict]:
 
 
 async def _on_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle config entry updates (subentry add/edit/delete), in the order of spec 026 § 6.2.
+    """Handle config entry updates (subentry add/edit/delete) per spec 026 § 6.2 and D-25.
 
     Never reloads the entry: a reload during a session loses money (spec 026 D-2).
     """
@@ -90,7 +91,35 @@ async def _on_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
         if sid in prev_names and prev_names[sid] != name
     }
     added = {sid: name for sid, name in names.items() if sid not in prev_names}
-    stats_engine: StatsEngine = domain_data["stats_engine"]
+
+    # D-25: sessions starting from here on see the new users and mappings, even
+    # if the statistics work below fails or waits for an earlier run.
+    await config_store.async_sync_from_subentries(entry)
+
+    # D-25: each run's statistics and entity work runs whole, one run at a time.
+    # The runs started by the RFID cascade queue here as separate tasks; the
+    # holder never awaits them, so they cannot deadlock.
+    async with domain_data["listener_lock"]:
+        if (
+            entry.state is not ConfigEntryState.LOADED
+            or hass.data.get(DOMAIN, {}).get(entry.entry_id) is not domain_data
+        ):
+            return
+        await _async_update_user_statistics(
+            hass, entry, domain_data["stats_engine"], names, removed, renamed, added
+        )
+
+
+async def _async_update_user_statistics(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    stats_engine: StatsEngine,
+    names: dict[str, str],
+    removed: dict[str, dict],
+    renamed: dict[str, tuple[str, str]],
+    added: dict[str, str],
+) -> None:
+    """Steps 4-6 of spec 026 § 6.2. A failure for one user does not stop the others (D-25)."""
 
     def others(sid: str) -> tuple[set[str], set[str]]:
         """Exact names and slugs of the other configured users.
@@ -102,49 +131,55 @@ async def _on_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
         return other_names, {slugify(n) for n in other_names}
 
     for sid, info in removed.items():
-        if info["subentry_type"] == SUBENTRY_TYPE_USER:
-            _LOGGER.debug("User subentry %s removed, cascading delete", sid)
-            await async_cascade_delete_user(hass, entry, sid)
-            name = info["data"]["name"]
-            other_names, other_slugs = others(sid)
-            async_remove_user_stats_sensors(
-                hass, entry, sid, name, remove_registry=slugify(name) not in other_slugs
-            )
-            if name not in other_names:
-                await stats_engine.async_remove_user(name)
-        elif info["subentry_type"] == SUBENTRY_TYPE_VEHICLE:
-            _LOGGER.debug("Vehicle subentry %s removed, cascading delete", sid)
-            await async_cascade_delete_vehicle(hass, entry, sid)
-        else:
-            _LOGGER.debug("RFID mapping subentry %s removed (no cascade)", sid)
+        try:
+            if info["subentry_type"] == SUBENTRY_TYPE_USER:
+                _LOGGER.debug("User subentry %s removed, cascading delete", sid)
+                await async_cascade_delete_user(hass, entry, sid)
+                name = info["data"]["name"]
+                other_names, other_slugs = others(sid)
+                async_remove_user_stats_sensors(
+                    hass, entry, sid, name, remove_registry=slugify(name) not in other_slugs
+                )
+                if name not in other_names:
+                    await stats_engine.async_remove_user(name)
+            elif info["subentry_type"] == SUBENTRY_TYPE_VEHICLE:
+                _LOGGER.debug("Vehicle subentry %s removed, cascading delete", sid)
+                await async_cascade_delete_vehicle(hass, entry, sid)
+            else:
+                _LOGGER.debug("RFID mapping subentry %s removed (no cascade)", sid)
+        except Exception:
+            _LOGGER.exception("Updating statistics for removed subentry %s failed", sid)
 
     for sid, (old_name, new_name) in renamed.items():
-        other_names, other_slugs = others(sid)
-        # D-9: a bucket already under the new name is a leftover, not this user's.
-        if new_name not in other_names:
-            await stats_engine.async_remove_user(new_name)
-        if old_name not in other_names:
-            await stats_engine.async_rename_user(old_name, new_name)
-        old_slug = slugify(old_name)
-        await async_rename_user_stats_sensors(
-            hass,
-            entry,
-            sid,
-            old_name,
-            new_name,
-            move_registry=old_slug != slugify(new_name) and old_slug not in other_slugs,
-        )
+        try:
+            other_names, other_slugs = others(sid)
+            # D-9: a bucket already under the new name is a leftover, not this user's.
+            if new_name not in other_names:
+                await stats_engine.async_remove_user(new_name)
+            if old_name not in other_names:
+                await stats_engine.async_rename_user(old_name, new_name)
+            old_slug = slugify(old_name)
+            await async_rename_user_stats_sensors(
+                hass,
+                entry,
+                sid,
+                old_name,
+                new_name,
+                move_registry=old_slug != slugify(new_name) and old_slug not in other_slugs,
+            )
+        except Exception:
+            _LOGGER.exception("Updating statistics for renamed user %s failed", sid)
 
     for sid, name in added.items():
-        other_names, other_slugs = others(sid)
-        if name not in other_names:  # D-9
-            await stats_engine.async_remove_user(name)
-        # Another user's sensors already hold this slug's unique_ids (legacy data).
-        if slugify(name) not in other_slugs:
-            async_add_user_stats_sensors(hass, entry, sid, name)
-
-    # Sync ConfigStore from subentries (source of truth)
-    await config_store.async_sync_from_subentries(entry)
+        try:
+            other_names, other_slugs = others(sid)
+            if name not in other_names:  # D-9
+                await stats_engine.async_remove_user(name)
+            # Another user's sensors already hold this slug's unique_ids (legacy data).
+            if slugify(name) not in other_slugs:
+                async_add_user_stats_sensors(hass, entry, sid, name)
+        except Exception:
+            _LOGGER.exception("Updating statistics for added user %s failed", sid)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -165,6 +200,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id]["config_store"] = config_store
     hass.data[DOMAIN][entry.entry_id]["prev_subentries"] = _snapshot_subentries(entry)
+    hass.data[DOMAIN][entry.entry_id]["listener_lock"] = asyncio.Lock()
 
     # Register update listener for subentry changes
     entry.async_on_unload(entry.add_update_listener(_on_entry_updated))

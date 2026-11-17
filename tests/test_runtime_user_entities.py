@@ -34,11 +34,14 @@ from custom_components.ev_charging_manager.sensor import (
 )
 
 from .conftest import (
+    ENGINE_PROFILES,
     MOCK_CHARGER_DATA,
     MOCK_ENERGY_ENTITY,
     setup_session_engine,
     start_charging_session,
+    start_profile_session,
     stop_charging_session,
+    stop_profile_session,
 )
 
 _METRICS = ("total_energy", "total_cost", "session_count", "avg_session_energy", "last_session")
@@ -52,10 +55,10 @@ def _user(name: str, user_type: str = "regular") -> dict:
     return {"data": data, "subentry_type": "user", "title": name, "unique_id": None}
 
 
-async def _setup(hass: HomeAssistant, *users: dict) -> MockConfigEntry:
+async def _setup(hass: HomeAssistant, *users: dict, profile: str = "generic") -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data=MOCK_CHARGER_DATA,
+        data={**MOCK_CHARGER_DATA, "charger_profile": profile},
         options=_NO_FILTER_OPTIONS,
         title="My go-e Charger",
         subentries_data=list(users),
@@ -157,11 +160,12 @@ async def test_add_user_creates_sensors_without_reload(hass: HomeAssistant) -> N
         assert _state(hass, entity_id) == STATE_UNAVAILABLE
 
 
-async def test_add_user_during_session_keeps_session(hass: HomeAssistant) -> None:
+@pytest.mark.parametrize("profile", ENGINE_PROFILES)
+async def test_add_user_during_session_keeps_session(hass: HomeAssistant, profile: str) -> None:
     """T-28: the running session object, its energy and its cost continue unchanged."""
-    entry = await _setup(hass, _user("Petra"))
+    entry = await _setup(hass, _user("Petra"), profile=profile)
     await _add_rfid(hass, entry, 1, _sid(hass, entry, "Petra"))
-    await start_charging_session(hass, trx_value="2")
+    await start_profile_session(hass, profile)
     hass.states.async_set(MOCK_ENERGY_ENTITY, "1.0")
     await hass.async_block_till_done()
     engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
@@ -347,6 +351,7 @@ async def test_delete_user_sharing_slug_keeps_sensors(hass: HomeAssistant) -> No
 async def test_rename_moves_bucket_and_sensors(hass: HomeAssistant, hass_storage) -> None:
     """T-34: bucket and registry entries follow the new name; entity ids stay."""
     entry = await _setup(hass, _user("Paul"))
+    await _add_rfid(hass, entry, 1, _sid(hass, entry, "Paul"))
     await _completed(hass, "Paul", 4.0, 10.0)
     before = _engine(hass, entry).user_stats["Paul"].to_dict()
     entity_ids = _entity_ids(hass, entry, "Paul")
@@ -361,7 +366,15 @@ async def test_rename_moves_bucket_and_sensors(hass: HomeAssistant, hass_storage
     assert _entity_ids(hass, entry, "Pelle") == entity_ids
     assert _state(hass, entity_ids[0]) == "4.0"
 
-    await _completed(hass, "Pelle", 2.0, 5.0)
+    completed = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+    await start_charging_session(hass, trx_value="2")
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "2.0")
+    await hass.async_block_till_done()
+    await stop_charging_session(hass)
+
+    assert [e.data["user_name"] for e in completed] == ["Pelle"]
+    assert _engine(hass, entry).user_stats["Pelle"].total_energy_kwh == pytest.approx(6.0)
+    assert _stored(hass_storage)["user_stats"]["Pelle"]["user_name"] == "Pelle"
     assert _state(hass, entity_ids[0]) == "6.0"
 
 
@@ -440,18 +453,18 @@ async def test_add_user_with_existing_exact_name_keeps_bucket(hass: HomeAssistan
     assert _state(hass, _entity_ids(hass, entry, "Paul")[0]) == "4.0"
 
 
-async def test_delete_user_during_session(hass: HomeAssistant) -> None:
+@pytest.mark.parametrize("profile", ENGINE_PROFILES)
+async def test_delete_user_during_session(hass: HomeAssistant, profile: str) -> None:
     """T-40: the session completes under the old name and re-creates its bucket."""
-    entry = await _setup(hass, _user("Petra"))
+    entry = await _setup(hass, _user("Petra"), profile=profile)
     await _add_rfid(hass, entry, 1, _sid(hass, entry, "Petra"))
     completed = async_capture_events(hass, EVENT_SESSION_COMPLETED)
-    await start_charging_session(hass, trx_value="2")
+    await start_profile_session(hass, profile)
     hass.states.async_set(MOCK_ENERGY_ENTITY, "2.0")
     await hass.async_block_till_done()
 
     await _delete_user(hass, entry, "Petra")
-    await stop_charging_session(hass)
-    await hass.async_block_till_done()
+    await stop_profile_session(hass, profile)
 
     assert [e.data["user_name"] for e in completed] == ["Petra"]
     assert _engine(hass, entry).user_stats["Petra"].total_energy_kwh == pytest.approx(2.0)
@@ -513,6 +526,118 @@ async def test_delete_legacy_user_named_unknown_keeps_unknown_bucket(hass: HomeA
 
     assert _engine(hass, entry).user_stats["Unknown"].total_energy_kwh == 3.0
     assert _entity_ids(hass, entry, "Unknown") == entity_ids
+
+
+async def test_guest_rename_end_to_end(hass: HomeAssistant) -> None:
+    """D-7 through the two-step guest flow: the bucket stays a guest's; guest totals unchanged."""
+    entry = await _setup(hass, _user("Visitor", "guest"))
+    await _completed(hass, "Visitor", 10.0, 45.0, "guest")
+    totals = [
+        er.async_get(hass).async_get_entity_id(
+            "sensor", DOMAIN, f"{entry.entry_id}_guest_total_{m}"
+        )
+        for m in ("energy", "cost")
+    ]
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "user"),
+        context={"source": "reconfigure", "subentry_id": _sid(hass, entry, "Visitor")},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Gina", "active": True}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 4.0}
+    )
+    assert result["reason"] == "reconfigure_successful"
+    await hass.async_block_till_done()
+
+    engine = _engine(hass, entry)
+    assert "Visitor" not in engine.user_stats
+    assert (engine.user_stats["Gina"].user_type, engine.user_stats["Gina"].total_energy_kwh) == (
+        "guest",
+        10.0,
+    )
+    assert [_state(hass, entity_id) for entity_id in totals] == ["10.0", "45.0"]
+    assert engine.guest_retired == {"energy_kwh": 0.0, "cost_kr": 0.0}
+
+
+async def test_delete_and_rename_do_not_reload(hass: HomeAssistant) -> None:
+    """D-2: neither a rename nor a delete reloads the entry."""
+    entry = await _setup(hass, _user("Paul"), _user("Eva"))
+    engine = hass.data[DOMAIN][entry.entry_id]["session_engine"]
+
+    with patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload:
+        await _rename_user(hass, entry, "Paul", "Pelle")
+        await _delete_user(hass, entry, "Eva")
+
+    reload.assert_not_called()
+    assert hass.data[DOMAIN][entry.entry_id]["session_engine"] is engine
+
+
+# ---------------------------------------------------------------------------
+# D-11, D-12 through a real session (T-12)
+# ---------------------------------------------------------------------------
+
+
+async def _session_on_card_1(hass: HomeAssistant, profile: str) -> list:
+    completed = async_capture_events(hass, EVENT_SESSION_COMPLETED)
+    await start_profile_session(hass, profile)
+    hass.states.async_set(MOCK_ENERGY_ENTITY, "2.0")
+    await hass.async_block_till_done()
+    await stop_profile_session(hass, profile)
+    return completed
+
+
+@pytest.mark.parametrize("profile", ENGINE_PROFILES)
+async def test_blip_on_inactive_users_mapping_counts_as_unknown(
+    hass: HomeAssistant, profile: str
+) -> None:
+    """T-12, D-12: an active mapping of an inactive user starts an Unknown session."""
+    entry = await _setup(hass, _user("Petra"), profile=profile)
+    await _add_rfid(hass, entry, 1, _sid(hass, entry, "Petra"))
+    sub = _sub(entry, "Petra")
+    hass.config_entries.async_update_subentry(entry, sub, data={**sub.data, "active": False})
+    await hass.async_block_till_done()
+    mapping = next(s for s in entry.subentries.values() if s.subentry_type == "rfid_mapping")
+    assert mapping.data["active"] is True
+
+    completed = await _session_on_card_1(hass, profile)
+
+    assert [e.data["user_name"] for e in completed] == ["Unknown"]
+    stats = _engine(hass, entry).user_stats
+    assert stats["Unknown"].total_energy_kwh == pytest.approx(2.0)
+    assert "Petra" not in stats
+
+
+@pytest.mark.parametrize("profile", ENGINE_PROFILES)
+async def test_blip_after_guest_deactivation_counts_as_unknown(
+    hass: HomeAssistant, profile: str
+) -> None:
+    """T-12, D-11: after a guest is deactivated in the flow, its card starts an Unknown session."""
+    entry = await _setup(hass, _user("Visitor", "guest"), profile=profile)
+    await _add_rfid(hass, entry, 1, _sid(hass, entry, "Visitor"))
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "user"),
+        context={"source": "reconfigure", "subentry_id": _sid(hass, entry, "Visitor")},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Visitor", "active": False}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"guest_pricing_method": "fixed", "price_per_kwh": 4.0}
+    )
+    assert result["reason"] == "reconfigure_successful"
+    await hass.async_block_till_done()
+    mapping = next(s for s in entry.subentries.values() if s.subentry_type == "rfid_mapping")
+    assert (mapping.data["active"], mapping.data["deactivated_by"]) == (False, "user_cascade")
+
+    completed = await _session_on_card_1(hass, profile)
+
+    assert [e.data["user_name"] for e in completed] == ["Unknown"]
+    stats = _engine(hass, entry).user_stats
+    assert stats["Unknown"].total_energy_kwh == pytest.approx(2.0)
+    assert "Visitor" not in stats
 
 
 # ---------------------------------------------------------------------------

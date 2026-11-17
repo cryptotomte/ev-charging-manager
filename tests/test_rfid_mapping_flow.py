@@ -365,6 +365,38 @@ async def test_discovery_error_falls_back_to_manual(hass: HomeAssistant, caplog)
     assert "Cannot reach charger" in caplog.text
 
 
+async def test_unknown_charger_address_falls_back_to_manual(hass: HomeAssistant, caplog) -> None:
+    """D-15, X-3: no charger address -> manual form with discovery_failed and a WARNING."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**MOCK_CHARGER_DATA, "charger_profile": "goe_gemini", "charger_host": None},
+        title="My go-e Charger",
+    )
+    await setup_entry_with_subentries(hass, entry)
+    await _add_user(hass, entry.entry_id, "Paul")
+
+    with (
+        patch(
+            "custom_components.ev_charging_manager.config_flow.async_get_charger_host",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "custom_components.ev_charging_manager.config_flow.get_discovery_provider"
+        ) as get_provider,
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+        )
+
+    get_provider.assert_not_called()
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "manual"
+    assert result["errors"] == {"base": "discovery_failed"}
+    assert [
+        r.levelname for r in caplog.records if "cannot determine the charger address" in r.message
+    ] == ["WARNING"]
+
+
 async def test_unexpected_discovery_exception_falls_back_to_manual(
     hass: HomeAssistant, caplog
 ) -> None:

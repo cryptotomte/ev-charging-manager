@@ -354,7 +354,7 @@
             "step": {
                 "select_card": {
                     "title": "Discovered RFID Cards",
-                    "description": "The following RFID cards are programmed in your charger. Select a card to map it to a user. {last_uid}",
+                    "description": "The following RFID cards are programmed in your charger. Select a card to map it to a user. Last scanned UID: {last_uid}",
                     "data": {
                         "card_index": "Select card"
                     },
@@ -376,7 +376,7 @@
                 },
                 "manual": {
                     "title": "Add RFID Mapping",
-                    "description": "Select the card slot index and assign it to a user. Tip: Start a charging session with the card, then check the RFID index in Developer Tools. {discovery_error}",
+                    "description": "Select the card slot index and assign it to a user. Tip: Start a charging session with the card, then check the RFID index in Developer Tools.",
                     "data": {
                         "card_index": "Card slot",
                         "user_id": "User",
@@ -404,7 +404,10 @@
             },
             "error": {
                 "already_mapped": "This card slot is already assigned to another user.",
-                "no_available_slots": "All 10 card slots (0-9) are already in use."
+                "no_available_slots": "All 10 card slots (0-9) are already in use.",
+                "discovery_failed": "The cards could not be read from the charger. Choose the card slot manually.",
+                "all_slots_mapped": "All cards programmed in the charger are already mapped. Choose the card slot manually.",
+                "no_programmed_cards": "No cards are programmed in the charger. Program the card in the go-e app, or choose the card slot manually."
             },
             "abort": {
                 "no_users": "No active users found. Please add at least one user before creating RFID mappings."

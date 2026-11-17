@@ -156,7 +156,12 @@ class GoeRfidDiscovery:
                 async with session.get(url) as resp:
                     if resp.status != 200:
                         raise DiscoveryError(f"Charger returned HTTP {resp.status} for {context}")
-                    return await resp.json()
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        raise DiscoveryError(
+                            f"Unexpected response format from charger for {context}"
+                        )
+                    return data
         except DiscoveryError:
             raise
         except TimeoutError as exc:
@@ -173,10 +178,11 @@ class GoeRfidDiscovery:
         data = await self._fetch_api(session, GOE_FILTER_FWV, "firmware version query")
 
         fwv = data.get("fwv")
-        if not fwv or not isinstance(fwv, str):
+        # Some firmware reports fwv as a JSON number; bool is an int subclass.
+        if isinstance(fwv, bool) or not isinstance(fwv, (str, int, float)):
             raise DiscoveryError("Unexpected firmware version format from charger.")
         try:
-            major_str = fwv.split(".")[0]
+            major_str = str(fwv).split(".")[0]
             return int(major_str)
         except (ValueError, IndexError) as exc:
             raise DiscoveryError(f"Cannot parse firmware version '{fwv}'.") from exc
@@ -215,14 +221,10 @@ class GoeRfidDiscovery:
             if i < len(cards_raw) and isinstance(cards_raw[i], dict):
                 slot = cards_raw[i]
                 name = self._parse_card_name(slot.get("name"))
-                energy_wh = slot.get("energy", 0)
-                energy_kwh = self._parse_energy_wh(energy_wh)
-                # B3: A slot is programmed if it has a meaningful name or non-zero energy.
-                # energy_wh can be None when JSON has "energy": null, so the guard is needed.
-                raw_name = slot.get("name", "")
-                is_programmed = bool(raw_name and raw_name.lower() not in ("n/a", "na")) or (
-                    energy_wh is not None and energy_wh > 0
-                )
+                energy_kwh = self._parse_energy_wh(slot.get("energy", 0))
+                # B3: A slot is programmed if it has a meaningful name or non-zero
+                # energy. Judged on the parsed values so odd JSON types never raise (D-16).
+                is_programmed = name is not None or (energy_kwh is not None and energy_kwh > 0)
             else:
                 name = None
                 energy_kwh = None

@@ -1249,7 +1249,8 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
             # Fall back to charger_host from entry data (direct config)
             host = entry.data.get("charger_host")
         if host is None:
-            self._discovery_error = "Cannot determine charger address."
+            _LOGGER.warning("RFID discovery skipped: cannot determine the charger address")
+            self._discovery_error = "discovery_failed"
             return await self.async_step_manual()
 
         provider = get_discovery_provider(profile, host)
@@ -1258,12 +1259,17 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
 
         self._provider = provider
 
-        # Run discovery
+        # Run discovery. Any failure falls back to the manual form (D-16).
         try:
             cards = await provider.get_programmed_cards(self.hass)
             self._discovered_cards = cards
         except DiscoveryError as exc:
-            self._discovery_error = exc.message
+            _LOGGER.warning("RFID discovery failed: %s", exc.message)
+            self._discovery_error = "discovery_failed"
+            return await self.async_step_manual()
+        except Exception:
+            _LOGGER.exception("RFID discovery failed unexpectedly")
+            self._discovery_error = "discovery_failed"
             return await self.async_step_manual()
 
         # Also fetch lri UID (best-effort)
@@ -1314,10 +1320,9 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
             label = f"#{card.index}: {label_name} ({energy_str})"
             options.append({"value": str(card.index), "label": label})
 
-        # Build description placeholders for UID info
-        uid_text = f"Last scanned UID: {self._last_rfid_uid}" if self._last_rfid_uid else ""
+        # The sentence around the UID lives in the translations (D-15).
         description_placeholders: dict[str, str] = {
-            "last_uid": uid_text,
+            "last_uid": self._last_rfid_uid or "–",
         }
 
         schema = vol.Schema(
@@ -1349,7 +1354,8 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
         if user_input is not None:
             data: dict[str, Any] = {
                 "card_index": card.index,
-                CONF_CARD_UID: self._last_rfid_uid,
+                # lri is the charger's last scanned UID, not this slot's (D-17).
+                CONF_CARD_UID: None,
                 "user_id": user_input["user_id"],
                 "vehicle_id": user_input.get("vehicle_id"),
                 "active": True,
@@ -1468,16 +1474,14 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
                 )
             )
 
-        error_text = f"Discovery failed: {self._discovery_error}" if self._discovery_error else ""
-        description_placeholders: dict[str, str] = {
-            "discovery_error": error_text,
-        }
+        # Why discovery was not used, shown only on the first display (D-15).
+        if user_input is None and self._discovery_error:
+            errors["base"] = self._discovery_error
 
         return self.async_show_form(
             step_id="manual",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
-            description_placeholders=description_placeholders,
         )
 
     async def async_step_reconfigure(
@@ -1506,6 +1510,8 @@ class RfidMappingSubentryFlowHandler(ConfigSubentryFlow):
             )
 
         active_users = self._get_active_users(entry)
+        if not active_users:
+            return self.async_abort(reason="no_users")
         vehicles = self._get_vehicles(entry)
 
         schema_dict: dict[Any, Any] = {

@@ -354,7 +354,7 @@
             "step": {
                 "select_card": {
                     "title": "Upptäckta RFID-kort",
-                    "description": "Följande RFID-kort är programmerade i laddaren. Välj ett kort att koppla till en användare. {last_uid}",
+                    "description": "Följande RFID-kort är programmerade i laddaren. Välj ett kort att koppla till en användare. Senast skannade UID: {last_uid}",
                     "data": {
                         "card_index": "Välj kort"
                     },
@@ -376,7 +376,7 @@
                 },
                 "manual": {
                     "title": "Lägg till RFID-koppling",
-                    "description": "Välj kortplats och koppla den till en användare. Tips: starta en laddning med kortet och se sedan RFID-indexet under Utvecklarverktyg. {discovery_error}",
+                    "description": "Välj kortplats och koppla den till en användare. Tips: starta en laddning med kortet och se sedan RFID-indexet under Utvecklarverktyg.",
                     "data": {
                         "card_index": "Kortplats",
                         "user_id": "Användare",
@@ -404,7 +404,10 @@
             },
             "error": {
                 "already_mapped": "Denna kortplats är redan tilldelad en annan användare.",
-                "no_available_slots": "Alla 10 kortplatser (0–9) är redan i bruk."
+                "no_available_slots": "Alla 10 kortplatser (0–9) är redan i bruk.",
+                "discovery_failed": "Korten kunde inte läsas från laddaren. Välj kortplats manuellt.",
+                "all_slots_mapped": "Alla kort som är programmerade i laddaren är redan kopplade. Välj kortplats manuellt.",
+                "no_programmed_cards": "Inga kort är programmerade i laddaren. Programmera kortet i go-e-appen eller välj kortplats manuellt."
             },
             "abort": {
                 "no_users": "Det finns inga aktiva användare. Lägg till minst en användare innan du skapar RFID-kopplingar."

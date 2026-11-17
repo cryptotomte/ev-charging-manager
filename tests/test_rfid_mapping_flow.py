@@ -221,7 +221,7 @@ async def test_rfid_flow_already_mapped_cards_filtered(hass: HomeAssistant) -> N
 
 
 async def test_rfid_flow_uid_shown_in_description(hass: HomeAssistant) -> None:
-    """When rde is enabled, lri UID appears in description_placeholders."""
+    """T-15: when rde is enabled, the placeholder is the bare lri UID."""
     entry = _goe_entry()
     await setup_entry_with_subentries(hass, entry)
     await _add_user(hass, entry.entry_id, "Paul")
@@ -237,11 +237,11 @@ async def test_rfid_flow_uid_shown_in_description(hass: HomeAssistant) -> None:
         )
 
     assert result["step_id"] == "select_card"
-    assert "04b7d7b2c01690" in result["description_placeholders"]["last_uid"]
+    assert result["description_placeholders"]["last_uid"] == "04b7d7b2c01690"
 
 
 async def test_rfid_flow_no_uid_when_rde_disabled(hass: HomeAssistant) -> None:
-    """When rde is disabled, last_uid placeholder is empty string."""
+    """T-15: when no UID was read, the placeholder is a dash."""
     entry = _goe_entry()
     await setup_entry_with_subentries(hass, entry)
     await _add_user(hass, entry.entry_id, "Paul")
@@ -257,16 +257,16 @@ async def test_rfid_flow_no_uid_when_rde_disabled(hass: HomeAssistant) -> None:
         )
 
     assert result["step_id"] == "select_card"
-    assert result["description_placeholders"]["last_uid"] == ""
+    assert result["description_placeholders"]["last_uid"] == "–"
 
 
 # ---------------------------------------------------------------------------
-# T018: US3 — card_uid stored in subentry
+# Spec 026 D-17: card_uid is never filled from lri
 # ---------------------------------------------------------------------------
 
 
-async def test_rfid_mapping_stores_card_uid_when_available(hass: HomeAssistant) -> None:
-    """card_uid from lri is stored in the subentry when a UID is available."""
+async def test_rfid_mapping_card_uid_none_even_when_lri_available(hass: HomeAssistant) -> None:
+    """T-14: lri is the charger's last scanned UID, not the slot's; card_uid stays None."""
     entry = _goe_entry()
     await setup_entry_with_subentries(hass, entry)
     user_id = await _add_user(hass, entry.entry_id, "Paul")
@@ -290,7 +290,7 @@ async def test_rfid_mapping_stores_card_uid_when_available(hass: HomeAssistant) 
     assert result["type"] == FlowResultType.CREATE_ENTRY
     loaded_entry = hass.config_entries.async_get_entry(entry.entry_id)
     rfid_subs = [s for s in loaded_entry.subentries.values() if s.subentry_type == "rfid_mapping"]
-    assert rfid_subs[0].data["card_uid"] == "04b7d7b2c01690"
+    assert rfid_subs[0].data["card_uid"] is None
 
 
 async def test_rfid_mapping_card_uid_none_when_unavailable(hass: HomeAssistant) -> None:
@@ -337,10 +337,11 @@ async def test_generic_charger_shows_manual_form_directly(hass: HomeAssistant) -
 
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "manual"
+    assert result["errors"] == {}  # T-18
 
 
-async def test_discovery_error_falls_back_to_manual(hass: HomeAssistant) -> None:
-    """DiscoveryError during charger query falls back to manual entry."""
+async def test_discovery_error_falls_back_to_manual(hass: HomeAssistant, caplog) -> None:
+    """T-16: DiscoveryError -> manual form with discovery_failed; the message is logged."""
     entry = _goe_entry()
     await setup_entry_with_subentries(hass, entry)
     await _add_user(hass, entry.entry_id, "Paul")
@@ -359,10 +360,56 @@ async def test_discovery_error_falls_back_to_manual(hass: HomeAssistant) -> None
 
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "manual"
-    # Error message passed to description_placeholders with "Discovery failed: " prefix
-    error_text = result["description_placeholders"].get("discovery_error", "")
-    assert "Discovery failed:" in error_text
-    assert "Cannot reach charger" in error_text
+    assert result["errors"] == {"base": "discovery_failed"}
+    assert not result.get("description_placeholders")
+    assert "Cannot reach charger" in caplog.text
+
+
+async def test_unexpected_discovery_exception_falls_back_to_manual(
+    hass: HomeAssistant, caplog
+) -> None:
+    """T-20: any other provider exception -> manual form with discovery_failed."""
+    entry = _goe_entry()
+    await setup_entry_with_subentries(hass, entry)
+    await _add_user(hass, entry.entry_id, "Paul")
+    provider = _make_provider()
+    provider.get_programmed_cards = AsyncMock(side_effect=AttributeError("'list' has no 'get'"))
+
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=provider,
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+        )
+
+    assert result["step_id"] == "manual"
+    assert result["errors"] == {"base": "discovery_failed"}
+    assert "AttributeError" in caplog.text
+
+
+async def test_manual_resubmit_shows_only_slot_error(hass: HomeAssistant) -> None:
+    """T-19: after discovery failed, a taken slot shows only already_mapped."""
+    entry = _goe_entry()
+    await setup_entry_with_subentries(hass, entry)
+    user_id = await _add_user(hass, entry.entry_id, "Paul")
+    provider = _make_provider(discovery_error=DiscoveryError("Cannot reach charger."))
+
+    with patch(
+        "custom_components.ev_charging_manager.config_flow.get_discovery_provider",
+        return_value=provider,
+    ):
+        for expected in (FlowResultType.CREATE_ENTRY, FlowResultType.FORM):
+            result = await hass.config_entries.subentries.async_init(
+                (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+            )
+            assert result["errors"] == {"base": "discovery_failed"}
+            result = await hass.config_entries.subentries.async_configure(
+                result["flow_id"], {"card_index": "5", "user_id": user_id}
+            )
+            assert result["type"] == expected
+
+    assert result["errors"] == {"card_index": "already_mapped"}
 
 
 async def test_manual_form_creates_correct_subentry(hass: HomeAssistant) -> None:
@@ -463,6 +510,7 @@ async def test_discovery_all_slots_already_mapped_falls_back_to_manual(
         )
 
     assert result["step_id"] == "manual"
+    assert result["errors"] == {"base": "all_slots_mapped"}  # T-17
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +541,7 @@ async def test_discovery_no_programmed_cards_falls_back_to_manual(
         )
 
     assert result["step_id"] == "manual"
+    assert result["errors"] == {"base": "no_programmed_cards"}  # T-17
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +665,38 @@ async def test_manual_no_users_aborts(hass: HomeAssistant) -> None:
 
     result = await hass.config_entries.subentries.async_init(
         (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+    )
+
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "no_users"
+
+
+async def test_reconfigure_mapping_without_active_users_aborts(hass: HomeAssistant) -> None:
+    """T-13: editing a mapping when no user is active aborts with no_users."""
+    entry = _generic_entry()
+    await setup_entry_with_subentries(hass, entry)
+    user_id = await _add_user(hass, entry.entry_id, "Paul")
+    r = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "rfid_mapping"), context={"source": "user"}
+    )
+    await hass.config_entries.subentries.async_configure(
+        r["flow_id"], {"card_index": "2", "user_id": user_id}
+    )
+    r = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "user"), context={"source": "reconfigure", "subentry_id": user_id}
+    )
+    await hass.config_entries.subentries.async_configure(
+        r["flow_id"], {"name": "Paul", "active": False}
+    )
+    mapping = next(
+        s
+        for s in hass.config_entries.async_get_entry(entry.entry_id).subentries.values()
+        if s.subentry_type == "rfid_mapping"
+    )
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "rfid_mapping"),
+        context={"source": "reconfigure", "subentry_id": mapping.subentry_id},
     )
 
     assert result["type"] == FlowResultType.ABORT

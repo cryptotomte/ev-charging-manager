@@ -104,7 +104,7 @@ class GoeRfidDiscovery:
             _LOGGER.debug("go-e %s: failed to fetch last RFID UID", self._host, exc_info=True)
             return None
 
-        if not data.get("rde", False):
+        if not isinstance(data, dict) or not data.get("rde", False):
             return None
         lri = data.get("lri")
         if lri and isinstance(lri, str):
@@ -301,11 +301,11 @@ class GoeRfidDiscovery:
 
         Returns None for negative or unreasonably large values (> MAX_ENERGY_KWH).
         """
-        if raw is None:
+        if raw is None or isinstance(raw, bool):  # D-32: a bool is not an energy
             return None
         try:
             wh = float(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if wh < 0:
             return None

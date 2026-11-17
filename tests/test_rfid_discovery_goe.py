@@ -707,3 +707,75 @@ async def test_null_or_bool_fwv_raises_discovery_error(hass: HomeAssistant, fwv)
 
     with _patch_session(session), pytest.raises(DiscoveryError):
         await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+
+# ---------------------------------------------------------------------------
+# Spec 026 D-32: overflow, booleans, non-object bodies, and the is_programmed rule
+# ---------------------------------------------------------------------------
+
+
+async def test_huge_or_boolean_energy_is_not_a_number(hass: HomeAssistant) -> None:
+    """D-32: an energy too large for a float, or a boolean, parses as no energy."""
+    slots = [{"name": "", "energy": 10**400}, {"name": "", "energy": True}]
+    session = _mock_session([(200, {"fwv": "59.4"}), (200, {"cards": slots})])
+
+    with _patch_session(session):
+        cards = await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+    for card in cards[:2]:
+        assert card.energy_kwh is None
+        assert card.is_programmed is False
+
+
+@pytest.mark.parametrize("body", [["04b7d7b2c01690"], None, 42, "04b7d7b2c01690"])
+async def test_last_uid_non_object_body_returns_none(hass: HomeAssistant, body) -> None:
+    """D-32: a last-UID answer that is not a JSON object reads as no UID."""
+    session = _mock_session([(200, body)])
+
+    with _patch_session(session):
+        assert await GoeRfidDiscovery("192.168.1.100").get_last_rfid_uid(hass) is None
+
+
+async def test_is_programmed_uses_cleaned_name_and_parsed_energy(hass: HomeAssistant) -> None:
+    """D-32 (spec § 12 X-5): blank or placeholder names and out-of-range energy do not count."""
+    slots = [
+        {"name": "   ", "energy": 0},
+        {"name": " N/A ", "energy": 0},
+        {"name": "", "energy": 10**12},
+        {"name": "Paul", "energy": 0},
+    ]
+    session = _mock_session([(200, {"fwv": "59.4"}), (200, {"cards": slots})])
+
+    with _patch_session(session):
+        cards = await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+    assert [c.is_programmed for c in cards[:4]] == [False, False, False, True]
+
+
+async def test_flat_keys_odd_types_degrade_without_exception(hass: HomeAssistant) -> None:
+    """D-16, D-32: the firmware >= 60 parser survives odd JSON types in every key."""
+    data = {
+        "c0n": 42,
+        "c0e": "abc",
+        "c0i": True,
+        "c1n": ["x"],
+        "c1e": 10**400,
+        "c1i": False,
+        "c2n": " Paul ",
+        "c2e": True,
+        "c2i": True,
+        "c3n": {"x": 1},
+        "c3e": [1],
+        "c3i": None,
+        "c4n": None,
+        "c4e": "56223",
+        "c4i": True,
+    }
+    session = _mock_session([(200, {"fwv": "60.1"}), (200, data)])
+
+    with _patch_session(session):
+        cards = await GoeRfidDiscovery("192.168.1.100").get_programmed_cards(hass)
+
+    assert [c.name for c in cards[:5]] == [None, None, "Paul", None, None]
+    assert [c.energy_kwh for c in cards[:4]] == [None, None, None, None]
+    assert cards[4].energy_kwh == pytest.approx(56.223)

@@ -350,11 +350,14 @@ async def test_config_flow_currency_must_be_chosen(hass: HomeAssistant, ha_curre
     await hass.config.async_update(currency=ha_currency)
     result = await _setup_to_pricing_step(hass)
     assert_currency_field_empty(result)
+    handler = hass.config_entries.flow._progress[result["flow_id"]]
+    stored = copy.deepcopy(handler.data)
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 3.10}
     )
 
+    assert handler.data == stored
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "pricing"
     assert result["errors"] == {CONF_CURRENCY: "currency_required"}

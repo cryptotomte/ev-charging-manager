@@ -17,6 +17,7 @@ from homeassistant.config_entries import (
     SubentryFlowResult,
 )
 from homeassistant.core import callback
+from homeassistant.generated.currencies import ACTIVE_CURRENCIES
 from homeassistant.helpers import selector
 from homeassistant.util import slugify
 
@@ -31,6 +32,7 @@ from .const import (
     CONF_CHARGER_PROFILE,
     CONF_CHARGER_SERIAL,
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
+    CONF_CURRENCY,
     CONF_DEBUG_LOGGING,
     CONF_DISCONNECT_GRACE_MIN,
     CONF_ENERGY_ENTITY,
@@ -77,6 +79,7 @@ from .const import (
     DOMAIN,
     HEARTBEAT_LOG_INTERVAL_MIN_MAX,
     HEARTBEAT_LOG_INTERVAL_MIN_MIN,
+    LEGACY_CURRENCY,
     UI_DISPATCH_INTERVAL_S_ACTIVE_MIN,
     UI_DISPATCH_INTERVAL_S_MAX,
     UI_DISPATCH_INTERVAL_S_MIN,
@@ -117,6 +120,17 @@ def _make_entity_key(
     if required:
         return vol.Required(field, description=description) if description else vol.Required(field)
     return vol.Optional(field, description=description) if description else vol.Optional(field)
+
+
+def _currency_selector() -> selector.SelectSelector:
+    """Spec 028 D-61: kr, then Home Assistant's own active ISO 4217 codes; no free text."""
+    return selector.SelectSelector(
+        selector.SelectSelectorConfig(
+            options=[LEGACY_CURRENCY, *sorted(ACTIVE_CURRENCIES)],
+            mode=selector.SelectSelectorMode.DROPDOWN,
+            custom_value=False,
+        )
+    )
 
 
 def _coerce_charging_value(value: Any) -> int | str:
@@ -341,6 +355,8 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="pricing",
             data_schema=vol.Schema(
                 {
+                    # D-62: no default and no suggested value; the user must choose.
+                    vol.Required(CONF_CURRENCY): _currency_selector(),
                     vol.Required(
                         CONF_PRICING_MODE, default=DEFAULT_PRICING_MODE
                     ): selector.SelectSelector(

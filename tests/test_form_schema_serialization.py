@@ -27,6 +27,7 @@ from custom_components.ev_charging_manager.const import (
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
     CONF_CHARGER_SERIAL,
+    CONF_CURRENCY,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
     CONF_PLUG_ENTITY,
@@ -112,7 +113,10 @@ async def test_config_flow_forms_serializable(hass: HomeAssistant, client) -> No
         "pricing",
     )
     await _post(
-        client, step, {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50}, "spot_config"
+        client,
+        step,
+        {CONF_CURRENCY: "kr", CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+        "spot_config",
     )
     await _post(
         client,

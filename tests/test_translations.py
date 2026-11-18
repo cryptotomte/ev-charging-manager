@@ -99,12 +99,17 @@ _ENGLISH = {
 
 def test_no_kr_as_currency_word_and_currency_field_texts() -> None:
     """Spec 028 T-22 (D-69, D-76): strings.json is en.json, pinned above."""
-    for name, label in (("translations/en.json", "Currency"), ("translations/sv.json", "Valuta")):
+    for name, label, required in (
+        ("translations/en.json", "Currency", "Currency (required)"),
+        ("translations/sv.json", "Valuta", "Valuta (obligatorisk)"),
+    ):
         texts = _flatten(_load(name))
         assert [k for k, v in texts.items() if v and _CURRENCY_WORD.search(v)] == [_NAMES_KR]
         assert [k for k, v in texts.items() if v and _SWEDISH.search(v)] == [], name
+        # D-73: the config field is optional to the frontend, so its label carries the marker.
+        assert texts["config.step.pricing.data.currency"] == required
+        assert texts["options.step.pricing.data.currency"] == label
         for flow in ("config", "options"):
-            assert texts[f"{flow}.step.pricing.data.currency"] == label
             assert texts[f"{flow}.step.pricing.data_description.currency"]
     assert [
         _flatten(_load(name))["config.error.currency_required"]

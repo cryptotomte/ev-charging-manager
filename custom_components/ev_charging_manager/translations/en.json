@@ -48,7 +48,7 @@
             "pricing": {
                 "title": "Pricing Configuration",
                 "data": {
-                    "currency": "Currency",
+                    "currency": "Currency (required)",
                     "pricing_mode": "Pricing Mode",
                     "static_price_kwh": "Price per kWh"
                 },

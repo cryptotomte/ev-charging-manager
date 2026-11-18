@@ -48,7 +48,7 @@
             "pricing": {
                 "title": "Prissättningskonfiguration",
                 "data": {
-                    "currency": "Valuta",
+                    "currency": "Valuta (obligatorisk)",
                     "pricing_mode": "Prisläge",
                     "static_price_kwh": "Pris per kWh"
                 },

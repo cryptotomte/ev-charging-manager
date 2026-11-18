@@ -298,6 +298,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await session_engine.async_recover(active_snapshot)
     session_engine.async_setup()
 
+    if uses_plug_anchored:
+        # Spec 027 D-42: entries are not unloaded at an orderly stop, so without this
+        # the snapshot on disk is as old as the last periodic save.
+        async def _write_snapshot_on_stop(_event: Event) -> None:
+            await session_engine.async_write_snapshot()
+
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _write_snapshot_on_stop)
+        )
+
     # Schedule periodic persistence of active session
     persistence_interval = entry.options.get(
         CONF_PERSISTENCE_INTERVAL_S, DEFAULT_PERSISTENCE_INTERVAL_S

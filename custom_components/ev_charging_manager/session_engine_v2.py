@@ -15,6 +15,7 @@ charger profile (T013 / FR-036).
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -89,6 +90,7 @@ from .const import (
     EVENT_SESSION_STARTED,
     EVENT_UNKNOWN_RFID_DETECTED,
     NOTIFICATION_ID_UNKNOWN_RFID,
+    RECOVERY_INPUT_WAIT_S,
     SIGNAL_RFID_MAPPING_ADDED,
     SIGNAL_SESSION_UPDATE,
     SessionEngineState,
@@ -124,6 +126,29 @@ _RFID_REASON_MAP: dict[str, UnknownReason] = {
 }
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_price(value: Any) -> bool:
+    """A finite, non-negative number (spec 027 D-55; a spot price itself may be negative)."""
+    return _is_number(value) and value >= 0
+
+
+def _hour_of(moment: datetime) -> datetime:
+    return moment.replace(minute=0, second=0, microsecond=0)
+
+
+def _spot_value(state: Any) -> float | None:
+    """A price entity's state as a number, or None when it has no valid price."""
+    if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        return None
+    try:
+        return float(state.state)
+    except (ValueError, TypeError):
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class _RfidWaitState:
     """In-memory state for an active RFID wait (event-driven; no timer).
@@ -139,6 +164,8 @@ class _RfidWaitState:
     """
 
     plug_on_at: datetime
+    # Spec 027 D-51: a wait entered for a cable already in flags the session it starts.
+    reconstructed: bool = False
 
 
 class PlugAnchoredSessionEngine:
@@ -274,9 +301,19 @@ class PlugAnchoredSessionEngine:
         # The CAPTURED pair prices the hour when it closes — never a fresh read
         # at the tick (Nordpool-style sensors flip to the new hour's price at
         # the boundary, racing the tick). None price means "unavailable at
-        # capture" → fallback pricing for the whole hour. In-memory only; dies
-        # with the session (resume recaptures).
+        # capture" → fallback pricing for the whole hour. Kept in the snapshot's
+        # resume_state, so a resume in the same hour keeps it (spec 027 D-39).
         self._current_hour_price: float | None = None
+        # Spec 027 D-39: a resume found the stored hour passed but had no counter
+        # reading yet; the first reading closes the stored hour.
+        self._spot_close_pending: bool = False
+        # Spec 027 D-54: price entities seen with a valid state since this engine was
+        # set up; the hour in progress awaits its price from a price entity that was
+        # not loaded yet; the listener that watches for that first valid state.
+        self._spot_seen_valid: set[str] = set()
+        self._spot_price_pending: bool = False
+        self._spot_watch_unsub: _Unsub = None
+        self._spot_watch_entity: str | None = None
 
         # Story 07 (passive notification): set of notification IDs currently visible,
         # keyed for auto-dismiss when the corresponding mapping is added (FR-022).
@@ -302,28 +339,19 @@ class PlugAnchoredSessionEngine:
         # other's handle is not sufficient when both were dispatched in the
         # same loop iteration.
         self._recovery_resolved: bool = False
+        # Spec 027 D-49: the short wait for the energy or RFID entity once the plug is
+        # valid (state listener + timer), and a decision that is running.
+        self._recovery_wait_unsub: _Unsub = None
+        self._recovery_wait_timeout_unsub: _Unsub = None
+        self._recovery_busy: bool = False
+        # Spec 027 D-56: snapshot writes requested after unload do nothing.
+        self._unloaded: bool = False
 
-        # Build pricing engine from entry data (immutable at runtime)
-        pricing_mode = entry.data.get("pricing_mode", "static")
-        spot_config: SpotConfig | None = None
-        if pricing_mode == "spot":
-            spot_config = SpotConfig(
-                price_entity=entry.data.get(CONF_SPOT_PRICE_ENTITY, ""),
-                additional_cost_kwh=entry.data.get(
-                    CONF_SPOT_ADDITIONAL_COST_KWH, DEFAULT_SPOT_ADDITIONAL_COST_KWH
-                ),
-                vat_multiplier=entry.data.get(
-                    CONF_SPOT_VAT_MULTIPLIER, DEFAULT_SPOT_VAT_MULTIPLIER
-                ),
-                fallback_price_kwh=entry.data.get(
-                    CONF_SPOT_FALLBACK_PRICE_KWH, DEFAULT_SPOT_FALLBACK_PRICE_KWH
-                ),
-            )
-        self._pricing = PricingEngine(
-            mode=pricing_mode,
-            static_price=entry.data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
-            spot_config=spot_config,
-        )
+        # The price parameters of the session in progress (spec 027 D-35/D-36), stored
+        # with its snapshot; the entry's between sessions.
+        self._pricing_params: dict[str, Any] = {}
+        self._pricing: PricingEngine
+        self._apply_pricing(self._entry_pricing_params())
 
     # -----------------------------------------------------------------------
     # Public interface (coordinator-callable, same as legacy SessionEngine)
@@ -428,10 +456,57 @@ class PlugAnchoredSessionEngine:
         return SessionSubState.INITIALIZING
 
     def get_active_session_dict(self) -> dict | None:
-        """Return the active session as a dict for periodic persistence, or None."""
-        if self._active_session is None:
+        """Return the active snapshot, or None: the session fields plus ``resume_state``.
+
+        Spec 027 D-35: ``resume_state`` holds the values that otherwise exist only in
+        memory and exists only in the active snapshot, never in a completed record.
+        Every snapshot writer goes through here.
+        """
+        session = self._active_session
+        if session is None:
             return None
-        return self._active_session.to_dict()
+        snapshot = session.to_dict()
+        snapshot["resume_state"] = {
+            "pricing": dict(self._pricing_params),
+            "guest_pricing": (
+                None if self._guest_pricing is None else self._guest_pricing.to_dict()
+            ),
+            "spot_hour": (
+                {
+                    "start": self._hour_start_time,
+                    "price": self._current_hour_price,
+                    "fallback": self._current_hour_price is None,
+                }
+                if self._pricing.mode == "spot"
+                else None
+            ),
+        }
+        return snapshot
+
+    async def async_write_snapshot(self, session_id: str | None = None) -> None:
+        """Write the active snapshot (spec 027 D-42).
+
+        With ``session_id``, the write is skipped unless the engine still holds that
+        session, so a late write cannot resurrect a discarded or completed one.
+        """
+        session = self._active_session
+        if (
+            self._unloaded
+            or session is None
+            or (session_id is not None and session.id != session_id)
+        ):
+            return
+        try:
+            await self._session_store.async_save_active_session(self.get_active_session_dict())
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: snapshot write failed (id=%s): %s", session.id, err
+            )
+
+    def _schedule_snapshot_write(self) -> None:
+        """Write the snapshot at a session event (spec 027 D-42) for the session held now."""
+        if self._active_session is not None:
+            self._hass.async_create_task(self.async_write_snapshot(self._active_session.id))
 
     async def async_unload(self) -> None:
         """Tear down engine-managed listeners (BUG-6 fix).
@@ -443,6 +518,7 @@ class PlugAnchoredSessionEngine:
         Called from __init__.async_unload_entry. Listeners registered via
         entry.async_on_unload are torn down by HA itself.
         """
+        self._unloaded = True
         # PR-27 FR-019: persist a final active-session snapshot so a reload
         # mid-session loses at most seconds — not up to a full periodic-save
         # interval — of tracked state. The FR-011 completed-id guard inside
@@ -450,7 +526,7 @@ class PlugAnchoredSessionEngine:
         # completion just finished.
         if self._active_session is not None:
             try:
-                await self._session_store.async_save_active_session(self._active_session.to_dict())
+                await self._session_store.async_save_active_session(self.get_active_session_dict())
                 _LOGGER.debug(
                     "PlugAnchoredSessionEngine: final active-session snapshot "
                     "persisted at unload (id=%s)",
@@ -491,6 +567,9 @@ class PlugAnchoredSessionEngine:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("deferred-recovery-timeout unsub failed: %s", err)
             self._deferred_recovery_timeout_unsub = None
+        self._safe_cancel("_recovery_wait_unsub")
+        self._safe_cancel("_recovery_wait_timeout_unsub")
+        self._safe_cancel("_spot_watch_unsub")
 
         # Cancel and clear all engine-managed unsubs.
         for unsub in list(self._engine_unsubs):
@@ -530,13 +609,43 @@ class PlugAnchoredSessionEngine:
             self._state = SessionEngineState.IDLE
             self._active_session = None
 
-    async def _async_do_recover(self, snapshot: dict) -> None:
-        """Execute the plug-anchored restart recovery logic.
+    def _rfid_entity_unready(self) -> bool:
+        """Whether the RFID entity has no state or is unavailable (spec 027 D-49).
+
+        ``unknown`` and ``null`` are states of a loaded entity and mean "no card".
+        """
+        rfid_entity_id = self._entry.data.get(CONF_RFID_ENTITY)
+        if not rfid_entity_id:
+            return False
+        rfid_state = self._hass.states.get(rfid_entity_id)
+        return rfid_state is None or rfid_state.state == STATE_UNAVAILABLE
+
+    @property
+    def _recovery_pending(self) -> bool:
+        """Whether a recovery decision is still open (deferred, waiting or running)."""
+        return (
+            self._deferred_recovery_unsub is not None
+            or self._recovery_wait_unsub is not None
+            or self._recovery_busy
+        )
+
+    def _present_card_index(self) -> int | None:
+        """The card index the charger shows now (trx - 1), or None when no card is shown."""
+        try:
+            index = int(self._get_trx()) - 1
+        except (TypeError, ValueError):
+            return None
+        return index if index >= 0 else None
+
+    async def _async_do_recover(self, snapshot: dict, *, waited: bool = False) -> None:
+        """Execute the plug-anchored restart recovery logic (spec 027 § 6.2, D-49).
 
         BUG-3 fix: when the plug entity is not yet available (None — unavailable /
         unknown / entity not loaded at boot), DO NOT silently treat the plug as
         off. That would prematurely complete the session with the wrong disconnect
-        time. Instead, defer recovery until a valid plug state arrives.
+        time. Instead, defer recovery until a valid plug state arrives. With a valid
+        plug, a missing energy reading (plug off) or RFID entity (plug on) gets a
+        short wait; ``waited`` means that wait is over and what is known decides.
         """
         now = dt_util.utcnow()
 
@@ -576,44 +685,160 @@ class PlugAnchoredSessionEngine:
                 f"power={current_power:.0f}W energy={energy_str}",
             )
 
-        energy_start = float(snapshot.get("energy_start_kwh", 0.0))
-        # PR-27 FR-002: only an available reading measurably below the session's
-        # start value is a reset; the epsilon kills float jitter false positives.
-        energy_counter_reset = (
-            current_energy is not None and current_energy < energy_start - ENERGY_RESET_EPSILON_KWH
-        )
+        if current_plug != "on":
+            energy_entity_id = self._entry.data.get(CONF_ENERGY_ENTITY)
+            if not waited and energy_entity_id and current_energy is None:
+                self._wait_for_recovery_input(snapshot, energy_entity_id, kind="energy")
+                return
+            await self._complete_snapshot_car_left(snapshot)
+            return
 
-        # Effective energy for downstream use: when the live reading is missing,
-        # reconstruct it from the snapshot (start + accumulated) so the session
-        # resumes/completes with its last known values (PR-27 FR-001).
-        effective_energy = (
-            current_energy
-            if current_energy is not None
-            else energy_start + float(snapshot.get("energy_kwh", 0.0))
-        )
+        if not waited and self._rfid_entity_unready():
+            self._wait_for_recovery_input(snapshot, self._entry.data[CONF_RFID_ENTITY], kind="rfid")
+            return
 
-        # Determine whether plug is currently on (explicit string compare;
-        # None was handled by the early return above).
-        plug_on = current_plug == "on"
-
-        if plug_on and not energy_counter_reset:
-            # Cable still in — resume the session (FR-026)
-            await self._resume_session_from_snapshot(snapshot, effective_energy, current_power, now)
-        else:
-            # Cable removed or energy counter reset — complete the old session (FR-027)
-            reason = "energy counter reset" if energy_counter_reset else "plug was off at restart"
-            _LOGGER.info(
-                "PlugAnchoredSessionEngine recovery: completing old session (%s) id=%s",
-                reason,
-                snapshot.get("id", "?"),
+        card = self._present_card_index()
+        snapshot_card = snapshot.get("rfid_index")
+        # PRELIMINARY P-2 (spec 027 § 10): the card value does not change within one
+        # connection, so a different card means a new connection. No card is no
+        # evidence (spec 027 § 4.6), and neither is a card on a snapshot without one:
+        # "no card, then a card" is the normal order of authorisation (D-50).
+        if snapshot_card is not None and card is not None and card != snapshot_card:
+            # Spec 027 D-50: the counter belongs to the new connection, so the old
+            # session keeps its snapshot energy and the new one takes the whole counter.
+            await self._complete_snapshot_as_session(
+                snapshot, self._snapshot_completion_energy(snapshot, None), now
             )
-            await self._complete_snapshot_as_session(snapshot, effective_energy, now)
-
             if self._debug_logger:
                 self._debug_logger.log(
                     DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
-                    f"session ended at restart — reason={reason} id={snapshot.get('id', '?')}",
+                    "session ended at restart — reason=another card on the charger at "
+                    f"restart id={snapshot.get('id', '?')}",
                 )
+            if self._unloaded:
+                return
+            self._state = SessionEngineState.TRACKING
+            # PRELIMINARY P-1 (spec 027 § 10): with the cable in, the counter is the
+            # energy of the current connection.
+            await self._async_start_session(energy_start_kwh=0.0, reconstructed=True)
+            return
+
+        # Cable still in — resume the session (FR-026). A counter below the
+        # snapshot's is handled inside the resume (spec 027 D-38).
+        await self._resume_session_from_snapshot(snapshot, current_energy, current_power, now)
+
+    @staticmethod
+    def _snapshot_completion_energy(snapshot: dict, current_energy: float | None) -> float:
+        """The energy a completed snapshot gets: never less than its own (spec 027 D-52).
+
+        ``current_energy`` is the counter when it still belongs to the snapshot's
+        connection (D-47), None when it does not or has no reading.
+        """
+        saved_energy = float(snapshot.get("energy_kwh", 0.0))
+        if current_energy is None:
+            return saved_energy
+        return max(saved_energy, current_energy - float(snapshot.get("energy_start_kwh", 0.0)))
+
+    async def _complete_snapshot_car_left(self, snapshot: dict) -> None:
+        """Complete a snapshot whose car left during the outage (FR-027, spec 027 D-47).
+
+        The counter keeps the session's final value until the next plug-in.
+        """
+        energy = self._snapshot_completion_energy(snapshot, self._get_energy())
+        _LOGGER.info(
+            "PlugAnchoredSessionEngine recovery: completing old session "
+            "(plug was off at restart) id=%s",
+            snapshot.get("id", "?"),
+        )
+        await self._complete_snapshot_as_session(
+            snapshot, energy, dt_util.utcnow(), charger_total_after_kwh=self._get_eto()
+        )
+        if self._debug_logger:
+            self._debug_logger.log(
+                DEBUG_CAT_SESSION_FORCE_ENDED_BY_RESTART,
+                "session ended at restart — reason=plug was off at restart "
+                f"id={snapshot.get('id', '?')}",
+            )
+
+    def _wait_for_recovery_input(self, snapshot: dict, entity_id: str, *, kind: str) -> None:
+        """Hold the recovery decision until ``entity_id`` is usable (spec 027 D-49).
+
+        At most RECOVERY_INPUT_WAIT_S. ``kind`` "energy" (plug off): ends at the first
+        valid energy reading or at any plug change, then completes the snapshot with
+        what is known. ``kind`` "rfid" (plug on): ends when the RFID entity has a state
+        other than unavailable, or at a plug change, then decides again without waiting.
+        While the wait runs a plug-on starts nothing (§ 12, X-3).
+        """
+        plug_entity_id = self._entry.options.get(CONF_PLUG_ENTITY)
+        plug_at_start = self._get_plug()
+        if self._debug_logger:
+            self._debug_logger.log(
+                DEBUG_CAT_HA_RESTART_DETECTED,
+                f"recovery waits up to {RECOVERY_INPUT_WAIT_S}s for {entity_id} "
+                f"(plug={plug_at_start} snapshot_id={snapshot.get('id', '?')})",
+            )
+
+        def _ready() -> bool:
+            if self._get_plug() != plug_at_start:
+                return True
+            if kind == "energy":
+                return self._get_energy() is not None
+            return not self._rfid_entity_unready()
+
+        async def _finish(reason: str) -> None:
+            # Check-and-set before any await: the listener and the timer race.
+            if self._recovery_wait_unsub is None:
+                return
+            self._safe_cancel("_recovery_wait_unsub")
+            self._safe_cancel("_recovery_wait_timeout_unsub")
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_HA_RESTART_DETECTED,
+                    f"recovery wait for {entity_id} ended ({reason}) — deciding",
+                )
+            self._recovery_busy = True
+            try:
+                if kind == "energy":
+                    await self._complete_snapshot_car_left(snapshot)
+                else:
+                    await self._async_do_recover(snapshot, waited=True)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error(
+                    "PlugAnchoredSessionEngine: recovery after waiting for %s failed: %s id=%s",
+                    entity_id,
+                    err,
+                    snapshot.get("id", "?"),
+                )
+                self._state = SessionEngineState.IDLE
+                self._active_session = None
+            finally:
+                self._recovery_busy = False
+            self._hand_plug_back_after_recovery()
+
+        async def _on_state(_event: Event) -> None:
+            if _ready():
+                await _finish("input valid or plug changed")
+
+        async def _on_timeout(_now: datetime) -> None:
+            self._recovery_wait_timeout_unsub = None
+            await _finish(f"no valid state within {RECOVERY_INPUT_WAIT_S}s")
+
+        self._recovery_wait_unsub = async_track_state_change_event(
+            self._hass, [e for e in (entity_id, plug_entity_id) if e], _on_state
+        )
+        self._recovery_wait_timeout_unsub = async_call_later(
+            self._hass, RECOVERY_INPUT_WAIT_S, _on_timeout
+        )
+
+    def _hand_plug_back_after_recovery(self, *, cable_in: bool = False) -> None:
+        """Give a cable held back while the recovery decided its normal plug-on handling."""
+        if (
+            not self._unloaded
+            and not self._recovery_pending
+            and self._state == SessionEngineState.IDLE
+            and self._get_plug() == "on"
+        ):
+            self._handle_plug_on(cable_in=cable_in)
 
     async def _defer_recovery_until_plug_ready(self, snapshot: dict, plug_entity_id: str) -> None:
         """Register a one-shot listener that re-runs recovery when plug entity is valid.
@@ -654,6 +879,7 @@ class PlugAnchoredSessionEngine:
                     DEBUG_CAT_HA_RESTART_DETECTED,
                     f"plug entity now valid ({new_state.state!r}) — running deferred recovery",
                 )
+            self._recovery_busy = True
             try:
                 await self._async_do_recover(snapshot)
             except Exception as err:  # noqa: BLE001
@@ -664,6 +890,9 @@ class PlugAnchoredSessionEngine:
                 )
                 self._state = SessionEngineState.IDLE
                 self._active_session = None
+            finally:
+                self._recovery_busy = False
+            self._hand_plug_back_after_recovery()
 
         async def _on_recovery_timeout(_now: datetime) -> None:
             # PR-27 FR-005: check-and-set before any await — if the plug-ready
@@ -724,16 +953,13 @@ class PlugAnchoredSessionEngine:
 
             # Force-complete the snapshot as a reconstructed session (mirrors BUG-3
             # path but with restart-time as disconnected_at).
+            self._recovery_busy = True
             try:
                 now = dt_util.utcnow()
-                # PR-27 FR-001: explicit None check — a genuine 0.0 reading is
-                # evidence and must not fall through to the snapshot fallback.
-                current_energy = self._get_energy()
-                if current_energy is None:
-                    current_energy = float(snapshot.get("energy_start_kwh", 0.0)) + float(
-                        snapshot.get("energy_kwh", 0.0)
-                    )
-                await self._complete_snapshot_as_session(snapshot, current_energy, now)
+                # PR-27 FR-001: an unavailable counter is no evidence; a genuine 0.0
+                # reading is.
+                energy = self._snapshot_completion_energy(snapshot, self._get_energy())
+                await self._complete_snapshot_as_session(snapshot, energy, now)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error(
                     "PlugAnchoredSessionEngine: force-complete after recovery timeout "
@@ -743,6 +969,9 @@ class PlugAnchoredSessionEngine:
                 )
                 self._state = SessionEngineState.IDLE
                 self._active_session = None
+            finally:
+                self._recovery_busy = False
+            self._hand_plug_back_after_recovery(cable_in=True)
 
         self._deferred_recovery_unsub = async_track_state_change_event(
             self._hass, [plug_entity_id], _on_plug_ready
@@ -759,7 +988,7 @@ class PlugAnchoredSessionEngine:
     async def _resume_session_from_snapshot(
         self,
         snapshot: dict,
-        current_energy: float,
+        current_energy: float | None,
         current_power: float,
         now: datetime,
     ) -> None:
@@ -771,6 +1000,10 @@ class PlugAnchoredSessionEngine:
         synthetic closed window — never both (seed-split below); in spot mode
         the hourly snapshot callback is re-armed; and the resumed session is
         immediately re-persisted as the active snapshot (review F2).
+
+        ``current_energy`` is the live counter reading, None while the energy entity
+        is unavailable. Spec 027 § 6.2 step 5 sets the order: restore what the session
+        started with, replay the present reading (D-38), recompute (D-37).
         """
         # PR-27 FR-003: clear any armed RFID wait BEFORE installing the session.
         # The deferred-resume path can race the engine's own plug-on handling,
@@ -795,10 +1028,10 @@ class PlugAnchoredSessionEngine:
                 snapshot.get("connected_at") or snapshot.get("started_at", now.isoformat())
             ),
             energy_start_kwh=float(snapshot.get("energy_start_kwh", 0.0)),
-            energy_kwh=max(0.0, current_energy - float(snapshot.get("energy_start_kwh", 0.0))),
+            energy_kwh=float(snapshot.get("energy_kwh", 0.0)),
             cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
             cost_method=snapshot.get("cost_method", "static"),
-            price_details=snapshot.get("price_details"),
+            price_details=self._snapshot_price_details(snapshot),
             charger_total_before_kwh=snapshot.get("charger_total_before_kwh"),
             max_power_w=float(snapshot.get("max_power_w", 0.0)),
             charging_started_at=snapshot.get("charging_started_at"),
@@ -810,25 +1043,24 @@ class PlugAnchoredSessionEngine:
         )
 
         self._active_session = session
-        self._last_energy_kwh = current_energy
+        # Spec 027 D-38: the last known counter reading is the snapshot's, so the
+        # replay below compares the present reading with it.
+        self._last_energy_kwh = session.energy_start_kwh + session.energy_kwh
+        current_energy_or_last = (
+            current_energy if current_energy is not None else self._last_energy_kwh
+        )
         self._last_power_w = current_power
         self._state = SessionEngineState.TRACKING
         # PR-27: mirror the session-level flag (FR-026 sets data_gap=True on every
         # restart resume) on the engine flag, so completion's
         # `session.data_gap = self._data_gap` transfer cannot wipe it later.
         self._data_gap = True
+        self._restore_session_context(snapshot, session, now)
 
         # BUG-2 fix: re-arm the spot-pricing hourly snapshot callback after restart.
         # Without this, _hourly_unsub stays None, the hourly callback never fires,
         # and post-restart energy is bundled incorrectly into the "current hour".
-        # Seed hour-state from the current wall clock and energy reading so the
-        # next hourly boundary correctly accounts for energy delivered since restart.
-        if self._pricing.mode == "spot" and self._hourly_unsub is None:
-            self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-            self._hour_energy_snapshot = max(0.0, current_energy - session.energy_start_kwh)
-            # PR-29 (FR-008): the pre-restart captured price is gone (in-memory)
-            # — recapture at resume for the in-progress hour.
-            self._capture_hour_price()
+        if self._pricing.mode == "spot":
             self._arm_hourly_spot_callback()
             if self._debug_logger:
                 self._debug_logger.log(
@@ -889,7 +1121,7 @@ class PlugAnchoredSessionEngine:
                     start_at=pre_restart_start,
                     end_at=pre_restart_end,
                     energy_start_kwh=session.energy_start_kwh,
-                    energy_end_kwh=current_energy,
+                    energy_end_kwh=current_energy_or_last,
                     last_power_change_at=pre_restart_end,
                 )
                 self._window_tracker.inject_closed_window(synthetic_window)
@@ -930,7 +1162,7 @@ class PlugAnchoredSessionEngine:
         # Reconcile window state: if power > 0, continue/open a window; else keep closed
         if current_power > 0:
             # Open a window (or continue one — we can't distinguish without full history)
-            self._window_tracker.open_window(now, current_energy)
+            self._window_tracker.open_window(now, current_energy_or_last)
             session.charging_window_count += 1
             if session.charging_started_at is None:
                 session.charging_started_at = now.isoformat()
@@ -939,9 +1171,33 @@ class PlugAnchoredSessionEngine:
                 self._debug_logger.log(
                     DEBUG_CAT_CHARGING_WINDOW_OPEN,
                     f"window={session.charging_window_count} opened at restart "
-                    f"(power={current_power:.0f}W energy_start={current_energy:.3f}kWh)",
+                    f"(power={current_power:.0f}W energy_start={current_energy_or_last:.3f}kWh)",
                 )
         # If power=0, leave window tracker empty — window will open when power returns
+
+        # Spec 027 D-38: replay the present through the live handler, so a counter that
+        # went backwards during the outage meets the live reset rule.
+        if current_energy is not None:
+            self._handle_energy_update(str(current_energy))
+        stored_hour = self._stored_hour()
+        if self._pricing.mode == "spot" and stored_hour is not None and stored_hour > _hour_of(now):
+            # Spec 027 D-55: a clock behind the snapshot (no RTC at boot) must not bill
+            # the stored hour twice; it continues until the clock passes it.
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: the stored spot hour %s is later than the clock "
+                "(%s) — it continues as the hour in progress",
+                self._hour_start_time,
+                now.isoformat(),
+            )
+        if self._pricing.mode == "spot" and (stored_hour is None or stored_hour < _hour_of(now)):
+            # Spec 027 D-39: the stored hour has passed — the energy not yet billed,
+            # outage energy included, closes into it at its stored price. Without a
+            # reading the close waits for the first one (spec 027 § 12, X-2).
+            if current_energy is not None:
+                self._async_hourly_snapshot(now)
+            else:
+                self._spot_close_pending = True
+        self._recompute_derived(session)
 
         if self._debug_logger:
             self._debug_logger.log(
@@ -962,7 +1218,7 @@ class PlugAnchoredSessionEngine:
         # write is what keeps the on-disk copy fresh; if it fails the original
         # snapshot is still on disk (non-fatal — log and continue tracking).
         try:
-            await self._session_store.async_save_active_session(session.to_dict())
+            await self._session_store.async_save_active_session(self.get_active_session_dict())
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
                 "PlugAnchoredSessionEngine: immediate post-resume snapshot re-persist "
@@ -970,17 +1226,152 @@ class PlugAnchoredSessionEngine:
                 err,
             )
 
-    async def _complete_snapshot_as_session(
-        self, snapshot: dict, current_energy: float, now: datetime
-    ) -> None:
-        """Complete a snapshot as a reconstructed session with best available data."""
-        energy_start = float(snapshot.get("energy_start_kwh", 0.0))
-        saved_energy_kwh = float(snapshot.get("energy_kwh", 0.0))
-        best_energy = (
-            max(0.0, current_energy - energy_start)
-            if current_energy >= energy_start
-            else saved_energy_kwh
+    @staticmethod
+    def _snapshot_price_details(snapshot: dict) -> list[dict] | None:
+        """The snapshot's ``price_details``; a malformed list counts as empty (D-55)."""
+        details = snapshot.get("price_details")
+        if details is None:
+            return None
+        if isinstance(details, list) and all(
+            isinstance(d, dict) and _is_number(d.get("kwh")) and _is_number(d.get("cost_kr", 0.0))
+            for d in details
+        ):
+            return [dict(d) for d in details]
+        _LOGGER.warning(
+            "PlugAnchoredSessionEngine: price_details of snapshot id=%s is malformed (%r) "
+            "— treated as empty (spec 027 D-55)",
+            snapshot.get("id", "?"),
+            details,
         )
+        return []
+
+    def _stored_hour(self) -> datetime | None:
+        """The start of the spot hour in progress as a time, or None."""
+        try:
+            stored = datetime.fromisoformat(self._hour_start_time)
+        except (TypeError, ValueError):
+            return None
+        return stored if stored.tzinfo is not None else None
+
+    def _restore_session_context(self, snapshot: dict, session: Session, now: datetime) -> bool:
+        """Restore what the session started with from the snapshot's ``resume_state``.
+
+        Spec 027 D-36 (pricing), D-39 (spot hour), D-40 (guest rate), D-41 (charger
+        total). A snapshot written by 0.4.7 has no ``resume_state`` and takes the
+        fallbacks of D-45; a ``resume_state`` with a missing or malformed part takes
+        the same fallback for that part and logs a warning (RT-31). Returns whether a
+        stored spot hour was restored.
+        """
+        state = snapshot.get("resume_state")
+        if state is not None and not isinstance(state, dict):
+            _LOGGER.warning(
+                "PlugAnchoredSessionEngine: resume_state of snapshot id=%s is malformed "
+                "(%r) — using the fallbacks of spec 027 D-45",
+                session.id,
+                state,
+            )
+            state = None
+        written_by_047 = state is None
+        state = state or {}
+
+        def fallback(part: str) -> None:
+            if not written_by_047:
+                _LOGGER.warning(
+                    "PlugAnchoredSessionEngine: resume_state.%s of snapshot id=%s is "
+                    "missing or malformed (%r) — using the fallback of spec 027 D-45",
+                    part,
+                    session.id,
+                    state.get(part),
+                )
+
+        pricing = state.get("pricing")
+        mode = pricing.get("mode") if isinstance(pricing, dict) else None
+        if (mode == "static" and _is_price(pricing.get(CONF_STATIC_PRICE_KWH))) or (
+            mode == "spot"
+            and isinstance(pricing.get(CONF_SPOT_PRICE_ENTITY), str)
+            and _is_number(pricing.get(CONF_SPOT_ADDITIONAL_COST_KWH))
+            and _is_number(pricing.get(CONF_SPOT_VAT_MULTIPLIER))
+            and _is_price(pricing.get(CONF_SPOT_FALLBACK_PRICE_KWH))
+        ):
+            self._apply_pricing(dict(pricing))
+        else:
+            fallback("pricing")
+            self._apply_pricing(self._entry_pricing_params())
+
+        guest: GuestPricing | None = None
+        raw_guest = state.get("guest_pricing")
+        method = raw_guest.get("method") if isinstance(raw_guest, dict) else None
+        if (method == "fixed" and _is_price(raw_guest.get("price_per_kwh"))) or (
+            method == "markup" and _is_price(raw_guest.get("markup_factor"))
+        ):
+            guest = GuestPricing.from_dict(raw_guest)
+        elif raw_guest is not None or "guest_pricing" not in state:
+            fallback("guest_pricing")
+            # Spec 027 D-45: look the card up again; its rate counts only while the
+            # card still names the same guest.
+            index = session.rfid_index
+            if isinstance(index, int):
+                resolution = RfidLookup(self._config_store.data).resolve(index + 1)
+                if resolution.user_name == session.user_name and resolution.guest_pricing:
+                    guest = GuestPricing.from_dict(resolution.guest_pricing)
+        self._guest_pricing = guest
+        session.charge_price_method = guest.method if guest is not None else None
+
+        valid = False
+        if self._pricing.mode == "spot":
+            # Spec 027 D-39: the energy already billed is what price_details holds.
+            self._hour_energy_snapshot = sum(
+                detail.get("kwh", 0.0) for detail in session.price_details or []
+            )
+            spot_hour = state.get("spot_hour")
+            try:
+                # Compared with the clock as a time (D-55), so it must carry its zone.
+                valid = datetime.fromisoformat(spot_hour["start"]).tzinfo is not None and (
+                    spot_hour["price"] is None or _is_number(spot_hour["price"])
+                )
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            if valid:
+                self._hour_start_time = spot_hour["start"]
+                self._current_hour_price = spot_hour["price"]
+            else:
+                fallback("spot_hour")
+                self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+                self._capture_hour_price()
+
+        self._eto_start = session.charger_total_before_kwh
+        return valid
+
+    def _implied_spot_price(self, snapshot: dict, session: Session) -> float | None:
+        """The spot price at which the snapshot's running cost priced its unbilled energy.
+
+        Spec 027 § 13.5 V-3: ``(cost − Σ cost_kr) / (energy − Σ kwh)`` from the snapshot,
+        as the spot price that gives this total price per kWh; None when it cannot be
+        formed.
+        """
+        details = session.price_details or []
+        unbilled_kwh = float(snapshot.get("energy_kwh", 0.0)) - sum(d["kwh"] for d in details)
+        unbilled_cost = float(snapshot.get("cost_total_kr", 0.0)) - sum(
+            d.get("cost_kr", 0.0) for d in details
+        )
+        vat = self._pricing_params[CONF_SPOT_VAT_MULTIPLIER]
+        if unbilled_kwh <= 0 or not vat:
+            return None
+        spot = (
+            unbilled_cost / unbilled_kwh / vat - self._pricing_params[CONF_SPOT_ADDITIONAL_COST_KWH]
+        )
+        return spot if math.isfinite(spot) else None
+
+    async def _complete_snapshot_as_session(
+        self,
+        snapshot: dict,
+        energy_kwh: float,
+        now: datetime,
+        *,
+        charger_total_after_kwh: float | None = None,
+    ) -> None:
+        """Complete a snapshot as a reconstructed session with the energy the caller chose."""
+        energy_start = float(snapshot.get("energy_start_kwh", 0.0))
 
         connected_at_str = snapshot.get("connected_at") or snapshot.get(
             "started_at", now.isoformat()
@@ -1024,15 +1415,37 @@ class PlugAnchoredSessionEngine:
             charging_duration_s=charging_duration_s,
             charging_window_count=int(snapshot.get("charging_window_count", 0)),
             energy_start_kwh=energy_start,
-            energy_kwh=round(best_energy, 3),
+            energy_kwh=round(energy_kwh, 3),
             cost_total_kr=float(snapshot.get("cost_total_kr", 0.0)),
             cost_method=snapshot.get("cost_method", "static"),
-            price_details=snapshot.get("price_details"),
-            charger_total_before_kwh=snapshot.get("charger_total_before_kwh"),
+            price_details=self._snapshot_price_details(snapshot),
+            # Spec 027 D-56: both totals or neither, as the live completion.
+            charger_total_before_kwh=(
+                snapshot.get("charger_total_before_kwh")
+                if charger_total_after_kwh is not None
+                else None
+            ),
+            charger_total_after_kwh=(
+                charger_total_after_kwh
+                if snapshot.get("charger_total_before_kwh") is not None
+                else None
+            ),
             max_power_w=float(snapshot.get("max_power_w", 0.0)),
             reconstructed=True,
             data_gap=True,
         )
+        spot_hour_restored = self._restore_session_context(snapshot, session, now)
+        if self._pricing.mode == "spot":
+            if not spot_hour_restored:
+                # Spec 027 § 13.5 V-3 (amends D-45): without a stored hour, the price the
+                # snapshot's own running cost implies; else the price captured now, else
+                # the fallback.
+                implied = self._implied_spot_price(snapshot, session)
+                if implied is not None:
+                    self._current_hour_price = implied
+            # Spec 027 D-39: the remaining energy closes into the stored hour.
+            self._bill_open_hour(session, session.energy_kwh)
+        self._recompute_derived(session)
 
         if charging_duration_s > 0 and session.energy_kwh > 0:
             session.avg_power_w = round((session.energy_kwh * 3_600_000) / charging_duration_s, 1)
@@ -1065,7 +1478,10 @@ class PlugAnchoredSessionEngine:
             # disk until a recovery decision lands (review F2).
             await self._session_store.async_clear_active_session()
 
-        self._state = SessionEngineState.IDLE
+        # Spec 027 D-56: the values belong to the session held now, if any.
+        if self._active_session is None:
+            self._reset_session_values()
+            self._state = SessionEngineState.IDLE
 
     # -----------------------------------------------------------------------
     # Setup: register HA entity listeners (T028)
@@ -1168,6 +1584,20 @@ class PlugAnchoredSessionEngine:
             if state and state.state not in _INVALID_STATES:
                 setattr(self, attr_name, state.state)
 
+        # Spec 027 D-54: from here on, whether the price entity has had a valid state.
+        entry_pricing = self._entry_pricing_params()
+        spot_entity = entry_pricing.get(CONF_SPOT_PRICE_ENTITY)
+        if entry_pricing["mode"] == "spot" and spot_entity:
+            if _spot_value(self._hass.states.get(spot_entity)) is not None:
+                self._spot_seen_valid.add(spot_entity)
+            elif self._spot_watch_unsub is None:
+                self._watch_spot_entity(spot_entity)
+
+        # Spec 027 D-51: a cable already in at setup gets its normal plug-on handling
+        # (spec 020: the RFID wait is re-derived from the entity values).
+        if self._state == SessionEngineState.IDLE and self._get_plug() == "on":
+            self._handle_plug_on(cable_in=True)
+
     # -----------------------------------------------------------------------
     # State change dispatch (T028)
     # -----------------------------------------------------------------------
@@ -1192,7 +1622,10 @@ class PlugAnchoredSessionEngine:
         if entity_id == plug_entity and plug_entity:
             if new_val is not None:
                 self._handle_observation_change("PLUG_STATE", "plug", "_last_plug", new_val)
-            self._handle_plug_change(new_val)
+            old_state = event.data.get("old_state")
+            self._handle_plug_change(
+                new_val, cable_in=old_state is None or old_state.state in _INVALID_STATES
+            )
             self._dispatch_update()
             return
 
@@ -1275,8 +1708,10 @@ class PlugAnchoredSessionEngine:
     # Plug handling: session start/end (T024)
     # -----------------------------------------------------------------------
 
-    def _handle_plug_change(self, new_val: str | None) -> None:
+    def _handle_plug_change(self, new_val: str | None, *, cable_in: bool = False) -> None:
         """Handle plug entity state change — the primary session boundary signal.
+
+        ``cable_in``: the plug entity had no valid state before this one (spec 027 D-51).
 
         BUG-7 fix: STATE_UNAVAILABLE / STATE_UNKNOWN (the literal strings, not
         Python None) used to silently no-op. The go-e WebSocket emits these
@@ -1340,7 +1775,7 @@ class PlugAnchoredSessionEngine:
                 # disconnect as transient (existing behavior).
 
         if new_val == "on":
-            self._handle_plug_on()
+            self._handle_plug_on(cable_in=cable_in)
         elif new_val == "off":
             self._handle_plug_off()
         else:
@@ -1351,7 +1786,7 @@ class PlugAnchoredSessionEngine:
                     f"plug entity reports unrecognised value {new_val!r}; ignored",
                 )
 
-    def _handle_plug_on(self) -> None:
+    def _handle_plug_on(self, *, cable_in: bool = False) -> None:
         """Plug transitioned off → on: start a new session or enter RFID wait (PR-24).
 
         If called while already TRACKING (transient disconnect resolved),
@@ -1362,6 +1797,9 @@ class PlugAnchoredSessionEngine:
         session immediately (fast path, FR-006).
         trx="0" (open-access sentinel at go-e) is NOT in _INVALID_STATES and
         triggers the immediate-start path.
+
+        ``cable_in``: the plug-on does not follow a valid ``off`` (at setup, or the plug
+        entity had no valid state), so the plug-in was not observed (spec 027 D-51).
         """
         if self._state == SessionEngineState.TRACKING:
             # Plug returned during a transient disconnect
@@ -1372,22 +1810,45 @@ class PlugAnchoredSessionEngine:
             # Already completing — ignore
             return
 
+        # While a recovery decision is open, the recovery decides what this cable is; a
+        # session started here (e.g. by power during an RFID wait) would be overwritten
+        # by it. The plug is handed back afterwards (spec 027 D-49, § 12 X-3).
+        if self._recovery_pending:
+            return
+
         # Cancel any lingering disconnect timer (defensive)
         self._cancel_grace_timer()
         self._cancel_rfid_wait()
 
         self._state = SessionEngineState.TRACKING
 
+        # Spec 027 D-58: a cable already in takes the baseline of main (the reading now).
+        # At a real plug-in the counter can still show the previous connection for a
+        # moment, and a zero baseline would bill it to this one (§ 13.5 V-1).
         current_trx = self._get_trx()
 
-        if current_trx in _INVALID_STATES:
+        if (
+            current_trx in _INVALID_STATES
+            and cable_in
+            and (self._get_power() or 0.0) > 0
+            and not self._rfid_entity_unready()
+        ):
+            # Spec 027 D-51: power already flowing produces no power event to resolve
+            # an RFID wait — the open-access inference of FR-003 runs now. Only on a
+            # real "no card": an RFID entity not loaded yet may still show one (V-2).
+            self._hass.async_create_task(
+                self._async_start_session(
+                    reason=UnknownReason.OPEN_ACCESS_INFERRED, reconstructed=True
+                )
+            )
+        elif current_trx in _INVALID_STATES:
             # trx is null/unavailable at plug-on → enter event-driven RFID wait (FR-001)
             now = dt_util.utcnow()
-            self._start_rfid_wait(now)
+            self._start_rfid_wait(now, reconstructed=cable_in)
         else:
             # trx is already non-null (fast path: blip-before-plug, or open-access)
             # → immediate session start (FR-006)
-            self._hass.async_create_task(self._async_start_session())
+            self._hass.async_create_task(self._async_start_session(reconstructed=cable_in))
 
     def _handle_plug_off(self) -> None:
         """Plug transitioned on → off: validate with cable_lock before ending (PR-22 FR-002/FR-003).
@@ -1459,6 +1920,7 @@ class PlugAnchoredSessionEngine:
                     "treating as transient disconnect, starting grace timer",
                 )
             self._start_grace_timer()
+            self._schedule_snapshot_write()
 
     def _handle_cable_lock_confirmation(self, new_val: str | None) -> None:
         """Confirm a genuine unplug from a late cable_lock→Unlocked (PR-25, FR-001).
@@ -1693,7 +2155,12 @@ class PlugAnchoredSessionEngine:
     # (trx non-null, power > 0, plug-off). No new listener registration needed.
     # -----------------------------------------------------------------------
 
-    def _start_rfid_wait(self, plug_on_at: datetime) -> None:
+    def _start_rfid_wait(
+        self,
+        plug_on_at: datetime,
+        *,
+        reconstructed: bool = False,
+    ) -> None:
         """Enter the event-driven RFID wait after plug-on with trx=null (FR-001).
 
         Creates a _RfidWaitState recording the plug-on timestamp and logs the
@@ -1706,11 +2173,12 @@ class PlugAnchoredSessionEngine:
 
         Args:
             plug_on_at: UTC timestamp of the plug-on event (becomes session.connected_at, FR-007).
+            reconstructed: the session the wait starts is flagged (D-51).
         """
         # Cancel any stale wait state (defensive)
         self._cancel_rfid_wait()
 
-        self._rfid_wait = _RfidWaitState(plug_on_at=plug_on_at)
+        self._rfid_wait = _RfidWaitState(plug_on_at=plug_on_at, reconstructed=reconstructed)
 
         if self._debug_logger:
             self._debug_logger.log(
@@ -1742,6 +2210,7 @@ class PlugAnchoredSessionEngine:
 
         # Save plug_on_at BEFORE cancelling (cancel clears the state)
         saved_plug_on_at = self._rfid_wait.plug_on_at
+        reconstructed = self._rfid_wait.reconstructed
 
         # Clear the wait state
         self._cancel_rfid_wait()
@@ -1751,7 +2220,9 @@ class PlugAnchoredSessionEngine:
         # so as long as the new_val is already in the entity state by now
         # (which it is — this callback fires after the state change), it will
         # be resolved by RfidLookup.
-        self._hass.async_create_task(self._async_start_session(connected_at=saved_plug_on_at))
+        self._hass.async_create_task(
+            self._async_start_session(connected_at=saved_plug_on_at, reconstructed=reconstructed)
+        )
 
     # -----------------------------------------------------------------------
     # Power handling: charging window lifecycle (T025, T026)
@@ -1784,6 +2255,7 @@ class PlugAnchoredSessionEngine:
                 # Power began flowing while waiting for RFID — open-access charger.
                 # Save plug_on_at and clear wait before starting session (FR-007).
                 plug_on_at = self._rfid_wait.plug_on_at
+                reconstructed = self._rfid_wait.reconstructed
                 self._cancel_rfid_wait()
                 if self._debug_logger:
                     self._debug_logger.log(
@@ -1795,6 +2267,7 @@ class PlugAnchoredSessionEngine:
                     self._async_start_session(
                         connected_at=plug_on_at,
                         reason=UnknownReason.OPEN_ACCESS_INFERRED,
+                        reconstructed=reconstructed,
                     )
                 )
                 return
@@ -1869,6 +2342,7 @@ class PlugAnchoredSessionEngine:
                 f"energy_start={energy_now:.3f}kWh "
                 f"session_id={session.id}",
             )
+        self._schedule_snapshot_write()
 
     def _start_idle_timer(self, _now: datetime) -> None:
         """Start the charging-idle timer (T026). Fires when power has been 0 for idle_timeout."""
@@ -1947,6 +2421,8 @@ class PlugAnchoredSessionEngine:
                 "session_window_count": session.charging_window_count,
             },
         )
+        # No-op inside a completion: the pipeline has already claimed the session.
+        self._schedule_snapshot_write()
 
     # -----------------------------------------------------------------------
     # Energy tracking (T028)
@@ -2011,7 +2487,17 @@ class PlugAnchoredSessionEngine:
 
         # Energy delta from session start
         session.energy_kwh = max(0.0, energy_kwh - session.energy_start_kwh)
+        if self._spot_close_pending:
+            self._async_hourly_snapshot(dt_util.utcnow())
+        self._recompute_derived(session)
 
+    def _recompute_derived(self, session: Session) -> None:
+        """Recompute cost, guest charge price and SoC from the session's energy.
+
+        Spec 027 D-37: runs on every energy update, at the end of a resume and when a
+        snapshot is completed, so no stored value is older than the energy it belongs
+        to; a live session is therefore current when it completes.
+        """
         # Mode-aware cost update
         if self._pricing.mode == "static":
             session.cost_total_kr = self._pricing.calculate(session.energy_kwh)
@@ -2044,6 +2530,8 @@ class PlugAnchoredSessionEngine:
         self,
         connected_at: datetime | None = None,
         reason: UnknownReason | None = None,
+        energy_start_kwh: float | None = None,
+        reconstructed: bool = False,
     ) -> None:
         """Create a new session on plug-on event — INITIALIZING state.
 
@@ -2057,6 +2545,11 @@ class PlugAnchoredSessionEngine:
                 Used by the open-access inference path (FR-003, PR-24) to record
                 UnknownReason.OPEN_ACCESS_INFERRED instead of the default
                 UnknownReason.TRX_NULL when trx is null but power flow started.
+            energy_start_kwh: Counter baseline; None takes the reading now. Spec 027
+                D-50 passes 0.0 for the new connection of a card split, and the
+                session then holds the whole counter at once.
+            reconstructed: the plug-in was not observed (spec 027 D-50/D-51); the
+                session is flagged ``reconstructed`` and ``data_gap``.
         """
         # Idempotency guard: a late-arriving scheduled task (e.g. from trx-resolve
         # callback) must abort if the engine has moved on between task scheduling
@@ -2071,6 +2564,8 @@ class PlugAnchoredSessionEngine:
             return
 
         try:
+            # Spec 027 D-36: a price changed in the options applies from the next session.
+            self._apply_pricing(self._entry_pricing_params())
             now = dt_util.utcnow()
             now_iso = now.isoformat()
             # Use the caller-provided plug-on time if available (FR-007), else current time.
@@ -2095,6 +2590,7 @@ class PlugAnchoredSessionEngine:
             # Snapshot energy at session start
             energy = self._get_energy() or 0.0
             self._last_energy_kwh = energy
+            start_kwh = energy if energy_start_kwh is None else energy_start_kwh
 
             power = self._get_power() or 0.0
             self._last_power_w = power
@@ -2124,14 +2620,18 @@ class PlugAnchoredSessionEngine:
                 # PR-22 canonical — plug-on time (may predate session start when set via
                 # the RFID wait path or open-access inference; PR-24 FR-007)
                 connected_at=connected_at_iso,
-                energy_start_kwh=energy,
-                energy_kwh=0.0,
+                energy_start_kwh=start_kwh,
+                energy_kwh=max(0.0, energy - start_kwh),
             )
 
             # Reset window tracker for this session
             self._window_tracker = ChargingWindowTracker()
-            self._data_gap = False
+            self._data_gap = reconstructed
+            self._active_session.reconstructed = reconstructed
+            self._active_session.data_gap = reconstructed
             self._eto_start = self._get_eto()
+            # Spec 027 D-41: stored at start so an interruption cannot lose it.
+            self._active_session.charger_total_before_kwh = self._eto_start
 
             # Snapshot guest pricing (Constitution §II Snapshot Principle)
             if resolution is not None and resolution.guest_pricing is not None:
@@ -2165,6 +2665,9 @@ class PlugAnchoredSessionEngine:
                 self._capture_hour_price()
                 self._arm_hourly_spot_callback()
 
+            if energy_start_kwh is not None:
+                self._recompute_derived(self._active_session)
+
             # Story 07: check for unmapped RFID and trigger passive notification if needed
             if session_user_type == "unknown" and resolution is not None:
                 if resolution.reason in ("unmapped", "rfid_inactive", "type_error"):
@@ -2179,7 +2682,7 @@ class PlugAnchoredSessionEngine:
                 self._debug_logger.log(
                     "ENGINE_DECISION",
                     f"IDLE → TRACKING (trigger: plug=on + rfid_resolved) "
-                    f"energy_start={energy:.3f}kWh",
+                    f"energy_start={start_kwh:.3f}kWh",
                 )
 
             # FR-004 (PR-28): full tag values only at debug level in the HA log
@@ -2211,6 +2714,8 @@ class PlugAnchoredSessionEngine:
             if power > 0:
                 self._open_window(now)
                 self._dispatch_update()
+
+            await self.async_write_snapshot()
 
         except Exception as err:  # noqa: BLE001
             _LOGGER.error(
@@ -2566,7 +3071,10 @@ class PlugAnchoredSessionEngine:
                     )
 
             # ETO cross-validation.
-            # Review F1(a): degraded on failure — totals stay unset.
+            # Review F1(a): degraded on failure — totals stay unset. Spec 027 D-56:
+            # the total at start is stored from session start (D-41), but a record
+            # has both totals or neither.
+            session.charger_total_before_kwh = None
             try:
                 eto_end = self._get_eto()
                 if self._eto_start is not None and eto_end is not None:
@@ -2738,27 +3246,33 @@ class PlugAnchoredSessionEngine:
             # stuck in COMPLETING after a persist failure (BUG-4).
             # PR-27 FR-010: _active_session was already claimed (set to None) at
             # the top of this method; only the remaining per-session state is reset.
-            self._rfid_wait = None  # defensive parity: complete session implies no pending wait
-            # Review F1(b): a finished completion settles any pending retry
-            # (e.g. another trigger completed the session before the timer fired).
-            self._cancel_completion_retry()
-            self._window_tracker = ChargingWindowTracker()
-            self._guest_pricing = None
-            self._last_energy_kwh = 0.0
-            self._last_power_w = 0.0
-            self._hour_energy_snapshot = 0.0
-            self._hour_start_time = ""
-            self._data_gap = False
-            # PR-25: clear the captured plug-off context so a stale timestamp/snapshot
-            # cannot be applied to a later, unrelated completion (D7).
-            self._plug_off_at = None
-            self._data_gap_before_disconnect = None
-            # PR-27 FR-020: the grace question (if any) is settled by this completion.
-            self._grace_pending_at_outage = False
-            self._eto_start = None
+            self._reset_session_values()
             self._state = SessionEngineState.IDLE
 
             self._dispatch_update()
+
+    def _reset_session_values(self) -> None:
+        """Clear the per-session values once a session is completed (live or snapshot)."""
+        self._rfid_wait = None  # defensive parity: complete session implies no pending wait
+        # Review F1(b): a finished completion settles any pending retry
+        # (e.g. another trigger completed the session before the timer fired).
+        self._cancel_completion_retry()
+        self._window_tracker = ChargingWindowTracker()
+        self._guest_pricing = None
+        self._last_energy_kwh = 0.0
+        self._last_power_w = 0.0
+        self._hour_energy_snapshot = 0.0
+        self._hour_start_time = ""
+        self._spot_close_pending = False
+        self._spot_price_pending = False
+        self._data_gap = False
+        # PR-25: clear the captured plug-off context so a stale timestamp/snapshot
+        # cannot be applied to a later, unrelated completion (D7).
+        self._plug_off_at = None
+        self._data_gap_before_disconnect = None
+        # PR-27 FR-020: the grace question (if any) is settled by this completion.
+        self._grace_pending_at_outage = False
+        self._eto_start = None
 
     def _build_completed_event_data(self, session: Session) -> dict[str, Any]:
         """Build the EVENT_SESSION_COMPLETED payload."""
@@ -2826,11 +3340,25 @@ class PlugAnchoredSessionEngine:
         boundary, racing this tick). The price read NOW becomes the captured
         price for the hour that starts at this boundary.
         """
+        # Spec 027 D-55: a tick for the hour in progress (a timer armed in the first second
+        # of an hour) or an earlier one (the clock stepped back) has nothing to close.
+        stored_hour = self._stored_hour()
+        if stored_hour is not None and _hour_of(now) <= stored_hour:
+            return
+        self._spot_close_pending = False
         if self._active_session is None or self._pricing.mode != "spot":
             return
         session = self._active_session
-        current_relative_energy = (self._last_energy_kwh or 0.0) - session.energy_start_kwh
-        kwh_this_hour = max(0.0, current_relative_energy - self._hour_energy_snapshot)
+        self._bill_open_hour(session, (self._last_energy_kwh or 0.0) - session.energy_start_kwh)
+        self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
+        # FR-009 (PR-29): capture the price for the hour that starts at this boundary.
+        self._capture_hour_price()
+        self._dispatch_update()
+        self._schedule_snapshot_write()
+
+    def _bill_open_hour(self, session: Session, relative_energy_kwh: float) -> None:
+        """Append the hour in progress to price_details, billed at its captured price."""
+        kwh_this_hour = max(0.0, relative_energy_kwh - self._hour_energy_snapshot)
         detail = self._pricing.calculate_spot_hour(kwh_this_hour, self._current_hour_price)
         detail["hour"] = self._hour_start_time
         detail["kwh"] = round(kwh_this_hour, 3)
@@ -2838,11 +3366,7 @@ class PlugAnchoredSessionEngine:
             session.price_details = []
         session.price_details.append(detail)
         session.cost_total_kr = self._pricing.calculate_spot_total(session.price_details)
-        self._hour_energy_snapshot = current_relative_energy
-        self._hour_start_time = now.strftime("%Y-%m-%dT%H:00+00:00")
-        # FR-009 (PR-29): capture the price for the hour that starts at this boundary.
-        self._capture_hour_price()
-        self._dispatch_update()
+        self._hour_energy_snapshot = relative_energy_kwh
 
     # -----------------------------------------------------------------------
     # Charger-offline detection (FR-028)
@@ -2941,8 +3465,48 @@ class PlugAnchoredSessionEngine:
         except (ValueError, TypeError):
             return None
 
+    def _entry_pricing_params(self) -> dict[str, Any]:
+        """The price parameters configured in the entry, in the ``resume_state`` shape."""
+        data = self._entry.data
+        mode = data.get("pricing_mode", "static")
+        if mode == "spot":
+            return {
+                "mode": mode,
+                CONF_SPOT_PRICE_ENTITY: data.get(CONF_SPOT_PRICE_ENTITY, ""),
+                CONF_SPOT_ADDITIONAL_COST_KWH: data.get(
+                    CONF_SPOT_ADDITIONAL_COST_KWH, DEFAULT_SPOT_ADDITIONAL_COST_KWH
+                ),
+                CONF_SPOT_VAT_MULTIPLIER: data.get(
+                    CONF_SPOT_VAT_MULTIPLIER, DEFAULT_SPOT_VAT_MULTIPLIER
+                ),
+                CONF_SPOT_FALLBACK_PRICE_KWH: data.get(
+                    CONF_SPOT_FALLBACK_PRICE_KWH, DEFAULT_SPOT_FALLBACK_PRICE_KWH
+                ),
+            }
+        return {
+            "mode": mode,
+            CONF_STATIC_PRICE_KWH: data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
+        }
+
+    def _apply_pricing(self, params: dict[str, Any]) -> None:
+        """Price the session with ``params`` (``_entry_pricing_params`` shape)."""
+        self._pricing_params = params
+        spot_config: SpotConfig | None = None
+        if params["mode"] == "spot":
+            spot_config = SpotConfig(
+                price_entity=params[CONF_SPOT_PRICE_ENTITY],
+                additional_cost_kwh=params[CONF_SPOT_ADDITIONAL_COST_KWH],
+                vat_multiplier=params[CONF_SPOT_VAT_MULTIPLIER],
+                fallback_price_kwh=params[CONF_SPOT_FALLBACK_PRICE_KWH],
+            )
+        self._pricing = PricingEngine(
+            mode=params["mode"],
+            static_price=params.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
+            spot_config=spot_config,
+        )
+
     def _read_spot_price(self) -> float | None:
-        entity_id = self._entry.data.get(CONF_SPOT_PRICE_ENTITY)
+        entity_id = self._pricing_params.get(CONF_SPOT_PRICE_ENTITY)
         if not entity_id:
             return None
         state = self._hass.states.get(entity_id)
@@ -2991,14 +3555,79 @@ class PlugAnchoredSessionEngine:
                 exc_info=True,
             )
         self._current_hour_price = price
-        if price is None:
-            _LOGGER.warning(
-                "Spot price sensor '%s' unavailable at hour start (%s) — "
-                "fallback %.2f kr/kWh will price this hour",
-                self._entry.data.get(CONF_SPOT_PRICE_ENTITY),
+        entity_id = self._pricing_params.get(CONF_SPOT_PRICE_ENTITY)
+        if price is not None and entity_id:
+            self._spot_seen_valid.add(entity_id)
+        # Spec 027 D-54: a price entity not loaded yet since setup (this integration
+        # starts first) gives the hour its first valid state instead of the fallback.
+        self._spot_price_pending = (
+            price is None and bool(entity_id) and entity_id not in self._spot_seen_valid
+        )
+        if self._spot_price_pending:
+            self._watch_spot_entity(entity_id)
+            _LOGGER.info(
+                "Spot price sensor '%s' not loaded yet at hour start (%s) — the hour takes "
+                "its first valid state within the hour, else fallback %.2f kr/kWh",
+                entity_id,
                 self._hour_start_time,
                 self._pricing.fallback_price or 0.0,
             )
+        elif price is None:
+            _LOGGER.warning(
+                "Spot price sensor '%s' unavailable at hour start (%s) — "
+                "fallback %.2f kr/kWh will price this hour",
+                entity_id,
+                self._hour_start_time,
+                self._pricing.fallback_price or 0.0,
+            )
+
+    def _watch_spot_entity(self, entity_id: str) -> None:
+        """Listen for the price entity's first valid state (spec 027 D-54)."""
+        if self._spot_watch_unsub is not None and self._spot_watch_entity == entity_id:
+            return
+        self._safe_cancel("_spot_watch_unsub")
+        self._spot_watch_entity = entity_id
+        self._spot_watch_unsub = async_track_state_change_event(
+            self._hass, [entity_id], self._on_spot_price_state
+        )
+
+    @callback
+    def _on_spot_price_state(self, event: Event) -> None:
+        """The price entity's first valid state; it prices the hour still awaiting one."""
+        new_state = event.data.get("new_state")
+        price = _spot_value(new_state)
+        if price is None:
+            return
+        entity_id = event.data.get("entity_id")
+        self._spot_seen_valid.add(entity_id)
+        session = self._active_session
+        if (
+            self._spot_price_pending
+            and session is not None
+            and self._pricing.mode == "spot"
+            and entity_id == self._pricing_params.get(CONF_SPOT_PRICE_ENTITY)
+        ):
+            hour_start = self._stored_hour()
+            # Only a state of the hour in progress: one updated before its start, or
+            # after its end while the tick is still due, carries another hour's price
+            # (the boundary race of spec 025 / PR-29).
+            if hour_start is None or not (
+                hour_start <= new_state.last_updated < hour_start + timedelta(hours=1)
+            ):
+                return
+            self._current_hour_price = price
+            self._spot_price_pending = False
+            if self._debug_logger:
+                self._debug_logger.log(
+                    DEBUG_CAT_SESSION_RESUMED,
+                    f"spot price {price} from {entity_id}'s first valid state prices the "
+                    f"hour {self._hour_start_time} (spec 027 D-54)",
+                )
+            self._recompute_derived(session)
+            self._dispatch_update()
+            self._schedule_snapshot_write()
+        self._safe_cancel("_spot_watch_unsub")
+        self._spot_watch_entity = None
 
     def _calculate_charge_price(self, session: Session) -> float | None:
         if self._guest_pricing is None:

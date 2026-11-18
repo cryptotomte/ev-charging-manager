@@ -153,7 +153,11 @@ class Session:
             # Cost
             "cost_total_kr": self.cost_total_kr,
             "cost_method": self.cost_method,
-            "price_details": self.price_details,
+            # A copy: the store serialises after an await, and a snapshot must not share
+            # the live list (spec 027 D-42).
+            "price_details": (
+                None if self.price_details is None else [dict(d) for d in self.price_details]
+            ),
             "charge_price_total_kr": self.charge_price_total_kr,
             "charge_price_method": self.charge_price_method,
             "estimated_soc_added_pct": self.estimated_soc_added_pct,

@@ -238,15 +238,66 @@ The integration compares session-tracked energy against the charger's total ener
 - Verify the charger's network connection is stable.
 - If using polling mode, consider switching to WebSocket mode for more reliable updates.
 
-### HA Restart Recovery
+### Restart, Reload and Crash
 
-The integration automatically recovers active sessions after a Home Assistant restart:
+On the go-e Gemini profile (`goe_gemini`) a charging session survives a reload
+of the integration (for example after saving the options), a Home Assistant
+restart and a crash:
 
-- The active session snapshot is persisted periodically (default: every 5 minutes).
-- On startup, the engine restores the session if the same RFID card is still active.
-- Very short sessions (< 60s) or sessions with negligible energy (< 50 Wh) may be discarded as micro-sessions.
+- **Kept:** in the ordinary case the user, the energy, the cost, the guest charge
+  price and the spot price per hour end up as without the interruption. The
+  session in progress is saved at every session event and when Home Assistant
+  stops, so a reload or a restart keeps everything up to the moment the
+  integration stopped; a crash loses at most what happened since the last save
+  (at most `persistence_interval_s`, default 5 minutes).
+- **Price changes:** a price or pricing mode changed in the options applies from
+  the **next** session. The session in progress keeps the price it started with.
+- **Someone else plugged in while Home Assistant was down:** when the charger
+  shows a different card than the one the session started with, the first
+  session is closed with the energy saved for it, and the new card gets a
+  session of its own.
+- **Waiting at start-up:** recovery waits for the plug sensor; if it has not
+  reported after 60 minutes, the session is closed with what the charger's
+  counter has counted since the session started, never less than its saved
+  energy, and a notification is shown. Once the plug
+  has reported, recovery waits at most 30 seconds for the energy or card sensor.
+- **Can differ (money):**
+  - A second car that charges and leaves within the same outage is added to the
+    previous user's session.
+  - A card shown only after a session was resumed is not acted on, also when the
+    session had no card: it keeps the user it started with.
+  - If the charger's counter restarted while Home Assistant was down and the
+    same card is still there, what the new counter had counted before start-up
+    is not billed.
+  - Energy delivered between the last save and a crash is lost when the
+    charger's counter no longer shows it (another car plugged in, or the counter
+    reads less after the car left).
+  - In spot mode, energy delivered while Home Assistant was down is priced at
+    the hour that was in progress when it went down, or at the current hour for
+    a session that starts at start-up. If the hour changes before the first
+    counter reading after start-up, that energy is priced at the later hour. An
+    hour is on the fallback price when the price sensor has no price at the
+    hour's start; a sensor that has not reported since the integration was last
+    set up or reloaded is waited for within the hour. A price still missing when
+    the session was saved stays on the fallback if it resumes in the same hour.
+  - A car plugged in without a card while Home Assistant was down, after the
+    previous car left, is added to the resumed session unless the charger shows
+    a different card at start-up.
+  - A session that began entirely while Home Assistant was down is counted from
+    start-up: what the counter already showed then is not billed.
+- **Can differ (not money):** charging time and window count, the plug-in or
+  unplug time when it was not observed, and a car that is still unplugged at
+  start-up after a brief unplug becomes two sessions (the total is right). Every
+  recovered session, and every session started with the cable already in, is
+  marked `reconstructed` and `data_gap`.
 
-Check the logs for "Recovered session" entries to confirm recovery occurred. If a session was lost, look for "Discarded micro-session" or "Session continuity mismatch" messages.
+On the `generic` profile a restart or reload during a session can still lose or
+split the session.
+
+The debug log shows the recovery under `HA_RESTART_DETECTED`, `SESSION_RESUMED`,
+`SESSION_FORCE_ENDED_BY_RESTART` and `RECOVERY_TIMEOUT`. See
+[docs/SESSION-MODEL.md](docs/SESSION-MODEL.md#restart-reload-and-crash-recovery)
+for the details.
 
 ---
 

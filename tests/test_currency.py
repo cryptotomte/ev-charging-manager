@@ -34,14 +34,14 @@ from custom_components.ev_charging_manager.const import (
     STATS_STORE_KEY,
 )
 from tests.conftest import MOCK_CHARGER_DATA, setup_session_engine
-from tests.session_rig import TRX_PAUL, Rig, scenario_a, sessions_on_disk
+from tests.session_rig import TRX_GFIX, TRX_PAUL, Rig, scenario_a, sessions_on_disk
 from tests.test_config_flow import _setup_to_pricing_step
 from tests.test_interruption_fixed_price import (
     PAUL_4KWH,
     _assert_one_paul_session,
-    _second_session,
     save_options,
 )
+from tests.test_interruption_snapshot import COMPLETED_KEYS, RECORD_KEYS
 
 STATIC = {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50}
 
@@ -451,11 +451,43 @@ async def test_change_without_recorder_saves_quietly(hass: HomeAssistant, caplog
     ] == []
 
 
+# The key paths on main at afcadef (read there 2026-11-18), for the T-19 run; F-9 keeps the
+# stores, the session and the engines' data unchanged.
+STATS_PATHS = {
+    "guest_last", "guest_retired", "guest_retired.cost_kr", "guest_retired.energy_kwh",
+    "unknown_session_times", "user_stats", "user_stats.*", "user_stats.*.current_month",
+    "user_stats.*.current_month.cost_kr", "user_stats.*.current_month.energy_kwh",
+    "user_stats.*.current_month.month", "user_stats.*.current_month.sessions",
+    "user_stats.*.last_session_at", "user_stats.*.previous_month",
+    "user_stats.*.previous_month.cost_kr", "user_stats.*.previous_month.energy_kwh",
+    "user_stats.*.previous_month.month", "user_stats.*.previous_month.sessions",
+    "user_stats.*.session_count", "user_stats.*.total_cost_kr", "user_stats.*.total_energy_kwh",
+    "user_stats.*.user_name", "user_stats.*.user_type",
+}  # fmt: skip
+SNAPSHOT_PATHS = RECORD_KEYS | {
+    "resume_state", "resume_state.guest_pricing", "resume_state.pricing",
+    "resume_state.pricing.mode", "resume_state.pricing.static_price_kwh", "resume_state.spot_hour",
+}  # fmt: skip
+
+
+def key_paths(node: dict, prefix: str = "") -> set[str]:
+    """Dotted key paths of nested dicts; the user names under user_stats become ``*``."""
+    out = set()
+    for key, value in node.items():
+        path = "user_stats.*" if prefix == "user_stats" else f"{prefix}.{key}".lstrip(".")
+        out.add(path)
+        if isinstance(value, dict):
+            out |= key_paths(value, path)
+    return out
+
+
 @pytest.mark.parametrize("change", ["none", "EUR"])
 async def test_change_leaves_every_number(hass, hass_storage, freezer, change: str) -> None:
     """T-19: stats store, stored sessions and the completed payload as without a change (F-2, F-3).
 
-    "none" is the reference run: the second session's money is the same in both.
+    "none" is the reference run: the second session's money is the same in both. After the
+    session that follows the change, the stores, the record, the active snapshot and the
+    payload have main's keys.
     """
     rig = Rig(hass, freezer, hass_storage)
     await scenario_a(rig, TRX_PAUL, {})
@@ -468,13 +500,20 @@ async def test_change_leaves_every_number(hass, hass_storage, freezer, change: s
     assert hass_storage[STATS_STORE_KEY]["data"] == stats
     assert sessions_on_disk(hass_storage) == sessions
 
-    await _second_session(rig)
+    await rig.goto("10:45:00")
+    await rig.plug_in(TRX_PAUL)
+    await rig.goto("10:55:00")
+    await rig.set(energy=5.0)
+    assert key_paths(rig.snapshot()) == SNAPSHOT_PATHS
+    await rig.set(power=0)
+    await rig.goto("10:58:00")
+    await rig.unplug()
     first, second = rig.money()
     assert first == PAUL_4KWH
     assert (second["energy"], second["cost"], second["record_cost"]) == (1.0, 2.5, 2.5)
-    before, after = (event.data for event in rig.completed)
-    assert set(after) == set(before)
-    assert not any("currency" in key for key in after)
+    assert key_paths(hass_storage[STATS_STORE_KEY]["data"]) == STATS_PATHS
+    assert [set(record) for record in rig.records()] == [RECORD_KEYS] * 2
+    assert [set(event.data) for event in rig.completed] == [COMPLETED_KEYS] * 2
 
 
 def _session_cost(hass: HomeAssistant, entry) -> tuple[str, str]:
@@ -503,6 +542,59 @@ async def test_session_across_a_change_completes_once(
     _assert_one_paul_session(rig)
     if change != "none":
         assert seen == {"before": ("6.25", "kr"), "after": ("6.25", "EUR")}
+
+
+def _cost_states(hass: HomeAssistant, entry) -> dict[str, tuple[str, str]]:
+    """unique_id suffix -> (state, unit) of every monetary entity of the entry."""
+    out = {}
+    for reg in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id):
+        if reg.original_device_class == "monetary":
+            state = hass.states.get(reg.entity_id)
+            out[reg.unique_id.removeprefix(f"{entry.entry_id}_")] = (
+                state.state,
+                state.attributes.get("unit_of_measurement"),
+            )
+    return out
+
+
+async def _short_session(rig: Rig, trx: str, start: str, end: str, energy: float) -> None:
+    await rig.goto(start)
+    await rig.plug_in(trx)
+    await rig.goto(end)
+    await rig.set(energy=energy)
+    await rig.set(power=0)
+
+
+async def test_every_cost_sensor_keeps_its_value_across_a_change(
+    hass, hass_storage, freezer
+) -> None:
+    """D-77: the seven cost and price sensors read by value before and after kr -> EUR, with
+    Paul, an unmapped card and the guest done and a guest session running (F-2)."""
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_a(rig, TRX_PAUL, {})
+    for trx, start, end, energy in (
+        ("9", "10:45", "10:50", 5.0),
+        (TRX_GFIX, "11:00", "11:05", 6.0),
+    ):
+        await _short_session(rig, trx, f"{start}:00", f"{end}:00", energy)
+        await rig.unplug()
+    await rig.goto("11:15:00")
+    await rig.plug_in(TRX_GFIX)
+    await rig.goto("11:20:00")
+    await rig.set(energy=7.0)
+
+    before = _cost_states(hass, rig.entry)
+    await save_options({CONF_CURRENCY: "EUR", **STATIC})(rig)
+    after = _cost_states(hass, rig.entry)
+
+    assert COST_SENSORS <= set(before)
+    for name in COST_SENSORS:
+        float(before[name][0])
+    assert {name: value for name, (value, _) in after.items()} == {
+        name: value for name, (value, _) in before.items()
+    }
+    assert {unit for _, unit in before.values()} == {"kr"}
+    assert {unit for _, unit in after.values()} == {"EUR"}
 
 
 async def test_user_added_after_a_change_gets_the_new_unit(hass: HomeAssistant) -> None:

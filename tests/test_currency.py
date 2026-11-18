@@ -389,6 +389,28 @@ async def test_options_flow_currency_options(hass: HomeAssistant) -> None:
     assert_currency_options(result)
 
 
+@pytest.mark.parametrize("stored", ["ADP", "EUR"])
+async def test_options_flow_offers_the_stored_unit(hass: HomeAssistant, stored: str) -> None:
+    """D-75: the stored unit is offered once, also when Home Assistant's list lacks it (ADP is
+    a retired code); the form sent back with it saves and keeps it."""
+    assert (stored in ACTIVE_CURRENCIES) is (stored == "EUR")
+    entry = await setup_legacy_entry(hass, **{CONF_CURRENCY: stored})
+    flow = hass.config_entries.options
+    result = await flow.async_init(entry.entry_id)
+    result = await flow.async_configure(result["flow_id"], {})
+
+    config = result["data_schema"].schema[schema_key(result, CONF_CURRENCY)].config
+    assert config["options"] == ["kr", *sorted(set(ACTIVE_CURRENCIES) | {stored})]
+    result = await flow.async_configure(
+        result["flow_id"], {CONF_CURRENCY: stored, **STATIC, CONF_STATIC_PRICE_KWH: 3.0}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert (entry.data[CONF_CURRENCY], entry.data[CONF_STATIC_PRICE_KWH]) == (stored, 3.0)
+    assert_unit(hass, entry, stored)
+
+
 @pytest.mark.parametrize("value", ["euro", "sek", ""])
 async def test_options_flow_rejects_a_value_outside_the_list(
     hass: HomeAssistant, value: str

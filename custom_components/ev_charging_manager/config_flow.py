@@ -123,11 +123,17 @@ def _make_entity_key(
     return vol.Optional(field, description=description) if description else vol.Optional(field)
 
 
-def _currency_selector() -> selector.SelectSelector:
-    """Spec 028 D-61: kr, then Home Assistant's own active ISO 4217 codes; no free text."""
+def _currency_selector(stored: str = LEGACY_CURRENCY) -> selector.SelectSelector:
+    """Spec 028 D-61: kr, then Home Assistant's own active ISO 4217 codes; no free text.
+
+    The stored unit is always offered (D-75), or a code Home Assistant has retired would
+    make the pricing form impossible to save.
+    """
+    codes = set(ACTIVE_CURRENCIES) | {stored}
+    codes.discard(LEGACY_CURRENCY)
     return selector.SelectSelector(
         selector.SelectSelectorConfig(
-            options=[LEGACY_CURRENCY, *sorted(ACTIVE_CURRENCIES)],
+            options=[LEGACY_CURRENCY, *sorted(codes)],
             mode=selector.SelectSelectorMode.DROPDOWN,
             custom_value=False,
         )
@@ -761,6 +767,7 @@ class OptionsFlowHandler(OptionsFlow):
                 return self.async_create_entry(data=self._new_options)
 
         # Pre-fill with current entry.data values
+        current_currency = entry_currency(entry)
         current_mode = entry.data.get(CONF_PRICING_MODE, DEFAULT_PRICING_MODE)
         current_static = entry.data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH)
         current_spot_entity = entry.data.get(CONF_SPOT_PRICE_ENTITY, "")
@@ -774,7 +781,9 @@ class OptionsFlowHandler(OptionsFlow):
 
         schema_dict: dict[Any, Any] = {
             # D-63: the installation's current unit, so a save that leaves it keeps it.
-            vol.Required(CONF_CURRENCY, default=entry_currency(entry)): _currency_selector(),
+            vol.Required(CONF_CURRENCY, default=current_currency): _currency_selector(
+                current_currency
+            ),
             vol.Required(CONF_PRICING_MODE, default=current_mode): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -16,8 +17,9 @@ from homeassistant.config_entries import (
     OptionsFlow,
     SubentryFlowResult,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.generated.currencies import ACTIVE_CURRENCIES
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
 from homeassistant.util import slugify
 
@@ -83,6 +85,7 @@ from .const import (
     UI_DISPATCH_INTERVAL_S_ACTIVE_MIN,
     UI_DISPATCH_INTERVAL_S_MAX,
     UI_DISPATCH_INTERVAL_S_MIN,
+    entry_currency,
 )
 from .rfid_discovery import (
     DiscoveredCard,
@@ -131,6 +134,38 @@ def _currency_selector() -> selector.SelectSelector:
             custom_value=False,
         )
     )
+
+
+def _relabel_cost_statistics(hass: HomeAssistant, entry: ConfigEntry, unit: str) -> None:
+    """Move the long-term statistics of the entry's total-cost sensors to ``unit`` (D-65).
+
+    Relabels, converts nothing. Never blocks the options save it is part of (D-66); Home
+    Assistant's own "unit has changed" repair issue then tells the user what is left.
+    """
+    if "recorder" not in hass.config.components:
+        return
+    try:
+        # Imported here because the integration must work without the recorder (D-68).
+        from homeassistant.components.recorder.statistics import (
+            async_update_statistics_metadata,
+        )
+
+        registry = er.async_get(hass)
+        for reg in er.async_entries_for_config_entry(registry, entry.entry_id):
+            if (
+                reg.original_device_class == SensorDeviceClass.MONETARY
+                and (reg.capabilities or {}).get("state_class") == SensorStateClass.TOTAL
+            ):
+                async_update_statistics_metadata(
+                    hass, reg.entity_id, new_unit_class=None, new_unit_of_measurement=unit
+                )
+    except Exception as err:
+        _LOGGER.warning(
+            "Could not change the unit of the cost sensors' long-term statistics to %s (%s). "
+            "Fix them in Developer tools → Statistics",
+            unit,
+            err,
+        )
 
 
 def _coerce_charging_value(value: Any) -> int | str:
@@ -713,6 +748,7 @@ class OptionsFlowHandler(OptionsFlow):
             if not errors:
                 # Build updated entry.data with new pricing fields
                 pricing_keys = [
+                    CONF_CURRENCY,
                     CONF_PRICING_MODE,
                     CONF_STATIC_PRICE_KWH,
                     CONF_SPOT_PRICE_ENTITY,
@@ -720,6 +756,7 @@ class OptionsFlowHandler(OptionsFlow):
                     CONF_SPOT_VAT_MULTIPLIER,
                     CONF_SPOT_FALLBACK_PRICE_KWH,
                 ]
+                old_currency = entry_currency(entry)
                 new_data = dict(entry.data)
                 # Remove all spot keys first (clean slate)
                 for key in pricing_keys:
@@ -737,6 +774,8 @@ class OptionsFlowHandler(OptionsFlow):
                 self.hass.config_entries.async_update_entry(
                     entry, data=new_data, options=self._new_options
                 )
+                if new_data[CONF_CURRENCY] != old_currency:
+                    _relabel_cost_statistics(self.hass, entry, new_data[CONF_CURRENCY])
                 reload_ok = await self.hass.config_entries.async_reload(entry.entry_id)
                 if not reload_ok:
                     _LOGGER.warning(
@@ -760,6 +799,8 @@ class OptionsFlowHandler(OptionsFlow):
         )
 
         schema_dict: dict[Any, Any] = {
+            # D-63: the installation's current unit, so a save that leaves it keeps it.
+            vol.Required(CONF_CURRENCY, default=entry_currency(entry)): _currency_selector(),
             vol.Required(CONF_PRICING_MODE, default=current_mode): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[

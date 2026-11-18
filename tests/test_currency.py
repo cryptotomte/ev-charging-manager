@@ -9,7 +9,9 @@ without the ``currency`` key is an installation created before the setting and s
 from __future__ import annotations
 
 import copy
+import logging
 from types import MappingProxyType
+from unittest.mock import patch
 
 import pytest
 import voluptuous as vol
@@ -30,9 +32,20 @@ from custom_components.ev_charging_manager.const import (
     CONF_SPOT_VAT_MULTIPLIER,
     CONF_STATIC_PRICE_KWH,
     DOMAIN,
+    STATS_STORE_KEY,
 )
 from tests.conftest import MOCK_CHARGER_DATA, setup_session_engine
+from tests.session_rig import TRX_PAUL, Rig, scenario_a, sessions_on_disk
 from tests.test_config_flow import _setup_to_pricing_step
+from tests.test_interruption_fixed_price import (
+    PAUL_4KWH,
+    _assert_one_paul_session,
+    _second_session,
+    save_options,
+)
+
+STATIC = {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50}
+RELABEL = "custom_components.ev_charging_manager.config_flow._relabel_cost_statistics"
 
 USERS = [
     {
@@ -151,14 +164,51 @@ async def test_entry_without_key_keeps_kr_through_reload_and_subentry_changes(
 
     hass.config_entries.async_remove_subentry(entry, "u_gaest")
     await hass.async_block_till_done()
-    assert_unit(
-        hass,
-        entry,
-        "kr",
-        COST_SENSORS - {"paul_total_cost", "gaest_total_cost"}
-        | {"petra_total_cost", "pelle_total_cost"},
-    )
+    remaining = COST_SENSORS - {"paul_total_cost", "gaest_total_cost"} | {
+        "petra_total_cost",
+        "pelle_total_cost",
+    }
+    assert_unit(hass, entry, "kr", remaining)
     assert CONF_CURRENCY not in entry.data
+
+    with patch(RELABEL) as relabel:
+        result = await options_save(hass, entry, STATIC, {"min_session_duration_s": 120})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options["min_session_duration_s"] == 120
+    assert_unit(hass, entry, "kr", remaining)
+    relabel.assert_not_called()
+
+
+async def options_save(
+    hass: HomeAssistant, entry: MockConfigEntry, pricing: dict, init: dict | None = None
+) -> dict:
+    """Save the options form: step init, then step pricing (which reloads the entry)."""
+    flow = hass.config_entries.options
+    result = await flow.async_init(entry.entry_id)
+    result = await flow.async_configure(result["flow_id"], init or {})
+    result = await flow.async_configure(result["flow_id"], pricing)
+    await hass.async_block_till_done()
+    return result
+
+
+async def test_options_save_without_touching_the_field_keeps_kr(hass: HomeAssistant) -> None:
+    """T-3: the form shows kr; saved untouched, the entry gets the key with kr (D-63, F-1)."""
+    entry = await setup_legacy_entry(hass)
+    flow = hass.config_entries.options
+    result = await flow.async_init(entry.entry_id)
+    result = await flow.async_configure(result["flow_id"], {})
+    key = schema_key(result, CONF_CURRENCY)
+    assert next(iter(result["data_schema"].schema)) is key
+    assert key.default() == "kr"
+
+    with patch(RELABEL) as relabel:
+        result = await flow.async_configure(result["flow_id"], STATIC)
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.data[CONF_CURRENCY] == "kr"
+    assert_unit(hass, entry, "kr")
+    relabel.assert_not_called()
 
 
 @pytest.mark.parametrize("data", [{}, {CONF_CURRENCY: "EUR"}], ids=["without-key", "with-key"])
@@ -178,7 +228,6 @@ async def test_entry_version_stays_1_1(hass: HomeAssistant, data: dict) -> None:
 # New installations: the config flow (D-61, D-62)
 # ---------------------------------------------------------------------------
 
-STATIC = {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50}
 SPOT = {
     CONF_SPOT_PRICE_ENTITY: "sensor.spot_price",
     CONF_SPOT_ADDITIONAL_COST_KWH: 0.85,
@@ -303,3 +352,115 @@ async def test_config_flow_rejects_a_value_outside_the_list(
             result["flow_id"], {CONF_CURRENCY: value, **STATIC}
         )
     assert hass.config_entries.async_entries(DOMAIN) == []
+
+
+async def test_options_flow_currency_options(hass: HomeAssistant) -> None:
+    """T-10, options flow."""
+    entry = await setup_legacy_entry(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
+
+    assert_currency_options(result)
+
+
+@pytest.mark.parametrize("value", ["euro", "sek", ""])
+async def test_options_flow_rejects_a_value_outside_the_list(
+    hass: HomeAssistant, value: str
+) -> None:
+    """T-11, options flow: nothing is written (F-8)."""
+    entry = await setup_legacy_entry(hass)
+    data, options = dict(entry.data), dict(entry.options)
+
+    with pytest.raises(InvalidData):
+        await options_save(hass, entry, {CONF_CURRENCY: value, **STATIC})
+
+    assert (dict(entry.data), dict(entry.options)) == (data, options)
+    assert_unit(hass, entry, "kr")
+
+
+# ---------------------------------------------------------------------------
+# Changing it (D-63…D-67); with a real recorder in test_currency_statistics.py
+# ---------------------------------------------------------------------------
+
+
+async def test_change_without_recorder_saves_quietly(hass: HomeAssistant, caplog) -> None:
+    """T-17: no recorder, so nothing to relabel: the save succeeds without a warning (D-66)."""
+    entry = await setup_legacy_entry(hass)
+    assert "recorder" not in hass.config.components
+    caplog.clear()
+
+    result = await options_save(hass, entry, {CONF_CURRENCY: "EUR", **STATIC})
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.data[CONF_CURRENCY] == "EUR"
+    assert_unit(hass, entry, "EUR")
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and r.name.startswith("custom_components.ev_charging_manager")
+    ] == []
+
+
+@pytest.mark.parametrize("change", ["none", "EUR"])
+async def test_change_leaves_every_number(hass, hass_storage, freezer, change: str) -> None:
+    """T-19: stats store, stored sessions and the completed payload as without a change (F-2, F-3).
+
+    "none" is the reference run: the second session's money is the same in both.
+    """
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_a(rig, TRX_PAUL, {})
+    stats = copy.deepcopy(hass_storage[STATS_STORE_KEY]["data"])
+    sessions = copy.deepcopy(sessions_on_disk(hass_storage))
+
+    if change != "none":
+        await save_options({CONF_CURRENCY: change, **STATIC})(rig)
+        assert rig.entry.data[CONF_CURRENCY] == change
+    assert hass_storage[STATS_STORE_KEY]["data"] == stats
+    assert sessions_on_disk(hass_storage) == sessions
+
+    await _second_session(rig)
+    first, second = rig.money()
+    assert first == PAUL_4KWH
+    assert (second["energy"], second["cost"], second["record_cost"]) == (1.0, 2.5, 2.5)
+    before, after = (event.data for event in rig.completed)
+    assert set(after) == set(before)
+    assert not any("currency" in key for key in after)
+
+
+def _session_cost(hass: HomeAssistant, entry) -> tuple[str, str]:
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_session_cost"
+    )
+    state = hass.states.get(entity_id)
+    return state.state, state.attributes.get("unit_of_measurement")
+
+
+@pytest.mark.parametrize("change", ["none", "EUR"])
+async def test_session_across_a_change_completes_once(
+    hass, hass_storage, freezer, change: str
+) -> None:
+    """T-20: goe_gemini, kr -> EUR at 2.5 kWh: one record, the cost of the run without it."""
+    seen = {}
+
+    async def _change(rig: Rig) -> None:
+        seen["before"] = _session_cost(hass, rig.entry)
+        await save_options({CONF_CURRENCY: change, **STATIC})(rig)
+        seen["after"] = _session_cost(hass, rig.entry)
+
+    rig = Rig(hass, freezer, hass_storage)
+    await scenario_a(rig, TRX_PAUL, {} if change == "none" else {"mid": _change})
+
+    _assert_one_paul_session(rig)
+    if change != "none":
+        assert seen == {"before": ("6.25", "kr"), "after": ("6.25", "EUR")}
+
+
+async def test_user_added_after_a_change_gets_the_new_unit(hass: HomeAssistant) -> None:
+    """T-21."""
+    entry = await setup_legacy_entry(hass)
+    await options_save(hass, entry, {CONF_CURRENCY: "EUR", **STATIC})
+
+    await _add_user(hass, entry, "Petra")
+
+    assert_unit(hass, entry, "EUR", COST_SENSORS | {"petra_total_cost"})

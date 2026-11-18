@@ -1,6 +1,7 @@
 {
     "domain": "ev_charging_manager",
     "name": "EV Charging Manager",
+    "after_dependencies": ["recorder"],
     "codeowners": ["@cryptotomte"],
     "config_flow": true,
     "dependencies": [],

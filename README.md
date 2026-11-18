@@ -108,6 +108,13 @@ wizard; afterwards it is changed under **Settings** > **Devices & Services** >
 - **Statistics follow the setting.** At every start of the integration (also after a
   reload or a saved options form) and when a user is added or renamed, the integration
   puts the long-term statistics of its total-cost sensors in the configured currency.
+- **A change within a few seconds after a five-minute boundary**, on a total-cost sensor
+  that has no long-term statistics yet, can leave that sensor's statistics in the old
+  unit, with Home Assistant's "unit has changed" repair issue, until the next restart
+  or reload of the integration, which corrects it.
+- **A unit set with `customize`** (`unit_of_measurement` on one of these sensors) is
+  left alone, its long-term statistics included. To switch to the setting, remove the
+  `customize` entry and choose the currency in the options.
 - **Spot price sensor:** its state is used as a number in the configured currency per
   kWh. A sensor in another currency or scale (öre/kWh, EUR/MWh) is not converted.
 - **Downgrade:** if you chose another currency than `kr`, version 0.4.7 shows `kr`

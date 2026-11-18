@@ -2,6 +2,7 @@
 
 from enum import StrEnum
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 
 DOMAIN = "ev_charging_manager"
@@ -25,6 +26,7 @@ CONF_SPOT_PRICE_ENTITY = "spot_price_entity"
 CONF_SPOT_ADDITIONAL_COST_KWH = "spot_additional_cost_kwh"
 CONF_SPOT_VAT_MULTIPLIER = "spot_vat_multiplier"
 CONF_SPOT_FALLBACK_PRICE_KWH = "spot_fallback_price_kwh"
+CONF_CURRENCY = "currency"
 
 # Subentry configuration keys
 CONF_VEHICLE_NAME = "name"
@@ -73,6 +75,15 @@ DEFAULT_SPOT_VAT_MULTIPLIER = 1.25
 DEFAULT_SPOT_FALLBACK_PRICE_KWH = 2.50
 DEFAULT_CAR_STATUS_CHARGING_VALUE = "Charging"
 DEFAULT_CHARGING_EFFICIENCY = 0.90
+
+# Spec 028 D-60: the unit of every installation created before the setting existed.
+LEGACY_CURRENCY = "kr"
+
+
+def entry_currency(entry: ConfigEntry) -> str:
+    """Return the unit of the entry's cost sensors; an entry without the key has kr (D-60)."""
+    return entry.data.get(CONF_CURRENCY, LEGACY_CURRENCY)
+
 
 # ConfigStore settings
 STORE_KEY = "ev_charging_manager_config"

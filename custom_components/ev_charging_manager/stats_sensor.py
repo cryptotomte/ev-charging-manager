@@ -26,7 +26,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.util import slugify
 
-from .const import DOMAIN, SIGNAL_STATS_UPDATE
+from .const import DOMAIN, SIGNAL_STATS_UPDATE, entry_currency
 from .stats_engine import GuestLastSession, StatsEngine, UserStats
 
 _LOGGER = logging.getLogger(__name__)
@@ -164,11 +164,10 @@ class UserTotalEnergySensor(StatsBaseSensor):
 
 
 class UserTotalCostSensor(StatsBaseSensor):
-    """Lifetime accumulated cost for one user (kr)."""
+    """Lifetime accumulated cost for one user."""
 
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = SensorStateClass.TOTAL
-    _attr_native_unit_of_measurement = "kr"
     _attr_suggested_display_precision = 2
 
     def __init__(
@@ -180,6 +179,7 @@ class UserTotalCostSensor(StatsBaseSensor):
     ) -> None:
         """Initialize."""
         super().__init__(hass, entry)
+        self._attr_native_unit_of_measurement = entry_currency(entry)
         self._user_name = user_name
         self._attr_unique_id = f"{entry.entry_id}_{user_slug}_total_cost"
         self._attr_translation_key = "user_total_cost"
@@ -361,19 +361,19 @@ class GuestLastEnergySensor(StatsBaseSensor):
 
 
 class GuestLastChargePriceSensor(StatsBaseSensor):
-    """Charge price from the most recent guest session (kr).
+    """Charge price from the most recent guest session.
 
     Retains its value until overwritten by the next guest session.
     Unavailable when no guest session has completed or guest had no pricing configured.
     """
 
     _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_native_unit_of_measurement = "kr"
     _attr_suggested_display_precision = 2
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize."""
         super().__init__(hass, entry)
+        self._attr_native_unit_of_measurement = entry_currency(entry)
         self._attr_unique_id = f"{entry.entry_id}_guest_last_charge_price"
         self._attr_translation_key = "guest_last_charge_price"
 
@@ -427,7 +427,7 @@ class GuestTotalEnergySensor(StatsBaseSensor):
 
 
 class GuestTotalCostSensor(StatsBaseSensor):
-    """Lifetime accumulated cost across all guest users (kr).
+    """Lifetime accumulated cost across all guest users.
 
     Sums total_cost_kr for all UserStats where user_type == "guest", plus the
     carry of removed guest buckets (spec 026 D-6).
@@ -435,12 +435,12 @@ class GuestTotalCostSensor(StatsBaseSensor):
 
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = SensorStateClass.TOTAL
-    _attr_native_unit_of_measurement = "kr"
     _attr_suggested_display_precision = 2
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize."""
         super().__init__(hass, entry)
+        self._attr_native_unit_of_measurement = entry_currency(entry)
         self._attr_unique_id = f"{entry.entry_id}_guest_total_cost"
         self._attr_translation_key = "guest_total_cost"
 

@@ -287,7 +287,8 @@ When Home Assistant restarts mid-session, the recovery detects a pre-restart ope
 ## Session Store Schema (v1.2)
 
 Sessions are stored under the storage key `ev_charging_manager_sessions`
-(store version 1.2). Every record has these fields:
+(store version 1.2). Every record has these fields. The names ending in `_kr` are
+historical: they hold amounts in the currency configured in the integration, whatever it is.
 
 | Field | Type | Description |
 |-------|------|-------------|

@@ -17,6 +17,7 @@ from homeassistant.config_entries import (
     SubentryFlowResult,
 )
 from homeassistant.core import callback
+from homeassistant.generated.currencies import ACTIVE_CURRENCIES
 from homeassistant.helpers import selector
 from homeassistant.util import slugify
 
@@ -31,6 +32,7 @@ from .const import (
     CONF_CHARGER_PROFILE,
     CONF_CHARGER_SERIAL,
     CONF_CHARGING_IDLE_TIMEOUT_MIN,
+    CONF_CURRENCY,
     CONF_DEBUG_LOGGING,
     CONF_DISCONNECT_GRACE_MIN,
     CONF_ENERGY_ENTITY,
@@ -77,9 +79,11 @@ from .const import (
     DOMAIN,
     HEARTBEAT_LOG_INTERVAL_MIN_MAX,
     HEARTBEAT_LOG_INTERVAL_MIN_MIN,
+    LEGACY_CURRENCY,
     UI_DISPATCH_INTERVAL_S_ACTIVE_MIN,
     UI_DISPATCH_INTERVAL_S_MAX,
     UI_DISPATCH_INTERVAL_S_MIN,
+    entry_currency,
 )
 from .rfid_discovery import (
     DiscoveredCard,
@@ -117,6 +121,23 @@ def _make_entity_key(
     if required:
         return vol.Required(field, description=description) if description else vol.Required(field)
     return vol.Optional(field, description=description) if description else vol.Optional(field)
+
+
+def _currency_selector(stored: str = LEGACY_CURRENCY) -> selector.SelectSelector:
+    """Spec 028 D-61: kr, then Home Assistant's own active ISO 4217 codes; no free text.
+
+    The stored unit is always offered (D-75), or a code Home Assistant has retired would
+    make the pricing form impossible to save.
+    """
+    codes = set(ACTIVE_CURRENCIES) | {stored}
+    codes.discard(LEGACY_CURRENCY)
+    return selector.SelectSelector(
+        selector.SelectSelectorConfig(
+            options=[LEGACY_CURRENCY, *sorted(codes)],
+            mode=selector.SelectSelectorMode.DROPDOWN,
+            custom_value=False,
+        )
+    )
 
 
 def _coerce_charging_value(value: Any) -> int | str:
@@ -331,18 +352,27 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Step 2: Configure pricing mode and static price."""
+        errors: dict[str, str] = {}
+        values = user_input or {}
         if user_input is not None:
-            self.data.update(user_input)
-            if user_input.get(CONF_PRICING_MODE) == "spot":
-                return await self.async_step_spot_config()
-            return await self.async_step_confirm()
+            if CONF_CURRENCY not in user_input:
+                errors[CONF_CURRENCY] = "currency_required"
+            else:
+                self.data.update(user_input)
+                if user_input.get(CONF_PRICING_MODE) == "spot":
+                    return await self.async_step_spot_config()
+                return await self.async_step_confirm()
 
         return self.async_show_form(
             step_id="pricing",
             data_schema=vol.Schema(
                 {
+                    # Spec 028 D-73: the frontend pre-fills a required select with its first
+                    # option, so the field is optional and the handler requires it.
+                    vol.Optional(CONF_CURRENCY): _currency_selector(),
                     vol.Required(
-                        CONF_PRICING_MODE, default=DEFAULT_PRICING_MODE
+                        CONF_PRICING_MODE,
+                        default=values.get(CONF_PRICING_MODE, DEFAULT_PRICING_MODE),
                     ): selector.SelectSelector(
                         selector.SelectSelectorConfig(
                             options=[
@@ -352,7 +382,10 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                             mode=selector.SelectSelectorMode.LIST,
                         )
                     ),
-                    vol.Required(CONF_STATIC_PRICE_KWH, default=DEFAULT_STATIC_PRICE_KWH): vol.All(
+                    vol.Required(
+                        CONF_STATIC_PRICE_KWH,
+                        default=values.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
+                    ): vol.All(
                         selector.NumberSelector(
                             selector.NumberSelectorConfig(
                                 min=0.01,
@@ -365,6 +398,7 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                     ),
                 }
             ),
+            errors=errors,
         )
 
     async def async_step_spot_config(
@@ -697,6 +731,7 @@ class OptionsFlowHandler(OptionsFlow):
             if not errors:
                 # Build updated entry.data with new pricing fields
                 pricing_keys = [
+                    CONF_CURRENCY,
                     CONF_PRICING_MODE,
                     CONF_STATIC_PRICE_KWH,
                     CONF_SPOT_PRICE_ENTITY,
@@ -732,6 +767,7 @@ class OptionsFlowHandler(OptionsFlow):
                 return self.async_create_entry(data=self._new_options)
 
         # Pre-fill with current entry.data values
+        current_currency = entry_currency(entry)
         current_mode = entry.data.get(CONF_PRICING_MODE, DEFAULT_PRICING_MODE)
         current_static = entry.data.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH)
         current_spot_entity = entry.data.get(CONF_SPOT_PRICE_ENTITY, "")
@@ -744,6 +780,10 @@ class OptionsFlowHandler(OptionsFlow):
         )
 
         schema_dict: dict[Any, Any] = {
+            # D-63: the installation's current unit, so a save that leaves it keeps it.
+            vol.Required(CONF_CURRENCY, default=current_currency): _currency_selector(
+                current_currency
+            ),
             vol.Required(CONF_PRICING_MODE, default=current_mode): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=[

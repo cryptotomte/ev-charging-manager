@@ -38,7 +38,7 @@ Everything runs locally inside Home Assistant -- no cloud services required.
 Before installing, make sure you have:
 
 - [ ] An EV charger installed and connected to your local network
-- [ ] Home Assistant **2025.3** or newer
+- [ ] Home Assistant **2026.2** or newer
 - [ ] [HACS](https://hacs.xyz) installed
 - [ ] A Home Assistant integration for your charger already set up (e.g. [ha-goecharger-api2](https://github.com/marq24/ha-goecharger-api2) for go-e chargers)
 
@@ -86,9 +86,42 @@ If your charger brand is not yet documented, see [Charger Profiles (Community)](
 | **Charger profile** | Select your charger brand (e.g. go-e) or "Generic" |
 | **Charger serial** | A unique name/serial for this charger instance |
 | **Entity mapping** | Map the charger's HA entities (car status, energy, power, RFID) |
-| **Pricing** | Choose static or spot pricing and enter rates |
+| **Pricing** | Choose the currency, static or spot pricing, and enter rates |
 
 After completing the wizard, the integration creates a device and begins monitoring for charging sessions.
+
+### Currency
+
+One currency per installation. It is the unit of every cost and price sensor, and the
+currency the prices you enter are in. A new installation must choose it in the setup
+wizard; afterwards it is changed under **Settings** > **Devices & Services** >
+**EV Charging Manager** > **Configure**, on the pricing page.
+
+- **A label, not a conversion.** Changing the currency changes the unit of the sensors
+  and of the long-term statistics of the total-cost sensors. No amount is converted.
+  Recorded state history keeps the unit it was recorded with.
+- **Installations created before 0.5.0** show `kr` and keep it until you choose
+  another currency.
+- **At a change** one or two five-minute statistics periods may be skipped for each
+  total-cost sensor; their amount shows in the following period. Home Assistant may
+  log a warning per total-cost sensor ("The unit of … is changing").
+- **Statistics follow the setting.** At every start of the integration (also after a
+  reload or a saved options form) and when a user is added or renamed, the integration
+  puts the long-term statistics of its total-cost sensors in the configured currency.
+- **A change within a few seconds after a five-minute boundary**, on a total-cost sensor
+  that has no long-term statistics yet, can leave that sensor's statistics in the old
+  unit, with Home Assistant's "unit has changed" repair issue, until the next restart
+  or reload of the integration, which corrects it.
+- **A unit set with `customize`** (`unit_of_measurement` on one of these sensors) is
+  left alone, its long-term statistics included. To switch to the setting, remove the
+  `customize` entry and choose the currency in the options.
+- **Spot price sensor:** its state is used as a number in the configured currency per
+  kWh. A sensor in another currency or scale (öre/kWh, EUR/MWh) is not converted.
+- **Downgrade:** if you chose another currency than `kr`, version 0.4.7 shows `kr`
+  again and the long-term statistics of the total-cost sensors stop while it runs;
+  Home Assistant raises its "unit has changed" repair issue for each. The setting
+  survives the downgrade, and after the next upgrade the integration puts the
+  statistics in line again, so no manual repair is needed afterwards.
 
 ### Managing Users
 

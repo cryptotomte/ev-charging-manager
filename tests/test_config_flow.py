@@ -15,6 +15,7 @@ from custom_components.ev_charging_manager.const import (
     CONF_CHARGER_NAME,
     CONF_CHARGER_PROFILE,
     CONF_CHARGER_SERIAL,
+    CONF_CURRENCY,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_UNIT,
     CONF_ERROR_ENTITY,
@@ -90,7 +91,7 @@ async def test_config_flow_goe_happy_path(hass: HomeAssistant) -> None:
     # Step 2 — submit pricing
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50},
+        {CONF_CURRENCY: "kr", CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50},
     )
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "confirm"
@@ -149,7 +150,7 @@ async def test_config_flow_generic_profile(hass: HomeAssistant) -> None:
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 1.99},
+        {CONF_CURRENCY: "kr", CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 1.99},
     )
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
 
@@ -309,7 +310,7 @@ async def test_config_flow_spot_mode_shows_spot_config_step(hass: HomeAssistant)
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+        {CONF_CURRENCY: "kr", CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
     )
 
     assert result["type"] == FlowResultType.FORM
@@ -323,7 +324,7 @@ async def test_config_flow_spot_valid_entity_creates_entry(hass: HomeAssistant) 
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+        {CONF_CURRENCY: "kr", CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
     )
     assert result["step_id"] == "spot_config"
 
@@ -355,7 +356,7 @@ async def test_config_flow_spot_missing_entity_shows_error(hass: HomeAssistant) 
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+        {CONF_CURRENCY: "kr", CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
     )
     assert result["step_id"] == "spot_config"
 
@@ -381,7 +382,7 @@ async def test_config_flow_spot_non_numeric_entity_shows_error(hass: HomeAssista
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
+        {CONF_CURRENCY: "kr", CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 2.50},
     )
     assert result["step_id"] == "spot_config"
 
@@ -464,7 +465,7 @@ async def test_config_flow_goe_auto_populates_observation_slots(hass: HomeAssist
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50},
+        {CONF_CURRENCY: "kr", CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50},
     )
     assert result["step_id"] == "confirm"
 

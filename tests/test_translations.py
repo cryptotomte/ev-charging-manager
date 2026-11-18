@@ -57,3 +57,69 @@ def test_sv_json_placeholders_match_strings_json() -> None:
         if expected != actual:
             mismatches[key] = (sorted(expected), sorted(actual))
     assert mismatches == {}
+
+
+_CURRENCY_WORD = re.compile(r"\bkr\b")
+_SWEDISH = re.compile(r"swedish|svensk", re.IGNORECASE)
+# D-76: the setup help names kr as the unit of earlier installations; nothing else may.
+_NAMES_KR = "config.step.pricing.data_description.currency"
+_ENGLISH = {
+    _NAMES_KR: 'Unit shown on all cost sensors. Enter your prices in this currency. "kr" is the'
+    " unit of installations created before 0.5.0. You can change it later in the options.",
+    "options.step.pricing.data_description.currency": "Unit shown on all cost sensors. Enter"
+    " your prices in this currency. Changing it relabels existing totals and statistics;"
+    " nothing is converted.",
+    "options.step.pricing.description": "Currency and static or spot pricing.",
+    **{
+        f"{step}.data_description.{key}": text
+        for step in ("config.step.spot_config", "options.step.pricing")
+        for key, text in (
+            (
+                "spot_price_entity",
+                "Select the sensor that provides the current electricity spot price. It must"
+                " report the price per kWh in your currency; the value is used as it is.",
+            ),
+            (
+                "spot_additional_cost_kwh",
+                "Grid fee + energy tax, excl. VAT (per kWh, in your currency)",
+            ),
+            (
+                "spot_fallback_price_kwh",
+                "Price used when spot sensor is unavailable (per kWh, in your currency)",
+            ),
+        )
+    },
+    **{
+        f"config_subentries.user.step.{step}.data_description.price_per_kwh": "Fixed price per"
+        " kWh in the installation''s currency (required for ''fixed'' method)"
+        for step in ("guest_pricing", "reconfigure_guest_pricing")
+    },
+}
+
+
+def test_no_kr_as_currency_word_and_currency_field_texts() -> None:
+    """Spec 028 T-22 (D-69, D-76): strings.json is en.json, pinned above."""
+    for name, label, required in (
+        ("translations/en.json", "Currency", "Currency (required)"),
+        ("translations/sv.json", "Valuta", "Valuta (obligatorisk)"),
+    ):
+        texts = _flatten(_load(name))
+        assert [k for k, v in texts.items() if v and _CURRENCY_WORD.search(v)] == [_NAMES_KR]
+        assert [k for k, v in texts.items() if v and _SWEDISH.search(v)] == [], name
+        # D-73: the config field is optional to the frontend, so its label carries the marker.
+        assert texts["config.step.pricing.data.currency"] == required
+        assert texts["options.step.pricing.data.currency"] == label
+        for flow in ("config", "options"):
+            assert texts[f"{flow}.step.pricing.data_description.currency"]
+    assert [
+        _flatten(_load(name))["config.error.currency_required"]
+        for name in ("translations/en.json", "translations/sv.json")
+    ] == ["Choose a currency.", "Välj valuta."]
+
+
+def test_currency_texts_of_d76() -> None:
+    """Spec 028 D-76: the English texts as decided; Swedish has a text for each."""
+    english = _flatten(_load("translations/en.json"))
+    swedish = _flatten(_load("translations/sv.json"))
+    assert {key: english[key] for key in _ENGLISH} == _ENGLISH
+    assert all(swedish[key] and swedish[key] != english[key] for key in _ENGLISH)

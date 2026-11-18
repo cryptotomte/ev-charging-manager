@@ -18,7 +18,13 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_CAR_STATUS_ENTITY, DOMAIN, SIGNAL_SESSION_UPDATE, SessionEngineState
+from .const import (
+    CONF_CAR_STATUS_ENTITY,
+    DOMAIN,
+    SIGNAL_SESSION_UPDATE,
+    SessionEngineState,
+    entry_currency,
+)
 from .stats_sensor import create_guest_stats_sensors, create_user_stats_sensors
 
 _LOGGER = logging.getLogger(__name__)
@@ -345,14 +351,14 @@ class SessionDurationSensor(_SessionSensorBase):
 
 
 class SessionCostSensor(_SessionSensorBase):
-    """Shows the accumulated cost of the current session (kr)."""
+    """Shows the accumulated cost of the current session."""
 
     _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_native_unit_of_measurement = "kr"
     _attr_suggested_display_precision = 2
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
+        self._attr_native_unit_of_measurement = entry_currency(entry)
         self._attr_unique_id = f"{entry.entry_id}_session_cost"
         self._attr_translation_key = "session_cost"
 
@@ -365,14 +371,14 @@ class SessionCostSensor(_SessionSensorBase):
 
 
 class SessionChargePriceSensor(_SessionSensorBase):
-    """Shows the guest charge price during an active guest session (kr)."""
+    """Shows the guest charge price during an active guest session."""
 
     _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_native_unit_of_measurement = "kr"
     _attr_suggested_display_precision = 2
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, entry)
+        self._attr_native_unit_of_measurement = entry_currency(entry)
         self._attr_unique_id = f"{entry.entry_id}_session_charge_price"
         self._attr_translation_key = "session_charge_price"
 

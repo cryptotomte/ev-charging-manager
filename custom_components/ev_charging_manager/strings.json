@@ -48,8 +48,12 @@
             "pricing": {
                 "title": "Pricing Configuration",
                 "data": {
+                    "currency": "Currency (required)",
                     "pricing_mode": "Pricing Mode",
                     "static_price_kwh": "Price per kWh"
+                },
+                "data_description": {
+                    "currency": "Unit shown on all cost sensors. Enter your prices in this currency. \"kr\" is the unit of installations created before 0.5.0. You can change it later in the options."
                 }
             },
             "spot_config": {
@@ -62,10 +66,10 @@
                     "spot_fallback_price_kwh": "Fallback price"
                 },
                 "data_description": {
-                    "spot_price_entity": "Select the sensor that provides the current electricity spot price",
-                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (kr/kWh)",
-                    "spot_vat_multiplier": "1.25 = 25% Swedish VAT",
-                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (kr/kWh)"
+                    "spot_price_entity": "Select the sensor that provides the current electricity spot price. It must report the price per kWh in your currency; the value is used as it is.",
+                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (per kWh, in your currency)",
+                    "spot_vat_multiplier": "1.25 = 25% VAT",
+                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (per kWh, in your currency)"
                 }
             },
             "confirm": {
@@ -77,7 +81,8 @@
             "entity_not_found": "Entity not found in Home Assistant. Check the entity ID and try again.",
             "entity_unavailable": "Entity exists but is unavailable or in an unknown state. Ensure the underlying integration is running.",
             "entity_invalid": "Entity exists but has a non-numeric state. A spot price sensor must report a number.",
-            "invalid_price": "Price must be greater than 0."
+            "invalid_price": "Price must be greater than 0.",
+            "currency_required": "Choose a currency."
         },
         "abort": {
             "already_configured": "This integration is already configured. Each charger requires a separate instance."
@@ -125,8 +130,9 @@
             },
             "pricing": {
                 "title": "Pricing",
-                "description": "Switch between static and spot pricing modes.",
+                "description": "Currency and static or spot pricing.",
                 "data": {
+                    "currency": "Currency",
                     "pricing_mode": "Pricing Mode",
                     "static_price_kwh": "Price per kWh",
                     "spot_price_entity": "Price sensor",
@@ -135,10 +141,11 @@
                     "spot_fallback_price_kwh": "Fallback price"
                 },
                 "data_description": {
-                    "spot_price_entity": "Select the sensor that provides the current electricity spot price",
-                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (kr/kWh)",
-                    "spot_vat_multiplier": "1.25 = 25% Swedish VAT",
-                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (kr/kWh)"
+                    "currency": "Unit shown on all cost sensors. Enter your prices in this currency. Changing it relabels existing totals and statistics; nothing is converted.",
+                    "spot_price_entity": "Select the sensor that provides the current electricity spot price. It must report the price per kWh in your currency; the value is used as it is.",
+                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (per kWh, in your currency)",
+                    "spot_vat_multiplier": "1.25 = 25% VAT",
+                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (per kWh, in your currency)"
                 }
             }
         },
@@ -307,7 +314,7 @@
                     },
                     "data_description": {
                         "guest_pricing_method": "How to calculate the charging price for this guest",
-                        "price_per_kwh": "Fixed price per kWh (required for ''fixed'' method)",
+                        "price_per_kwh": "Fixed price per kWh in the installation''s currency (required for ''fixed'' method)",
                         "markup_factor": "Multiply base price by this factor (required for ''markup'' method, must be > 1.0)"
                     }
                 },
@@ -331,7 +338,7 @@
                     },
                     "data_description": {
                         "guest_pricing_method": "How to calculate the charging price for this guest",
-                        "price_per_kwh": "Fixed price per kWh (required for ''fixed'' method)",
+                        "price_per_kwh": "Fixed price per kWh in the installation''s currency (required for ''fixed'' method)",
                         "markup_factor": "Multiply base price by this factor (required for ''markup'' method)"
                     }
                 }

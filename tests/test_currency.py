@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 from types import MappingProxyType
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import voluptuous as vol
@@ -44,6 +45,7 @@ from tests.test_interruption_fixed_price import (
 from tests.test_interruption_snapshot import COMPLETED_KEYS, RECORD_KEYS
 
 STATIC = {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50}
+RECONCILE = "custom_components.ev_charging_manager.async_reconcile_cost_statistics"
 
 USERS = [
     {
@@ -173,6 +175,67 @@ async def test_entry_without_key_keeps_kr_through_reload_and_subentry_changes(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options["min_session_duration_s"] == 120
     assert_unit(hass, entry, "kr", remaining)
+
+
+async def test_listener_schedules_the_reconcile_only_for_an_added_or_renamed_user(
+    hass: HomeAssistant,
+) -> None:
+    """D-74 (b), X-14: removals, vehicle and RFID changes and an options change without user
+    changes schedule nothing from the listener; a user add and a rename once each. The options
+    save through the form counts one, from the setup of its reload."""
+    entry = await setup_legacy_entry(hass)
+    subentries = {
+        "v_car": (
+            "vehicle",
+            {
+                "name": "Car",
+                "battery_capacity_kwh": 50.0,
+                "usable_battery_kwh": 50.0,
+                "charging_phases": 3,
+                "max_charging_power_kw": 11.0,
+                "charging_efficiency": 0.9,
+            },
+        ),
+        "r0": (
+            "rfid_mapping",
+            {"card_index": 0, "card_uid": None, "user_id": "u_paul", "vehicle_id": None},
+        ),
+    }
+
+    with patch(RECONCILE, new_callable=AsyncMock) as reconcile:
+
+        async def scheduled() -> int:
+            await hass.async_block_till_done(wait_background_tasks=True)
+            return reconcile.call_count
+
+        for sid, (subentry_type, data) in subentries.items():
+            hass.config_entries.async_add_subentry(
+                entry,
+                ConfigSubentry(
+                    data=MappingProxyType({**data, "active": True}),
+                    subentry_id=sid,
+                    subentry_type=subentry_type,
+                    title=sid,
+                    unique_id=None,
+                ),
+            )
+            assert await scheduled() == 0, sid
+        for sid in (*subentries, "u_gaest"):
+            hass.config_entries.async_remove_subentry(entry, sid)
+            assert await scheduled() == 0, sid
+        hass.config_entries.async_update_entry(
+            entry, options={**entry.options, "min_session_duration_s": 120}
+        )
+        assert await scheduled() == 0
+        await options_save(hass, entry, STATIC, {"min_session_duration_s": 90})
+        assert await scheduled() == 1
+
+        await _add_user(hass, entry, "Petra")
+        assert await scheduled() == 2
+        await _rename_user(hass, entry, "u_paul", "Pelle")
+        assert await scheduled() == 3
+
+    assert entry.state is ConfigEntryState.LOADED
 
 
 async def options_save(

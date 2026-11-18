@@ -609,6 +609,49 @@ async def test_sensor_showing_a_third_unit_or_no_state_is_left_alone(
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
+async def test_only_monetary_totals_are_selected(hass: HomeAssistant, freezer) -> None:
+    """F-6: rows of this entry that are total but not monetary, or monetary but not total,
+    keep statistics in another unit; a monetary total in the same situation is relabelled."""
+    freezer.move_to(_period(0) + timedelta(seconds=10))
+    entry = await setup_legacy_entry(hass)
+    await _settle(hass)
+    rows = {
+        name: er.async_get(hass)
+        .async_get_or_create(
+            "sensor",
+            DOMAIN,
+            f"{entry.entry_id}_x_{name}",
+            config_entry=entry,
+            original_device_class=device_class,
+            capabilities={"state_class": state_class},
+        )
+        .entity_id
+        for name, device_class, state_class in (
+            ("total_not_monetary", "energy", "total"),
+            ("monetary_not_total", "monetary", "measurement"),
+            ("monetary_total", "monetary", "total"),
+        )
+    }
+
+    def show(unit: str) -> None:
+        for eid in rows.values():
+            hass.states.async_set(eid, "1.0", {"state_class": "total", "unit_of_measurement": unit})
+
+    show("EUR")
+    await _compile(hass, freezer, 0)
+    assert await _units(hass, rows.values()) == dict.fromkeys(rows.values(), "EUR")
+    show("kr")
+
+    await async_reconcile_cost_statistics(hass, entry)
+    await _settle(hass)
+
+    assert await _units(hass, rows.values()) == {
+        rows["total_not_monetary"]: "EUR",
+        rows["monetary_not_total"]: "EUR",
+        rows["monetary_total"]: "kr",
+    }
+
+
 # ---------------------------------------------------------------------------
 # T-15, T-16: the statistics rows themselves
 # ---------------------------------------------------------------------------

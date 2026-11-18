@@ -9,7 +9,10 @@ without the ``currency`` key is an installation created before the setting and s
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import re
+from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import AsyncMock, patch
 
@@ -671,3 +674,27 @@ async def test_user_added_after_a_change_gets_the_new_unit(hass: HomeAssistant) 
     await _add_user(hass, entry, "Petra")
 
     assert_unit(hass, entry, "EUR", COST_SENSORS | {"petra_total_cost"})
+
+
+# ---------------------------------------------------------------------------
+# Pins left open by the review (R-6)
+# ---------------------------------------------------------------------------
+
+INTEGRATION = Path(__file__).parent.parent / "custom_components" / DOMAIN
+
+
+@pytest.mark.parametrize("module", ["session_engine.py", "session_engine_v2.py"])
+def test_engine_log_messages_name_no_currency(module: str) -> None:
+    """D-70: the log strings say "per kWh" and carry no currency word."""
+    source = (INTEGRATION / module).read_text(encoding="utf-8")
+
+    assert "kr/kWh" not in source
+    assert re.findall(r"%[-+ #0-9.]*[a-zA-Z] kr\b", source) == []
+
+
+def test_manifest_orders_after_the_recorder_without_requiring_it() -> None:
+    """D-68: the integration calls the recorder when it is there and works without it."""
+    manifest = json.loads((INTEGRATION / "manifest.json").read_text(encoding="utf-8"))
+
+    assert "recorder" in manifest["after_dependencies"]
+    assert manifest["dependencies"] == []

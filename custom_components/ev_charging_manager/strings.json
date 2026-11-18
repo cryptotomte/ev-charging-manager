@@ -81,7 +81,8 @@
             "entity_not_found": "Entity not found in Home Assistant. Check the entity ID and try again.",
             "entity_unavailable": "Entity exists but is unavailable or in an unknown state. Ensure the underlying integration is running.",
             "entity_invalid": "Entity exists but has a non-numeric state. A spot price sensor must report a number.",
-            "invalid_price": "Price must be greater than 0."
+            "invalid_price": "Price must be greater than 0.",
+            "currency_required": "Choose a currency."
         },
         "abort": {
             "already_configured": "This integration is already configured. Each charger requires a separate instance."

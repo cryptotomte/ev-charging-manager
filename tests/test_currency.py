@@ -221,7 +221,14 @@ async def test_entry_version_stays_1_1(hass: HomeAssistant, data: dict) -> None:
     entry = await setup_legacy_entry(hass, **data)
 
     assert entry.state is ConfigEntryState.LOADED
+
+
+async def test_config_flow_creates_a_version_1_1_entry(hass: HomeAssistant) -> None:
+    """T-4: the entry the flow creates is 1.1 (a mock entry is 1.1 whatever the flow says)."""
+    entry = await create_entry(hass, "EUR")
+
     assert (entry.version, entry.minor_version) == (1, 1)
+    assert entry.state is ConfigEntryState.LOADED
 
 
 # ---------------------------------------------------------------------------
@@ -270,22 +277,41 @@ def add_users(hass: HomeAssistant, entry) -> None:
         )
 
 
-@pytest.mark.parametrize("ha_currency", ["SEK", "EUR"])
-async def test_config_flow_currency_is_required_without_default(
-    hass: HomeAssistant, ha_currency: str
-) -> None:
-    """T-5: first, required, no default, no suggested value; omitted = rejected (F-5)."""
-    await hass.config.async_update(currency=ha_currency)
-    result = await _setup_to_pricing_step(hass)
-
+def assert_currency_field_empty(result: dict) -> None:
+    """First, optional, no default, no suggested value: the frontend shows it empty (D-73)."""
     key = schema_key(result, CONF_CURRENCY)
     assert next(iter(result["data_schema"].schema)) is key
-    assert isinstance(key, vol.Required)
+    assert type(key) is vol.Optional
     assert key.default is vol.UNDEFINED
     assert key.description is None
-    with pytest.raises(InvalidData):
-        await hass.config_entries.flow.async_configure(result["flow_id"], STATIC)
-    assert hass.config_entries.async_entries(DOMAIN) == []
+
+
+@pytest.mark.parametrize("ha_currency", ["SEK", "EUR"])
+async def test_config_flow_currency_must_be_chosen(hass: HomeAssistant, ha_currency: str) -> None:
+    """T-5 (D-73): omitted = the form again with a field error and the other values kept;
+    then a submit with a currency goes on (F-5)."""
+    await hass.config.async_update(currency=ha_currency)
+    result = await _setup_to_pricing_step(hass)
+    assert_currency_field_empty(result)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_PRICING_MODE: "spot", CONF_STATIC_PRICE_KWH: 3.10}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "pricing"
+    assert result["errors"] == {CONF_CURRENCY: "currency_required"}
+    assert_currency_field_empty(result)
+    assert schema_key(result, CONF_PRICING_MODE).default() == "spot"
+    assert schema_key(result, CONF_STATIC_PRICE_KWH).default() == 3.10
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_CURRENCY: "NOK", **STATIC}
+    )
+    assert result["step_id"] == "confirm"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].data[CONF_CURRENCY] == "NOK"
 
 
 @pytest.mark.parametrize("currency", ["EUR", "kr"])
@@ -344,14 +370,20 @@ async def test_config_flow_currency_options(hass: HomeAssistant) -> None:
 async def test_config_flow_rejects_a_value_outside_the_list(
     hass: HomeAssistant, value: str
 ) -> None:
-    """T-11, config flow (F-8)."""
+    """T-11, config flow (F-8): the flow stays on the step and the next valid choice is the one
+    the entry gets."""
     result = await _setup_to_pricing_step(hass)
 
     with pytest.raises(InvalidData):
         await hass.config_entries.flow.async_configure(
             result["flow_id"], {CONF_CURRENCY: value, **STATIC}
         )
-    assert hass.config_entries.async_entries(DOMAIN) == []
+    assert hass.config_entries.flow.async_get(result["flow_id"])["step_id"] == "pricing"
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_CURRENCY: "SEK", **STATIC}
+    )
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["result"].data[CONF_CURRENCY] == "SEK"
 
 
 async def test_options_flow_currency_options(hass: HomeAssistant) -> None:

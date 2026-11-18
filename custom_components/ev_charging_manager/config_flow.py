@@ -380,20 +380,27 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Step 2: Configure pricing mode and static price."""
+        errors: dict[str, str] = {}
+        values = user_input or {}
         if user_input is not None:
-            self.data.update(user_input)
-            if user_input.get(CONF_PRICING_MODE) == "spot":
-                return await self.async_step_spot_config()
-            return await self.async_step_confirm()
+            if CONF_CURRENCY not in user_input:
+                errors[CONF_CURRENCY] = "currency_required"
+            else:
+                self.data.update(user_input)
+                if user_input.get(CONF_PRICING_MODE) == "spot":
+                    return await self.async_step_spot_config()
+                return await self.async_step_confirm()
 
         return self.async_show_form(
             step_id="pricing",
             data_schema=vol.Schema(
                 {
-                    # D-62: no default and no suggested value; the user must choose.
-                    vol.Required(CONF_CURRENCY): _currency_selector(),
+                    # Spec 028 D-73: the frontend pre-fills a required select with its first
+                    # option, so the field is optional and the handler requires it.
+                    vol.Optional(CONF_CURRENCY): _currency_selector(),
                     vol.Required(
-                        CONF_PRICING_MODE, default=DEFAULT_PRICING_MODE
+                        CONF_PRICING_MODE,
+                        default=values.get(CONF_PRICING_MODE, DEFAULT_PRICING_MODE),
                     ): selector.SelectSelector(
                         selector.SelectSelectorConfig(
                             options=[
@@ -403,7 +410,10 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                             mode=selector.SelectSelectorMode.LIST,
                         )
                     ),
-                    vol.Required(CONF_STATIC_PRICE_KWH, default=DEFAULT_STATIC_PRICE_KWH): vol.All(
+                    vol.Required(
+                        CONF_STATIC_PRICE_KWH,
+                        default=values.get(CONF_STATIC_PRICE_KWH, DEFAULT_STATIC_PRICE_KWH),
+                    ): vol.All(
                         selector.NumberSelector(
                             selector.NumberSelectorConfig(
                                 min=0.01,
@@ -416,6 +426,7 @@ class EvChargingManagerConfigFlow(ConfigFlow, domain=DOMAIN):
                     ),
                 }
             ),
+            errors=errors,
         )
 
     async def async_step_spot_config(

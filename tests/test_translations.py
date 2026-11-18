@@ -70,3 +70,7 @@ def test_no_kr_as_currency_word_and_currency_field_texts() -> None:
         for flow in ("config", "options"):
             assert texts[f"{flow}.step.pricing.data.currency"] == label
             assert texts[f"{flow}.step.pricing.data_description.currency"]
+    assert [
+        _flatten(_load(name))["config.error.currency_required"]
+        for name in ("translations/en.json", "translations/sv.json")
+    ] == ["Choose a currency.", "Välj valuta."]

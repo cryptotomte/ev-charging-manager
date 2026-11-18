@@ -18,9 +18,11 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder import statistics as rstats
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.core_config import DATA_CUSTOMIZE
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.entity_values import EntityValues
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
@@ -31,6 +33,9 @@ from custom_components.ev_charging_manager.const import (
     CONF_CURRENCY,
     DOMAIN,
     EVENT_SESSION_COMPLETED,
+)
+from custom_components.ev_charging_manager.cost_statistics import (
+    async_reconcile_cost_statistics,
 )
 from tests.conftest import MOCK_CHARGER_DATA, setup_session_engine
 from tests.test_currency import (
@@ -477,6 +482,131 @@ async def test_failing_metadata_read_does_not_block_anything(
     paul = _entity_id(hass, entry, "paul_total_cost")
     await _completed(hass, "Paul", "regular", 2.5)
     assert hass.states.get(paul).state == "12.5"
+
+
+# ---------------------------------------------------------------------------
+# A unit set with customize (the D-74 amendment)
+# ---------------------------------------------------------------------------
+
+CUSTOMIZED = "sensor.my_go_e_charger_paul_total_cost"
+
+
+async def _customized_on_047(hass: HomeAssistant, freezer) -> MockConfigEntry:
+    """0.4.7 with ``customize: unit_of_measurement: EUR`` on Paul's total: entry without the
+    key, state and statistics in EUR after period 0; the clock in period 1."""
+    hass.data[DATA_CUSTOMIZE] = EntityValues({CUSTOMIZED: {"unit_of_measurement": "EUR"}})
+    freezer.move_to(_period(0) + timedelta(seconds=10))
+    with patch(RECONCILE):  # 0.4.7 has no reconcile
+        entry = await setup_legacy_entry(hass)
+        await _settle(hass)
+        assert _entity_id(hass, entry, "paul_total_cost") == CUSTOMIZED
+        await _completed(hass, "Paul", "regular", 10.0)
+        await _compile(hass, freezer, 0)
+    assert hass.states.get(CUSTOMIZED).attributes["unit_of_measurement"] == "EUR"
+    assert await _units(hass, [CUSTOMIZED]) == {CUSTOMIZED: "EUR"}
+    freezer.move_to(_period(1) + timedelta(seconds=10))
+    return entry
+
+
+async def test_customized_unit_is_left_alone_after_the_upgrade(
+    hass: HomeAssistant, freezer, caplog
+) -> None:
+    """(a) The upgrade start and a later reload: the statistic stays in EUR and records."""
+    caplog.set_level(logging.INFO)
+    entry = await _customized_on_047(hass, freezer)
+    caplog.clear()
+
+    with patch(METADATA, wraps=rstats.async_update_statistics_metadata) as metadata:
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await _settle(hass)
+        await _sessions_and_compile(hass, freezer, "Paul", (1,))
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await _settle(hass)
+        await _sessions_and_compile(hass, freezer, "Paul", (2, 3))
+
+    metadata.assert_not_called()
+    assert _info(caplog) == []
+    stat = (await _report(hass, [CUSTOMIZED]))[CUSTOMIZED]
+    _assert_recording(stat, "EUR", 3)
+    assert stat["periods"] == [0, 1, 2, 3]
+
+
+async def test_customized_unit_repaired_by_the_user_stays(
+    hass: HomeAssistant, freezer, caplog
+) -> None:
+    """(b) Statistics relabelled to kr against the state (the build before the amendment),
+    the user's repair back to EUR, then the entry set up again: still EUR, recording."""
+    caplog.set_level(logging.INFO)
+    entry = await _customized_on_047(hass, freezer)
+    rstats.async_update_statistics_metadata(
+        hass, CUSTOMIZED, new_unit_class=None, new_unit_of_measurement="kr"
+    )
+    await _sessions_and_compile(hass, freezer, "Paul", (1,))
+    assert (await _report(hass, [CUSTOMIZED]))[CUSTOMIZED]["issue"] is True
+    rstats.async_update_statistics_metadata(
+        hass, CUSTOMIZED, new_unit_class=None, new_unit_of_measurement="EUR"
+    )
+    await async_wait_recording_done(hass)
+    freezer.move_to(_period(2) + timedelta(seconds=10))
+    caplog.clear()
+
+    with patch(METADATA, wraps=rstats.async_update_statistics_metadata) as metadata:
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await _settle(hass)
+        await _sessions_and_compile(hass, freezer, "Paul", (2, 3))
+
+    metadata.assert_not_called()
+    assert _info(caplog) == []
+    _assert_recording((await _report(hass, [CUSTOMIZED]))[CUSTOMIZED], "EUR", 3)
+
+
+async def test_customized_user_then_chooses_the_same_currency(
+    hass: HomeAssistant, freezer, caplog
+) -> None:
+    """(c) The customized user picks EUR in the options: Paul's total stays EUR and records;
+    the other totals, in kr, follow to EUR."""
+    caplog.set_level(logging.INFO)
+    entry = await _customized_on_047(hass, freezer)
+    others = [eid for eid in _total_cost_ids(hass, entry) if eid != CUSTOMIZED]
+    caplog.clear()
+
+    with patch(METADATA, wraps=rstats.async_update_statistics_metadata) as metadata:
+        await options_save(hass, entry, {CONF_CURRENCY: "EUR", **STATIC})
+        await _settle(hass)
+        await _sessions_and_compile(hass, freezer, "Paul", (1, 2))
+
+    assert entry.data[CONF_CURRENCY] == "EUR"
+    assert hass.states.get(CUSTOMIZED).attributes["unit_of_measurement"] == "EUR"
+    assert CUSTOMIZED not in [c.args[1] for c in metadata.call_args_list]
+    assert not any(CUSTOMIZED in line for line in _info(caplog))
+    assert {unit for unit in (await _units(hass, others)).values() if unit} == {"EUR"}
+    stat = (await _report(hass, [CUSTOMIZED]))[CUSTOMIZED]
+    _assert_recording(stat, "EUR", 2)
+    assert stat["periods"] == [0, 1, 2]
+
+
+async def test_sensor_showing_a_third_unit_or_no_state_is_left_alone(
+    hass: HomeAssistant, freezer, caplog
+) -> None:
+    """Entry in EUR, statistics in kr: only the total whose state says EUR is relabelled; one
+    that shows USD and one without a state keep kr, without a warning."""
+    entry = await _entry_with_statistics(hass, freezer)
+    guest, paul, unknown = (
+        _entity_id(hass, entry, f"{name}_total_cost") for name in ("guest", "paul", "unknown")
+    )
+    hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_CURRENCY: "EUR"})
+    await _settle(hass)
+    for eid, unit in ((guest, "EUR"), (paul, "USD")):
+        state = hass.states.get(eid)
+        hass.states.async_set(eid, state.state, {**state.attributes, "unit_of_measurement": unit})
+    hass.states.async_remove(unknown)
+    caplog.clear()
+
+    await async_reconcile_cost_statistics(hass, entry)
+    await _settle(hass)
+
+    assert await _units(hass, [guest, paul, unknown]) == {guest: "EUR", paul: "kr", unknown: "kr"}
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 # ---------------------------------------------------------------------------

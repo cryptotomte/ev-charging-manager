@@ -10,5 +10,5 @@
     "issue_tracker": "https://github.com/cryptotomte/ev-charging-manager/issues",
     "requirements": [],
     "single_config_entry": true,
-    "version": "0.4.7"
+    "version": "0.5.0b1"
 }

@@ -855,7 +855,7 @@ class SessionEngine:
                 )
 
             _LOGGER.debug(
-                "Session update: energy=%.3f kWh, power=%.0f W, cost=%.2f kr",
+                "Session update: energy=%.3f kWh, power=%.0f W, cost=%.2f",
                 session.energy_kwh,
                 self._last_power_w or 0.0,
                 session.cost_total_kr,
@@ -877,7 +877,7 @@ class SessionEngine:
 
         if spot_price is None:
             _LOGGER.warning(
-                "Spot price sensor '%s' unavailable at %s — using fallback %.2f kr/kWh",
+                "Spot price sensor '%s' unavailable at %s — using fallback %.2f per kWh",
                 self._entry.data.get(CONF_SPOT_PRICE_ENTITY),
                 self._hour_start_time,
                 self._pricing.fallback_price or 0.0,
@@ -1073,7 +1073,7 @@ class SessionEngine:
             if spot_price is None:
                 _LOGGER.warning(
                     "Spot price sensor '%s' unavailable at session end (%s) — "
-                    "using fallback %.2f kr/kWh",
+                    "using fallback %.2f per kWh",
                     self._entry.data.get(CONF_SPOT_PRICE_ENTITY),
                     self._hour_start_time,
                     self._pricing.fallback_price or 0.0,

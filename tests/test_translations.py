@@ -57,3 +57,16 @@ def test_sv_json_placeholders_match_strings_json() -> None:
         if expected != actual:
             mismatches[key] = (sorted(expected), sorted(actual))
     assert mismatches == {}
+
+
+_CURRENCY_WORD = re.compile(r"\bkr\b")
+
+
+def test_no_kr_as_currency_word_and_currency_field_texts() -> None:
+    """Spec 028 T-22 (D-69): strings.json is en.json, pinned above."""
+    for name, label in (("translations/en.json", "Currency"), ("translations/sv.json", "Valuta")):
+        texts = _flatten(_load(name))
+        assert [k for k, v in texts.items() if v and _CURRENCY_WORD.search(v)] == [], name
+        for flow in ("config", "options"):
+            assert texts[f"{flow}.step.pricing.data.currency"] == label
+            assert texts[f"{flow}.step.pricing.data_description.currency"]

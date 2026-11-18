@@ -3064,7 +3064,7 @@ class PlugAnchoredSessionEngine:
                     _LOGGER.warning(
                         "PlugAnchoredSessionEngine: spot final-hour finalize failed for "
                         "session id=%s: %s — cost degraded to running estimate "
-                        "(%.4f kr), data_gap=True",
+                        "(%.4f), data_gap=True",
                         session.id,
                         err,
                         session.cost_total_kr,
@@ -3548,7 +3548,7 @@ class PlugAnchoredSessionEngine:
                 self._active_session.data_gap = True
             _LOGGER.error(
                 "PlugAnchoredSessionEngine: unexpected spot price read fault at "
-                "hour start (%s) — fallback %.2f kr/kWh will price this hour, "
+                "hour start (%s) — fallback %.2f per kWh will price this hour, "
                 "data_gap=True",
                 self._hour_start_time,
                 self._pricing.fallback_price or 0.0,
@@ -3567,7 +3567,7 @@ class PlugAnchoredSessionEngine:
             self._watch_spot_entity(entity_id)
             _LOGGER.info(
                 "Spot price sensor '%s' not loaded yet at hour start (%s) — the hour takes "
-                "its first valid state within the hour, else fallback %.2f kr/kWh",
+                "its first valid state within the hour, else fallback %.2f per kWh",
                 entity_id,
                 self._hour_start_time,
                 self._pricing.fallback_price or 0.0,
@@ -3575,7 +3575,7 @@ class PlugAnchoredSessionEngine:
         elif price is None:
             _LOGGER.warning(
                 "Spot price sensor '%s' unavailable at hour start (%s) — "
-                "fallback %.2f kr/kWh will price this hour",
+                "fallback %.2f per kWh will price this hour",
                 entity_id,
                 self._hour_start_time,
                 self._pricing.fallback_price or 0.0,

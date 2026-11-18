@@ -20,6 +20,8 @@ This is independent of EV Charging Manager -- configure it in your HA InfluxDB i
 
 The automation template (`automations/ev_charging_manager_influxdb_export.yaml`) writes completed session data to the `ev_charging_sessions` measurement. This is the primary data source for the queries below.
 
+The field names `cost_kr` and `charge_price_kr` are historical: they hold amounts in the currency configured in the integration, whatever it is.
+
 ## Session Data Queries
 
 ### Cost per User per Month

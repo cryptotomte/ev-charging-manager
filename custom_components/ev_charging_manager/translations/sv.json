@@ -48,8 +48,12 @@
             "pricing": {
                 "title": "Prissättningskonfiguration",
                 "data": {
+                    "currency": "Valuta",
                     "pricing_mode": "Prisläge",
                     "static_price_kwh": "Pris per kWh"
+                },
+                "data_description": {
+                    "currency": "Enheten som visas på alla kostnadssensorer. Ange dina priser i denna valuta. Ett byte ändrar enheten på befintliga summor och statistik; inget räknas om."
                 }
             },
             "spot_config": {
@@ -63,9 +67,9 @@
                 },
                 "data_description": {
                     "spot_price_entity": "Välj sensorn som rapporterar det aktuella spotpriset",
-                    "spot_additional_cost_kwh": "Nätavgift + energiskatt, exkl. moms (kr/kWh)",
-                    "spot_vat_multiplier": "1,25 = 25 % svensk moms",
-                    "spot_fallback_price_kwh": "Pris som används när spotpriset är otillgängligt (kr/kWh)"
+                    "spot_additional_cost_kwh": "Nätavgift + energiskatt, exkl. moms (per kWh, i valutan ovan)",
+                    "spot_vat_multiplier": "1,25 = 25 % moms",
+                    "spot_fallback_price_kwh": "Pris som används när spotpriset är otillgängligt (per kWh, i valutan ovan)"
                 }
             },
             "confirm": {
@@ -127,6 +131,7 @@
                 "title": "Prissättning",
                 "description": "Byt mellan fast pris och spotprissättning.",
                 "data": {
+                    "currency": "Valuta",
                     "pricing_mode": "Prisläge",
                     "static_price_kwh": "Pris per kWh",
                     "spot_price_entity": "Prissensor",
@@ -135,10 +140,11 @@
                     "spot_fallback_price_kwh": "Reservpris"
                 },
                 "data_description": {
+                    "currency": "Enheten som visas på alla kostnadssensorer. Ange dina priser i denna valuta. Ett byte ändrar enheten på befintliga summor och statistik; inget räknas om.",
                     "spot_price_entity": "Välj sensorn som rapporterar det aktuella spotpriset",
-                    "spot_additional_cost_kwh": "Nätavgift + energiskatt, exkl. moms (kr/kWh)",
-                    "spot_vat_multiplier": "1,25 = 25 % svensk moms",
-                    "spot_fallback_price_kwh": "Pris som används när spotpriset är otillgängligt (kr/kWh)"
+                    "spot_additional_cost_kwh": "Nätavgift + energiskatt, exkl. moms (per kWh, i valutan ovan)",
+                    "spot_vat_multiplier": "1,25 = 25 % moms",
+                    "spot_fallback_price_kwh": "Pris som används när spotpriset är otillgängligt (per kWh, i valutan ovan)"
                 }
             }
         },

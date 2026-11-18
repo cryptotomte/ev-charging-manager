@@ -14,8 +14,8 @@
 #
 # Fields (measurement values):
 #   energy_kwh              - Energy consumed (float, kWh)
-#   cost_kr                 - Total cost (float, SEK)
-#   charge_price_kr         - Guest charge price, 0 if not applicable (float, SEK)
+#   cost_kr                 - Total cost (float, in the configured currency)
+#   charge_price_kr         - Guest charge price, 0 if not applicable (float, in the configured currency)
 #   duration_minutes        - Session duration (int, minutes)
 #   avg_power_w             - Average power (float, W)
 #   estimated_soc_added_pct - Estimated SoC added, 0 if unavailable (float, %)

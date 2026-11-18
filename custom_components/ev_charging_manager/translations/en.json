@@ -48,8 +48,12 @@
             "pricing": {
                 "title": "Pricing Configuration",
                 "data": {
+                    "currency": "Currency",
                     "pricing_mode": "Pricing Mode",
                     "static_price_kwh": "Price per kWh"
+                },
+                "data_description": {
+                    "currency": "Unit shown on all cost sensors. Enter your prices in this currency. Changing it relabels existing totals and statistics; nothing is converted."
                 }
             },
             "spot_config": {
@@ -63,9 +67,9 @@
                 },
                 "data_description": {
                     "spot_price_entity": "Select the sensor that provides the current electricity spot price",
-                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (kr/kWh)",
-                    "spot_vat_multiplier": "1.25 = 25% Swedish VAT",
-                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (kr/kWh)"
+                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (per kWh, in the currency above)",
+                    "spot_vat_multiplier": "1.25 = 25% VAT",
+                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (per kWh, in the currency above)"
                 }
             },
             "confirm": {
@@ -127,6 +131,7 @@
                 "title": "Pricing",
                 "description": "Switch between static and spot pricing modes.",
                 "data": {
+                    "currency": "Currency",
                     "pricing_mode": "Pricing Mode",
                     "static_price_kwh": "Price per kWh",
                     "spot_price_entity": "Price sensor",
@@ -135,10 +140,11 @@
                     "spot_fallback_price_kwh": "Fallback price"
                 },
                 "data_description": {
+                    "currency": "Unit shown on all cost sensors. Enter your prices in this currency. Changing it relabels existing totals and statistics; nothing is converted.",
                     "spot_price_entity": "Select the sensor that provides the current electricity spot price",
-                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (kr/kWh)",
-                    "spot_vat_multiplier": "1.25 = 25% Swedish VAT",
-                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (kr/kWh)"
+                    "spot_additional_cost_kwh": "Grid fee + energy tax, excl. VAT (per kWh, in the currency above)",
+                    "spot_vat_multiplier": "1.25 = 25% VAT",
+                    "spot_fallback_price_kwh": "Price used when spot sensor is unavailable (per kWh, in the currency above)"
                 }
             }
         },

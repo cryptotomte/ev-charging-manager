@@ -38,7 +38,7 @@ Everything runs locally inside Home Assistant -- no cloud services required.
 Before installing, make sure you have:
 
 - [ ] An EV charger installed and connected to your local network
-- [ ] Home Assistant **2025.3** or newer
+- [ ] Home Assistant **2026.2** or newer
 - [ ] [HACS](https://hacs.xyz) installed
 - [ ] A Home Assistant integration for your charger already set up (e.g. [ha-goecharger-api2](https://github.com/marq24/ha-goecharger-api2) for go-e chargers)
 
@@ -86,9 +86,31 @@ If your charger brand is not yet documented, see [Charger Profiles (Community)](
 | **Charger profile** | Select your charger brand (e.g. go-e) or "Generic" |
 | **Charger serial** | A unique name/serial for this charger instance |
 | **Entity mapping** | Map the charger's HA entities (car status, energy, power, RFID) |
-| **Pricing** | Choose static or spot pricing and enter rates |
+| **Pricing** | Choose the currency, static or spot pricing, and enter rates |
 
 After completing the wizard, the integration creates a device and begins monitoring for charging sessions.
+
+### Currency
+
+One currency per installation. It is the unit of every cost and price sensor, and the
+currency the prices you enter are in. A new installation must choose it in the setup
+wizard; afterwards it is changed under **Settings** > **Devices & Services** >
+**EV Charging Manager** > **Configure**, on the pricing page.
+
+- **A label, not a conversion.** Changing the currency relabels the existing totals,
+  their history and their long-term statistics. No amount is converted.
+- **Installations created before 0.5.0** show `kr` and keep it until you choose
+  another currency.
+- **At a change** Home Assistant logs one warning per total-cost sensor ("The unit of
+  … is changing") and skips one five-minute statistics period for it. The integration
+  moves the statistics to the new unit itself, so they keep recording and the sum
+  continues.
+- **Spot price sensor:** its state is used as a number in the configured currency per
+  kWh. A sensor in another currency or scale (öre/kWh, EUR/MWh) is not converted.
+- **Downgrade:** after choosing another currency than `kr`, a downgrade to 0.4.7 shows
+  `kr` again while the statistics carry the new unit, so Home Assistant raises its
+  "unit has changed" repair issue for each total-cost sensor. The setting itself
+  survives the downgrade and is back after the next upgrade.
 
 ### Managing Users
 

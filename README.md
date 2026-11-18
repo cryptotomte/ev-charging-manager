@@ -97,20 +97,24 @@ currency the prices you enter are in. A new installation must choose it in the s
 wizard; afterwards it is changed under **Settings** > **Devices & Services** >
 **EV Charging Manager** > **Configure**, on the pricing page.
 
-- **A label, not a conversion.** Changing the currency relabels the existing totals,
-  their history and their long-term statistics. No amount is converted.
+- **A label, not a conversion.** Changing the currency changes the unit of the sensors
+  and of the long-term statistics of the total-cost sensors. No amount is converted.
+  Recorded state history keeps the unit it was recorded with.
 - **Installations created before 0.5.0** show `kr` and keep it until you choose
   another currency.
-- **At a change** Home Assistant logs one warning per total-cost sensor ("The unit of
-  … is changing") and skips one five-minute statistics period for it. The integration
-  moves the statistics to the new unit itself, so they keep recording and the sum
-  continues.
+- **At a change** one or two five-minute statistics periods may be skipped for each
+  total-cost sensor; their amount shows in the following period. Home Assistant may
+  log a warning per total-cost sensor ("The unit of … is changing").
+- **Statistics follow the setting.** At every start of the integration (also after a
+  reload or a saved options form) and when a user is added or renamed, the integration
+  puts the long-term statistics of its total-cost sensors in the configured currency.
 - **Spot price sensor:** its state is used as a number in the configured currency per
   kWh. A sensor in another currency or scale (öre/kWh, EUR/MWh) is not converted.
-- **Downgrade:** after choosing another currency than `kr`, a downgrade to 0.4.7 shows
-  `kr` again while the statistics carry the new unit, so Home Assistant raises its
-  "unit has changed" repair issue for each total-cost sensor. The setting itself
-  survives the downgrade and is back after the next upgrade.
+- **Downgrade:** if you chose another currency than `kr`, version 0.4.7 shows `kr`
+  again and the long-term statistics of the total-cost sensors stop while it runs;
+  Home Assistant raises its "unit has changed" repair issue for each. The setting
+  survives the downgrade, and after the next upgrade the integration puts the
+  statistics in line again, so no manual repair is needed afterwards.
 
 ### Managing Users
 

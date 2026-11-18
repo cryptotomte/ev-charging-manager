@@ -53,7 +53,7 @@
                     "static_price_kwh": "Pris per kWh"
                 },
                 "data_description": {
-                    "currency": "Enheten som visas på alla kostnadssensorer. Ange dina priser i denna valuta. Ett byte ändrar enheten på befintliga summor och statistik; inget räknas om."
+                    "currency": "Enheten som visas på alla kostnadssensorer. Ange dina priser i denna valuta. \"kr\" är enheten för installationer som skapades före 0.5.0. Du kan ändra den senare i alternativen."
                 }
             },
             "spot_config": {
@@ -66,10 +66,10 @@
                     "spot_fallback_price_kwh": "Reservpris"
                 },
                 "data_description": {
-                    "spot_price_entity": "Välj sensorn som rapporterar det aktuella spotpriset",
-                    "spot_additional_cost_kwh": "Nätavgift + energiskatt, exkl. moms (per kWh, i valutan ovan)",
+                    "spot_price_entity": "Välj sensorn som rapporterar det aktuella spotpriset. Den måste rapportera priset per kWh i din valuta; värdet används som det är.",
+                    "spot_additional_cost_kwh": "Nätavgift + energiskatt, exkl. moms (per kWh, i din valuta)",
                     "spot_vat_multiplier": "1,25 = 25 % moms",
-                    "spot_fallback_price_kwh": "Pris som används när spotpriset är otillgängligt (per kWh, i valutan ovan)"
+                    "spot_fallback_price_kwh": "Pris som används när spotpriset är otillgängligt (per kWh, i din valuta)"
                 }
             },
             "confirm": {
@@ -130,7 +130,7 @@
             },
             "pricing": {
                 "title": "Prissättning",
-                "description": "Byt mellan fast pris och spotprissättning.",
+                "description": "Valuta och fast pris eller spotpris.",
                 "data": {
                     "currency": "Valuta",
                     "pricing_mode": "Prisläge",
@@ -142,10 +142,10 @@
                 },
                 "data_description": {
                     "currency": "Enheten som visas på alla kostnadssensorer. Ange dina priser i denna valuta. Ett byte ändrar enheten på befintliga summor och statistik; inget räknas om.",
-                    "spot_price_entity": "Välj sensorn som rapporterar det aktuella spotpriset",
-                    "spot_additional_cost_kwh": "Nätavgift + energiskatt, exkl. moms (per kWh, i valutan ovan)",
+                    "spot_price_entity": "Välj sensorn som rapporterar det aktuella spotpriset. Den måste rapportera priset per kWh i din valuta; värdet används som det är.",
+                    "spot_additional_cost_kwh": "Nätavgift + energiskatt, exkl. moms (per kWh, i din valuta)",
                     "spot_vat_multiplier": "1,25 = 25 % moms",
-                    "spot_fallback_price_kwh": "Pris som används när spotpriset är otillgängligt (per kWh, i valutan ovan)"
+                    "spot_fallback_price_kwh": "Pris som används när spotpriset är otillgängligt (per kWh, i din valuta)"
                 }
             }
         },
@@ -314,7 +314,7 @@
                     },
                     "data_description": {
                         "guest_pricing_method": "Hur laddningspriset ska beräknas för denna gäst",
-                        "price_per_kwh": "Fast pris per kWh (krävs för metoden ''fast pris'')",
+                        "price_per_kwh": "Fast pris per kWh i installationens valuta (krävs för metoden ''fast pris'')",
                         "markup_factor": "Multiplicera baspriset med denna faktor (krävs för metoden ''påslag'', måste vara > 1,0)"
                     }
                 },
@@ -338,7 +338,7 @@
                     },
                     "data_description": {
                         "guest_pricing_method": "Hur laddningspriset ska beräknas för denna gäst",
-                        "price_per_kwh": "Fast pris per kWh (krävs för metoden ''fast pris'')",
+                        "price_per_kwh": "Fast pris per kWh i installationens valuta (krävs för metoden ''fast pris'')",
                         "markup_factor": "Multiplicera baspriset med denna faktor (krävs för metoden ''påslag'')"
                     }
                 }

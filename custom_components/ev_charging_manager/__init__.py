@@ -27,6 +27,7 @@ from .const import (
     SUBENTRY_TYPE_USER,
     SUBENTRY_TYPE_VEHICLE,
 )
+from .cost_statistics import async_reconcile_cost_statistics
 from .debug_logger import DebugLogger, async_cleanup_legacy_file
 from .lifecycle import (
     async_cascade_delete_user,
@@ -108,6 +109,9 @@ async def _on_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await _async_update_user_statistics(
             hass, entry, domain_data["stats_engine"], names, removed, renamed, added
         )
+    if added or renamed:
+        # Spec 028 D-74: a user's entity id may already have statistics in an earlier unit.
+        _schedule_reconcile(hass, entry)
 
 
 async def _async_update_user_statistics(
@@ -201,6 +205,14 @@ async def _async_update_user_statistics(
                 async_add_user_stats_sensors(hass, entry, sid, name)
         except Exception:
             _LOGGER.exception("Updating statistics for added user %s failed", sid)
+
+
+def _schedule_reconcile(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    entry.async_create_background_task(
+        hass,
+        async_reconcile_cost_statistics(hass, entry),
+        f"{DOMAIN} cost statistics {entry.entry_id}",
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -324,6 +336,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Forward setup to sensor and binary_sensor platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Spec 028 D-74: covers every path that changes a unit outside the options form.
+    _schedule_reconcile(hass, entry)
 
     return True
 

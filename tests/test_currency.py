@@ -11,7 +11,6 @@ from __future__ import annotations
 import copy
 import logging
 from types import MappingProxyType
-from unittest.mock import patch
 
 import pytest
 import voluptuous as vol
@@ -45,7 +44,6 @@ from tests.test_interruption_fixed_price import (
 )
 
 STATIC = {CONF_PRICING_MODE: "static", CONF_STATIC_PRICE_KWH: 2.50}
-RELABEL = "custom_components.ev_charging_manager.config_flow._relabel_cost_statistics"
 
 USERS = [
     {
@@ -171,12 +169,10 @@ async def test_entry_without_key_keeps_kr_through_reload_and_subentry_changes(
     assert_unit(hass, entry, "kr", remaining)
     assert CONF_CURRENCY not in entry.data
 
-    with patch(RELABEL) as relabel:
-        result = await options_save(hass, entry, STATIC, {"min_session_duration_s": 120})
+    result = await options_save(hass, entry, STATIC, {"min_session_duration_s": 120})
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options["min_session_duration_s"] == 120
     assert_unit(hass, entry, "kr", remaining)
-    relabel.assert_not_called()
 
 
 async def options_save(
@@ -201,14 +197,12 @@ async def test_options_save_without_touching_the_field_keeps_kr(hass: HomeAssist
     assert next(iter(result["data_schema"].schema)) is key
     assert key.default() == "kr"
 
-    with patch(RELABEL) as relabel:
-        result = await flow.async_configure(result["flow_id"], STATIC)
-        await hass.async_block_till_done()
+    result = await flow.async_configure(result["flow_id"], STATIC)
+    await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.data[CONF_CURRENCY] == "kr"
     assert_unit(hass, entry, "kr")
-    relabel.assert_not_called()
 
 
 @pytest.mark.parametrize("data", [{}, {CONF_CURRENCY: "EUR"}], ids=["without-key", "with-key"])
@@ -416,12 +410,13 @@ async def test_options_flow_rejects_a_value_outside_the_list(
 
 
 async def test_change_without_recorder_saves_quietly(hass: HomeAssistant, caplog) -> None:
-    """T-17: no recorder, so nothing to relabel: the save succeeds without a warning (D-66)."""
+    """T-17: no recorder, so nothing to reconcile: the save succeeds without a warning (D-74)."""
     entry = await setup_legacy_entry(hass)
     assert "recorder" not in hass.config.components
     caplog.clear()
 
     result = await options_save(hass, entry, {CONF_CURRENCY: "EUR", **STATIC})
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.data[CONF_CURRENCY] == "EUR"
